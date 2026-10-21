@@ -36,3 +36,4 @@ dist/
 
 # ---- 本地工具目录（IDE / Agent 会话数据等，不入代码库）----
 .workbuddy/
+backend/media/remotion/build/
