@@ -75,7 +75,14 @@ COMIC_STYLE_CLAUSES: list[tuple[str, str, str]] = [
 ]
 
 # 模型爱在句首写写实倾向的画种描述，与风格锚直接对冲 —— 出现即中和并留痕
+# （2026-10-22 补：角色卡锚点里出现 "Thick oil painting style, realistic texture,
+# heavy brushstrokes"，定妆图直接生成半写实人像 —— 与平涂分镜图风格分裂，
+# 且这类写实人脸过不了视频内容审核。中和规则必须覆盖锚点原文里的全部写实画种词。）
 _REALISM_PATTERNS = [
+    (re.compile(r"\bthick\s+oil\s+painting\s+style\b", re.I), "flat 2D anime style"),
+    (re.compile(r"\boil\s+painting\s+style\b", re.I), "flat 2D anime style"),
+    (re.compile(r"\brealistic\s+texture\b", re.I), "clean flat cel shading"),
+    (re.compile(r"\bheavy\s+brushstrokes\b", re.I), "clean bold lineart"),
     (re.compile(r"\bthick\s+paint\s+realistic\s+illustration\b", re.I), "stylized anime illustration"),
     (re.compile(r"\brealistic\s+illustration\b", re.I), "stylized anime illustration"),
     (re.compile(r"\bhyper[- ]?realistic\b", re.I), "stylized anime"),

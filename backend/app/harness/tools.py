@@ -803,6 +803,7 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
     created: list[str] = []
     reused: list[str] = []
     degraded: list[str] = []
+    style_gate = str(ctx.extra.get("skill_id") or "") in COMIC_STYLE_SKILLS
     for role, anchor in anchors.items():
         rel = _character_art_rel(role)
         if ctx.storage.exists(ctx.run_id, rel):
@@ -814,6 +815,14 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
             f"{anchor}. Character design sheet, front-facing bust portrait of this single "
             "character, neutral clean background, centered composition, consistent style."
         )
+        # 风格锚门禁（与分镜生图同款，2026-10-22 补）：锚点原文可能带写实画种词
+        # （实测 "Thick oil painting style, realistic texture" 生出半写实人像定妆图，
+        # 与平涂分镜图风格分裂、还过不了视频审核）—— 必须过同一个中和 + 补齐逻辑。
+        style_note = None
+        if style_gate:
+            prompt, style_note = ensure_style_anchor(prompt)
+            if style_note:
+                degraded.append(f"{role} 定妆图：{style_note}")
         out = await generate_image(
             ctx.storage, ctx.run_id, prompt, rel, ratio="9:16",
             model_override=model_ov, service_override=service_ov,
