@@ -143,11 +143,16 @@ def _media_ready(kind: str, snap: dict) -> dict:
             return {"ready": False, "mode": "local", "hint": "未配置 TTS：用本机语音，音色单一"}
         return {"ready": True, "mode": "real", "hint": "真实配音已就绪"}
     if kind == "video":
+        # 权威判定交给 video_ready()：它知道 jdcloud 留空 Key 时会复用图片 Key，
+        # 只看 api_key_set 会把"复用图片 Key"的正确配置误报成 broken
+        from ..media.video import video_ready
+
         provider = (snap.get("provider") or "off").lower()
         if provider == "off":
             return {"ready": False, "mode": "off", "hint": "未启用：成片走静态图 + 运镜（零成本）"}
-        if not (snap.get("api_key_set") and snap.get("base_url") and snap.get("model")):
-            return {"ready": False, "mode": "broken", "hint": "缺少 Key / 接口地址 / 模型名"}
+        ok, hint = video_ready()
+        if not ok:
+            return {"ready": False, "mode": "broken", "hint": hint}
         return {"ready": True, "mode": "real", "hint": "视频生成已就绪（按次计费，异步等待）"}
     return {"ready": False, "mode": "unknown", "hint": ""}
 
