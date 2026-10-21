@@ -34,6 +34,22 @@ const SOURCE_LABEL: Record<string, { text: string; cls: string }> = {
 }
 
 const ROLE_LABEL: Record<FrameRole, string> = { first: '首帧', mid: '中间帧', last: '尾帧' }
+
+/** 单格修改建议（后端只读，采纳由人决定） */
+interface PanelSug {
+  index: number
+  diagnosis: string
+  patch: Record<string, string>
+  why: Record<string, string>
+  model: string
+}
+const SUG_FIELD_LABEL: Record<string, string> = {
+  prompt: '画面描述',
+  scene: '场景 / 景别',
+  motion: '镜头运动',
+  subtitle: '字幕',
+  speaker: '说话人',
+}
 const ROLE_HINT: Record<FrameRole, string> = {
   first: '这一格从哪开始（也是生成视频的首帧）',
   mid: '动作进行到一半（与首帧同场景）',
@@ -55,6 +71,8 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
   const [videoMode, setVideoMode] = useState('std')
   const [videoModel, setVideoModel] = useState('') // '' = 全局默认模型
   const [refUrl, setRefUrl] = useState('')
+  const [sug, setSug] = useState<PanelSug | null>(null)
+  const [sugNote, setSugNote] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -91,6 +109,11 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
     if (selected != null && !panels.some((p) => p.index === selected)) setSelected(panels[0]?.index ?? null)
   }, [panels, selected])
 
+  // 换格后上一格的建议不再有意义
+  useEffect(() => {
+    setSug(null)
+  }, [selected])
+
   const current = useMemo(() => panels.find((p) => p.index === selected) ?? null, [panels, selected])
   const merged = useMemo(() => (current ? { ...current, ...(drafts[current.index] ?? {}) } : null), [current, drafts])
 
@@ -101,6 +124,29 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
 
   const patchDraft = (index: number, patch: Partial<CanvasPanel>) => {
     setDrafts((d) => ({ ...d, [index]: { ...(d[index] ?? {}), ...patch } }))
+  }
+
+  // ---------------- 大模型修改建议（只读 → 人采纳）----------------
+
+  const askSuggestion = async (index: number, note = '') => {
+    setBusy(`sug-${index}`)
+    setErr(null)
+    try {
+      const res = await api.suggestPanel(runId, index, { note })
+      setSug({ index: res.index, diagnosis: res.diagnosis, patch: res.patch, why: res.why, model: res.model })
+    } catch (e: any) {
+      setErr(e.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const applySuggestion = () => {
+    if (!sug) return
+    patchDraft(sug.index, sug.patch as Partial<CanvasPanel>)
+    flash(`已把第 ${sug.index} 格的建议填进编辑框 —— 确认后点「保存本格」生效`)
+    setSug(null)
+    setSugNote('')
   }
 
   // ---------------- 操作 ----------------
@@ -835,6 +881,13 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                     >
                       {busy === `regen-${merged.index}` ? '重画中…' : '只重画这一格'}
                     </button>
+                    <button
+                      disabled={busy != null}
+                      onClick={() => askSuggestion(merged.index, sugNote)}
+                      className="text-[11.5px] px-3 py-1.5 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 transition-colors disabled:opacity-40"
+                    >
+                      {busy === `sug-${merged.index}` ? '思考中…' : 'AI 建议'}
+                    </button>
                     <label className="text-[11.5px] px-3 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 text-violet-300 cursor-pointer transition-colors">
                       {busy === `upload-${merged.index}` ? '上传中…' : '上传图片替换'}
                       <input
@@ -854,6 +907,56 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                       </span>
                     )}
                   </div>
+
+                  {/* ---------------- AI 修改建议（只读 → 采纳）---------------- */}
+                  {sug && sug.index === merged.index && (
+                    <div className="mt-2.5 rounded-lg border border-teal-500/25 bg-teal-500/[0.04] p-3">
+                      <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                        <span className="text-[11px] font-medium text-teal-300">AI 诊断</span>
+                        <span className="text-[9.5px] text-[#5f6d87]">{sug.model}</span>
+                      </div>
+                      <p className="text-[11px] leading-relaxed text-[#c9d5ea]">{sug.diagnosis}</p>
+                      <div className="mt-2 space-y-1.5">
+                        {Object.entries(sug.patch).map(([k, v]) => (
+                          <div key={k} className="rounded-md bg-[#0f1420] border border-[#1e2839] px-2.5 py-1.5">
+                            <div className="text-[10px] text-teal-300/80 mb-0.5">
+                              {SUG_FIELD_LABEL[k] ?? k}
+                              {sug.why[k] && <span className="text-[#5f6d87]"> · {sug.why[k]}</span>}
+                            </div>
+                            <div className="text-[10.5px] leading-relaxed text-[#9fb0cc] line-clamp-4 break-all">{v}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex items-center gap-2 mt-2 flex-wrap">
+                        <button
+                          disabled={busy != null}
+                          onClick={applySuggestion}
+                          className="text-[11px] px-2.5 py-1 rounded-lg bg-teal-500/20 hover:bg-teal-500/30 text-teal-300 disabled:opacity-40"
+                        >
+                          采纳（填进编辑框，不直接保存）
+                        </button>
+                        <input
+                          value={sugNote}
+                          onChange={(e) => setSugNote(e.target.value)}
+                          placeholder="告诉它你的要求，例如：表情更惊恐一点"
+                          className="flex-1 min-w-[180px] text-[10.5px] bg-[#0f1420] border border-[#26324a] rounded-lg px-2 py-1 text-[#dbe4f5] outline-none focus:border-teal-500/50"
+                        />
+                        <button
+                          disabled={busy != null}
+                          onClick={() => askSuggestion(merged.index, sugNote)}
+                          className="text-[11px] px-2.5 py-1 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] disabled:opacity-40"
+                        >
+                          {busy === `sug-${merged.index}` ? '…' : '按此要求重新建议'}
+                        </button>
+                        <button
+                          onClick={() => setSug(null)}
+                          className="text-[11px] px-2 py-1 rounded-lg text-[#6f7d99] hover:text-rose-300"
+                        >
+                          忽略
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </>

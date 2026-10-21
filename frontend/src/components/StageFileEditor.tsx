@@ -33,6 +33,18 @@ const KIND_ICON: Record<string, string> = {
   audio: '🎧',
 }
 
+/** 阶段级修改建议（模型只评审、不动产物） */
+interface StageSug {
+  overall: string
+  suggestions: { target: string; issue: string; suggestion: string; priority: string }[]
+  model: string
+}
+const PRIORITY_CLS: Record<string, string> = {
+  high: 'bg-rose-500/15 text-rose-300',
+  medium: 'bg-amber-500/15 text-amber-300',
+  low: 'bg-[#151d2b] text-[#8b98b4]',
+}
+
 export default function StageFileEditor({ runId, stageId, onChanged }: Props) {
   const [data, setData] = useState<StageFiles | null>(null)
   const [active, setActive] = useState<StageFile | null>(null)
@@ -41,6 +53,9 @@ export default function StageFileEditor({ runId, stageId, onChanged }: Props) {
   const [busy, setBusy] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
+  const [sug, setSug] = useState<StageSug | null>(null)
+  const [sugNote, setSugNote] = useState('')
+  const [sugOpen, setSugOpen] = useState(false)
 
   const flash = (t: string) => {
     setMsg(t)
@@ -52,6 +67,7 @@ export default function StageFileEditor({ runId, stageId, onChanged }: Props) {
     try {
       const d = await api.stageFiles(runId, stageId)
       setData(d)
+      setSug(null) // 换阶段后上一阶段的建议不再有意义
       setActive((cur) => {
         if (cur && d.files.some((f) => f.path === cur.path)) return d.files.find((f) => f.path === cur.path) ?? null
         return d.files.find((f) => f.editable) ?? d.files[0] ?? null
@@ -156,6 +172,21 @@ export default function StageFileEditor({ runId, stageId, onChanged }: Props) {
 
   const dirty = active?.editable && text !== original
 
+  // ---------------- 阶段级 AI 修改建议（只读）----------------
+  const askSuggestion = async () => {
+    setBusy('sug')
+    setErr(null)
+    try {
+      const r = await api.suggestStage(runId, stageId, { note: sugNote })
+      setSug(r)
+      setSugOpen(true)
+    } catch (e: any) {
+      setErr(e.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
   // 与弹窗查看器保持一致：⌘/Ctrl+S 直接提交
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -176,12 +207,78 @@ export default function StageFileEditor({ runId, stageId, onChanged }: Props) {
           {data?.replaceable_count ?? 0}
         </span>
         <button
+          disabled={busy != null}
+          onClick={askSuggestion}
+          title="让大模型评审本阶段产物，给出具体修改建议（只读，不改任何文件）"
+          className="ml-auto text-[11px] px-2.5 py-1 rounded-md bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 disabled:opacity-40"
+        >
+          {busy === 'sug' ? '评审中…' : 'AI 修改建议'}
+        </button>
+        <button
           onClick={() => void load()}
-          className="ml-auto text-[11px] px-2.5 py-1 rounded-md bg-[#151d2b] hover:bg-[#1d2738] text-[#9fb0cc]"
+          className="text-[11px] px-2.5 py-1 rounded-md bg-[#151d2b] hover:bg-[#1d2738] text-[#9fb0cc]"
         >
           刷新
         </button>
       </div>
+
+      {/* AI 建议卡 */}
+      {sugOpen && sug && (
+        <div className="mb-2 rounded-lg border border-teal-500/25 bg-teal-500/[0.04] p-3">
+          <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+            <span className="text-[11px] font-medium text-teal-300">AI 总评</span>
+            <span className="text-[9.5px] text-[#5f6d87]">{sug.model}</span>
+            <button
+              onClick={() => setSugOpen(false)}
+              className="ml-auto text-[10.5px] text-[#6f7d99] hover:text-rose-300"
+            >
+              收起
+            </button>
+          </div>
+          <p className="text-[11px] leading-relaxed text-[#c9d5ea]">{sug.overall || '（模型没有给总评）'}</p>
+          <div className="mt-2 space-y-1.5">
+            {sug.suggestions.map((s, i) => (
+              <div key={i} className="rounded-md bg-[#0f1420] border border-[#1e2839] px-2.5 py-2">
+                <div className="flex items-center gap-1.5 mb-1 flex-wrap">
+                  <span className={`text-[9px] px-1.5 py-[1px] rounded ${PRIORITY_CLS[s.priority] ?? PRIORITY_CLS.low}`}>
+                    {s.priority}
+                  </span>
+                  <span className="text-[10px] text-[#8b98b4] font-mono truncate max-w-[60%]" title={s.target}>
+                    {s.target}
+                  </span>
+                </div>
+                <div className="text-[10.5px] leading-relaxed text-[#c9d5ea]">
+                  <span className="text-rose-300/80">问题：</span>
+                  {s.issue}
+                </div>
+                <div className="text-[10.5px] leading-relaxed text-[#c9d5ea] mt-0.5">
+                  <span className="text-teal-300/80">建议：</span>
+                  {s.suggestion}
+                </div>
+              </div>
+            ))}
+            {!sug.suggestions.length && <div className="text-[10.5px] text-[#5f6d87]">模型没有提出具体建议。</div>}
+          </div>
+          <div className="flex items-center gap-2 mt-2 flex-wrap">
+            <input
+              value={sugNote}
+              onChange={(e) => setSugNote(e.target.value)}
+              placeholder="告诉它重点看哪里，例如：结尾钩子不够狠"
+              className="flex-1 min-w-[200px] text-[10.5px] bg-[#0f1420] border border-[#26324a] rounded-lg px-2 py-1 text-[#dbe4f5] outline-none focus:border-teal-500/50"
+            />
+            <button
+              disabled={busy != null}
+              onClick={askSuggestion}
+              className="text-[10.5px] px-2.5 py-1 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] disabled:opacity-40"
+            >
+              {busy === 'sug' ? '…' : '按此要求重新评审'}
+            </button>
+          </div>
+          <div className="text-[9.5px] text-[#4c5975] mt-1.5">
+            建议是只读的 —— 照着改请编辑左侧对应文件，改完「提交保存」，模型原件会自动备份。
+          </div>
+        </div>
+      )}
 
       {(err || msg) && (
         <div className="mb-2 space-y-1.5">

@@ -125,6 +125,26 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  // ---- 大模型修改建议（只读；采纳与否由人决定）----
+  suggestPanel: (runId: string, index: number, body: { note?: string }) =>
+    req<{
+      ok: boolean
+      index: number
+      diagnosis: string
+      patch: Record<string, string>
+      why: Record<string, string>
+      model: string
+    }>(`/runs/${runId}/panels/${index}/suggest`, { method: 'POST', body: JSON.stringify(body) }),
+  suggestStage: (runId: string, stageId: string, body: { note?: string }) =>
+    req<{
+      ok: boolean
+      stage_id: string
+      overall: string
+      suggestions: { target: string; issue: string; suggestion: string; priority: string }[]
+      model: string
+      override_model?: string | null
+    }>(`/runs/${runId}/stages/${stageId}/suggest`, { method: 'POST', body: JSON.stringify(body) }),
+
   // ---- 多帧（首 / 中 / 尾）----
   uploadFrame: (runId: string, index: number, role: FrameRole, body: { data_url: string; note?: string }) =>
     req<{ ok: boolean; path: string; size: number; index: string; role: FrameRole }>(
