@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -356,6 +357,114 @@ async def _request_jdcloud_image(
     return img.content, ext, notes
 
 
+# 万相 text2image 支持的尺寸由「尺寸组」限定（官方文档：纵横比 1:1 / 16:9 / 9:16 三组），
+# 这里按分镜比例映射到最接近的合法尺寸；用户显式填了 size 就原样透传（x 或 * 分隔都接受）
+_WAN_SIZES = {
+    "9:16": "720*1280",
+    "16:9": "1280*720",
+    "1:1": "1024*1024",
+}
+
+# wan2.2/2.5 单边像素上限 1440、总像素上限约 200 万（官方文档），拦住明显超限的尺寸
+_WAN_MAX_SIDE = 1440
+
+
+def _wan_size(size: str, ratio: str) -> str:
+    """把「比例或显式尺寸」归一成万相认的 W*H 字符串；非法尺寸直接报错而不是赌服务端。"""
+    raw = (size or "").strip()
+    if raw:
+        w, _, h = raw.lower().replace("×", "*").replace("x", "*").partition("*")
+        try:
+            w_i, h_i = int(w), int(h)
+        except ValueError as exc:
+            raise ValueError(f"生图尺寸格式不合法：{raw!r}（应为 720*1280 这类 W*H）") from exc
+        if not (512 <= w_i <= _WAN_MAX_SIDE and 512 <= h_i <= _WAN_MAX_SIDE):
+            raise ValueError(f"生图尺寸 {w_i}*{h_i} 超出万相允许范围（单边 512~{_WAN_MAX_SIDE}）")
+        return f"{w_i}*{h_i}"
+    return _WAN_SIZES.get(ratio, "720*1280")
+
+
+async def _request_dashscope_image(
+    prompt: str,
+    ratio: str,
+    model: str | None = None,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    size: str | None = None,
+    negative_prompt: str = "",
+    seed: int = 0,
+    extra: dict | None = None,
+    poll_timeout: float = 240.0,
+) -> tuple[bytes, str, list[str]]:
+    """万相（通义）文生图，异步任务制：提交 → 轮询 → 下载。返回 (图片字节, 扩展名, 参数说明)。
+
+    与同步接口不同，这是 DashScope 协议：
+      POST {base}/services/aigc/text2image/image-synthesis（头 X-DashScope-Async: enable）
+      GET  {base}/tasks/{task_id}                          （轮询，SUCCEEDED 才有 results[].url）
+    已实测（2026-10-22，万相中转）：wan2.2-t2i-plus / wan2.2-t2i-flash /
+    wanx2.1-t2i-plus / wanx2.1-t2i-turbo 均可出图，数秒到十几秒级；
+    wan2.5 系列与 OpenAI 兼容 /images/generations 在该网关不可用。
+
+    negative_prompt / seed 走 parameters，万相明确支持 —— 不像 image-01 那样只能"如实告知未生效"。
+    """
+    base = (base_url or settings.image_base_url).rstrip("/")
+    key = api_key or settings.image_api_key
+    notes: list[str] = []
+    body: dict = {
+        "model": (model or settings.image_model or "wan2.2-t2i-plus"),
+        "input": {"prompt": prompt[:2000]},
+        "parameters": {"size": _wan_size(size, ratio), "n": 1},
+    }
+    if negative_prompt:
+        body["parameters"]["negative_prompt"] = negative_prompt
+        notes.append("已携带负向提示词（万相原生支持）")
+    if seed:
+        body["parameters"]["seed"] = int(seed)
+        notes.append(f"已固定随机种子 seed={seed}")
+    if extra:
+        body["parameters"].update(extra)
+        notes.append(f"已合并高级参数：{', '.join(sorted(extra))}")
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "X-DashScope-Async": "enable",
+    }
+    async with httpx.AsyncClient(timeout=120) as cli:
+        resp = await cli.post(base + "/services/aigc/text2image/image-synthesis", headers=headers, json=body)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"万相生图提交失败 {resp.status_code}：{resp.text[:300]}")
+        task_id = ((resp.json().get("output") or {}).get("task_id")) or ""
+        if not task_id:
+            raise RuntimeError(f"万相生图提交返回里没有 task_id：{resp.text[:200]}")
+        # 轮询：PENDING/RUNNING 都要等；FAILED/UNKNOWN 才是真失败。超时如实报错。
+        import time as _time
+
+        deadline = _time.time() + poll_timeout
+        while True:
+            await asyncio.sleep(2.5)
+            poll = await cli.get(f"{base}/tasks/{task_id}", headers={"Authorization": f"Bearer {key}"})
+            if poll.status_code >= 400:
+                raise RuntimeError(f"万相任务查询失败 {poll.status_code}：{poll.text[:300]}")
+            out = (poll.json().get("output") or {})
+            status = (out.get("task_status") or "").upper()
+            if status == "SUCCEEDED":
+                url = ((out.get("results") or [{}])[0]).get("url") or ""
+                if not url:
+                    raise RuntimeError(f"万相任务成功但返回里没有图片 URL：{poll.text[:200]}")
+                break
+            if status in {"FAILED", "CANCELED", "UNKNOWN"}:
+                raise RuntimeError(f"万相生图任务失败（{status}）：{out.get('message') or out.get('code') or poll.text[:200]}")
+            if _time.time() > deadline:
+                raise RuntimeError(f"万相生图任务超时（>{poll_timeout:.0f}s，task={task_id} 最后状态 {status}）")
+        img = await cli.get(url)
+    if img.status_code >= 400:
+        raise RuntimeError(f"下载生图结果失败：HTTP {img.status_code}")
+    ct = img.headers.get("content-type", "")
+    ext = "png" if "png" in ct else ("jpg" if ("jpeg" in ct or "jpg" in ct) else "png")
+    return img.content, ext, notes
+
+
 def _parse_extra(raw: str, kind: str) -> dict:
     """高级参数是 JSON 字符串；写错就在生图前直接报错，不带着坏参数去打接口。"""
     text = (raw or "").strip()
@@ -455,6 +564,17 @@ async def generate_image(
                         "负面提示词不被 image-01 协议支持，已忽略；防写实请写进提示词的反写实条款"
                     ]
                 provider_label = f"jdcloud/{model_override or settings.image_model or 'image-01'}"
+            elif provider_kind == "dashscope":
+                # 万相是异步任务制，尺寸由本分支内部归一（不走 OpenAI 的 size 语义）
+                data, ext, notes = await _request_dashscope_image(
+                    prompt, ratio, model=model_override,
+                    size=size or None, negative_prompt=negative, seed=seed, extra=extra or None,
+                )
+                if subject_ref:
+                    notes = list(notes) + [
+                        "参考图（subject_reference）未生效：万相文生图不支持人物参考图，已退化为纯文生图"
+                    ]
+                provider_label = f"dashscope/{model_override or settings.image_model or 'wan2.2-t2i-plus'}"
             else:
                 # OpenAI 兼容接口不支持 subject_reference，如实回传未生效
                 data, ext, notes = await _request_real_image(

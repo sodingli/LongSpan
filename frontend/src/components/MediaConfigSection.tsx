@@ -31,6 +31,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   local: '本地兜底（不花钱）',
   'openai-compat': 'OpenAI 兼容接口',
   jdcloud: '京东云 modelservice',
+  dashscope: '万相通义（DashScope 异步）',
   off: '关闭（不生成视频）',
 }
 
@@ -39,7 +40,7 @@ const FIELDS: Record<Kind, FieldSpec[]> = {
     { key: 'provider', label: '接入方式', type: 'select' },
     { key: 'base_url', label: '接口地址', placeholder: 'https://modelservice.jdcloud.com/v1', wide: true },
     { key: 'api_key', label: 'API Key', type: 'password', placeholder: '留空 = 沿用已保存的' },
-    { key: 'model', label: '模型名', placeholder: 'image-01' },
+    { key: 'model', label: '模型名', placeholder: 'wan2.2-t2i-plus（或 image-01）', hint: '万相实测可用：wan2.2-t2i-plus / wan2.2-t2i-flash / wanx2.1-t2i-plus / wanx2.1-t2i-turbo' },
     {
       key: 'service',
       label: '预置服务标识',

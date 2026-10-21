@@ -33,7 +33,7 @@ VALID_PROVIDERS = {"auto", "mock", "openai-compat"}
 # - local：强制本地兜底（不想花钱、或想复现某次结果时用）
 # - off：彻底关闭（视频默认 off —— 它是唯一按次计费且可能等几分钟的能力）
 MEDIA_PROVIDERS = {
-    "image": ["auto", "local", "openai-compat", "jdcloud"],
+    "image": ["auto", "local", "openai-compat", "jdcloud", "dashscope"],
     "tts": ["auto", "local", "openai-compat"],
     "video": ["off", "jdcloud", "dashscope"],
 }
@@ -175,7 +175,7 @@ def get_media_config() -> dict:
         "env_file": str(env_file()),
         "env_file_exists": env_file_exists(),
         "notes": {
-            "image": "支持 OpenAI 兼容 /v1/images/generations，以及京东云预置服务（同步返回图片 URL）",
+            "image": "支持 OpenAI 兼容 /v1/images/generations、京东云预置服务（同步），以及万相 DashScope 异步任务（提交 → 轮询 → 下载）",
             "tts": "支持 OpenAI 兼容 /v1/audio/speech；没配就用本机语音（音色单一，会如实标注）",
             "video": "视频为异步任务接口（京东云 task/submit 或万相 wan3.0 video-synthesis，二选一）：提交 → 轮询 → 下载。单片段按次计费，不会自动跑",
         },
