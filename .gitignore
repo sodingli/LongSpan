@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# ---- 密钥与本地配置（务必不要入库）----
+.env
+.env.local
+*.env.local
+
+# ---- 运行时数据 ----
+.data/
+*.db
+*.sqlite3
+
+# ---- 前端 ----
+node_modules/
+dist/
+.npm-cache/
+.vite/
+
+# ---- 调研参考（第三方源码与归档，不入版本库；见 docs/技术复用与技术继承方案.md）----
+.refs/
+
+# ---- 系统 ----
+.DS_Store
+
+# ---- 构建缓存 ----
+*.tsbuildinfo
+
+# ---- 运行时缓存（webpack 等）----
+.cache/
+
+# ---- WorkBuddy 工具目录（项目备忘/会话数据，不入代码库）----
+.workbuddy/

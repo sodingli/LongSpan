@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.data/
+.venv/
+node_modules/
+dist/
+
+# 本机模型密钥（模板见 .env.example）
+.env
+.env.local

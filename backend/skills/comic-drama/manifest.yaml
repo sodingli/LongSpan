@@ -1,0 +1,286 @@
+# 漫剧（动态漫）技能包
+#
+# 注意这个文件的性质：它不是配置，它是**流程本身**。
+# 阶段顺序、验收标准、是否要人确认、最多重做几次，全在这里。
+# 主程序里没有一行代码知道"漫剧"是什么 —— 这就是"技能可插拔"。
+
+id: comic-drama
+name: 漫剧（动态漫）
+version: 0.1.0
+icon: "🎬"
+description: 一句话创意 → 竖屏动态漫短视频（分镜图 + 配音 + 镜头运动 + 字幕）
+tags: [视频, 内容创作, 动态漫]
+
+# ---------------------------------------------------------------------------
+# 入口：所有字段都有默认值，用户不填也能跑（快通道「零输入可跑」的前提）
+# ---------------------------------------------------------------------------
+entry:
+  inputs:
+    - key: idea
+      label: 一句话创意
+      type: textarea
+      required: false
+      default: "外卖小哥其实是隐藏的美食评论家，被米其林主厨当众约战"
+      placeholder: "例如：末日废土里的机械维修师，捡到一株会说话的营养液管子"
+    - key: duration
+      label: 单集时长（秒）
+      type: number
+      required: false
+      default: 60
+    - key: episodes
+      label: 集数
+      type: number
+      required: false
+      default: 1
+    - key: style
+      label: 画风
+      type: select
+      required: false
+      default: "国漫赛璐璐"
+      options: ["国漫赛璐璐", "日系清新", "厚涂写实", "美式硬朗", "水墨"]
+    - key: genre
+      label: 题材
+      type: select
+      required: false
+      default: "都市轻喜剧"
+      options: ["都市轻喜剧", "玄幻", "科幻", "悬疑", "治愈日常"]
+    - key: audience
+      label: 目标受众
+      type: text
+      required: false
+      default: "18-30 岁短视频用户"
+    - key: platform
+      label: 发布平台
+      type: select
+      required: false
+      default: "竖屏短视频（9:16）"
+      options: ["竖屏短视频（9:16）", "横屏（16:9）"]
+
+  presets:
+    - id: preset_foodie
+      label: 示例：隐藏的美食评论家
+      brief:
+        idea: "外卖小哥其实是隐藏的美食评论家，被米其林主厨当众约战"
+        genre: "都市轻喜剧"
+        style: "国漫赛璐璐"
+    - id: preset_scifi
+      label: 示例：废土机械师
+      brief:
+        idea: "末日废土里的机械维修师，捡到一株会说话的营养液管子，它记得战前的世界"
+        genre: "科幻"
+        style: "厚涂写实"
+    - id: preset_healing
+      label: 示例：深夜面馆
+      brief:
+        idea: "只在凌晨两点开门的面馆，每位客人都要用一个秘密换一碗面"
+        genre: "治愈日常"
+        style: "日系清新"
+
+outputs: [md, json, image, audio, video]
+
+# ---------------------------------------------------------------------------
+# 配额治理：没有配额的自校验就是烧钱循环
+# ---------------------------------------------------------------------------
+orchestration:
+  mode: agent-driven          # 无中央编排器：Python 只提供工具与持久化
+  budget_default_usd: 10
+  max_revisions_per_stage: 3
+  max_send_backs: 3
+  max_wall_time_minutes: 40   # 精修通道含生图/配音/渲染，给足时间
+
+  # -------------------------------------------------------------------------
+  # 草稿诚实性：快通道相比精修「省略了什么」
+  #
+  # 为什么这份清单必须写在技能里、而不是写在前端文案里：
+  #   ① 它随技能变化（换一个任务类型，"省略了什么"完全不同）；
+  #   ② 前端只是渲染它，不承担"替模型道歉"的责任；
+  #   ③ 用户看到的是**确定的差距**，不是含糊的"AI 生成内容仅供参考"。
+  # 原则：草稿可以粗，但不可以不诚实。
+  # -------------------------------------------------------------------------
+  draft_gaps:
+    - "角色形象没有锁定：分镜里的角色是按文字锚点临时画的，跨格一致性未经验证"
+    - "只出了前 3 格样片，不是全部分镜"
+    - "配音只给了方案（音色分配、停顿与重音标注），没有合成音频"
+    - "还没有 BGM 与音效点位"
+    - "没有合成成片（无 mp4）"
+    - "时长与节奏是估算值，未经成片校验"
+
+# ---------------------------------------------------------------------------
+# 阶段流水线
+#   fast_channel: true  → 属于「3 分钟草稿」快通道
+#   human_approval_default: true → 出口要人确认（门禁）
+# ---------------------------------------------------------------------------
+stages:
+  # ---------------- C1 ----------------
+  - id: constraint_parse
+    name: 约束解析
+    icon: "🧭"
+    description: 把用户的一句话拆成 硬约束 / 软偏好 / 自由区，并给出你对创意的解读
+    prompt: prompts/01_constraint_parse.md
+    tools_available: [read_brief, write_artifact, record_decision]
+    produces: [constraints.json]
+    fast_channel: true
+    checkpoint_required: true
+    human_approval_default: false
+    success_criteria:
+      - 文件 constraints.json 存在且非空
+    review_focus:
+      - 是否把"用户没说的"错误地当成了硬约束
+      - 自由区是否给得足够大，让后续阶段有发挥空间
+    demo_file: fixtures/01_constraints.json
+
+  # ---------------- C2 ----------------
+  - id: production_spec
+    name: 生产规格
+    icon: "📐"
+    description: 反推可执行规格——格数、每格秒数、节奏表、工具链、预算
+    prompt: prompts/02_production_spec.md
+    tools_available: [read_brief, write_artifact, record_decision]
+    produces: [spec.json]
+    fast_channel: true
+    checkpoint_required: true
+    human_approval_default: false
+    success_criteria:
+      - 文件 spec.json 存在且非空
+      - 包含"格"
+    review_focus:
+      - 格数是否由"总时长 ÷ 每格时长"算出，而不是拍脑袋
+      - 预算估算是否给了区间而非精确假数
+    demo_file: fixtures/02_spec.json
+
+  # ---------------- C3 ★ 关卡 ----------------
+  - id: script
+    name: 剧本
+    icon: "📝"
+    description: Logline → 人物小传 → 分集大纲 → 分镜脚本（含每格台词与时长）
+    prompt: prompts/03_script.md
+    tools_available: [read_brief, write_artifact, record_decision, list_artifacts]
+    produces: [script.md]
+    fast_channel: true
+    checkpoint_required: true
+    human_approval_default: true          # ← 方向性关卡：跑偏在这里拦住
+    success_criteria:
+      - 文件 script.md 存在且非空
+      - 包含"Logline"
+      - 至少 900 字
+    review_focus:
+      - Logline 是否一句话说清"谁、要什么、被什么阻挡"
+      - 结尾是否有钩子（决定观众会不会看下一集）
+      - 每格是否只承载一个信息
+    demo_file: fixtures/03_script.md
+
+  # ---------------- C4 ★ 关卡 ----------------
+  - id: characters
+    name: 角色设计
+    icon: "🧑‍🎨"
+    description: 角色卡（外貌/服装/性格）+ 一致性锚点描述词，供后续每一格原文复用
+    prompt: prompts/04_characters.md
+    tools_available: [write_artifact, record_decision, placeholder_image]
+    produces: [characters.md]
+    fast_channel: false
+    checkpoint_required: true
+    human_approval_default: true          # ← 形象关卡：形象定了才好铺量
+    success_criteria:
+      - 文件 characters.md 存在且非空
+      - 包含"一致性锚点"
+    review_focus:
+      - 锚点描述词是否具体到可以直接粘贴进生图提示词
+      - 主角与配角是否有视觉上的可区分性
+    demo_file: fixtures/04_characters.md
+    # 阶段动作（FR-03）：交出 characters.md 后，由 Harness 为每个角色生成定妆图。
+    # 定妆图是 C5 逐格生图的参考图来源（subject_reference），从根上解决跨格换脸。
+    actions:
+      - tool: generate_character_art
+
+  # ---------------- C5 ----------------
+  - id: storyboard
+    name: 分镜绘制
+    icon: "🎨"
+    description: 逐格出画面描述 + 分镜图；先跑前 3 格样片看效果，再铺满全格
+    prompt: prompts/05_storyboard.md
+    tools_available: [write_artifact, read_artifact, placeholder_image, record_decision, list_artifacts]
+    produces: [storyboard.md, panels.json]
+    fast_channel: true
+    checkpoint_required: true
+    human_approval_default: false
+    success_criteria:
+      - 文件 storyboard.md 存在且非空
+      - 至少 600 字
+      - 文件 panels.json 存在且非空
+    review_focus:
+      - 每格是否复用了角色卡里的锚点原文
+      - 相邻格之间是否有镜头景别变化（避免"每格都是中景"）
+      - 是否标注了镜头运动方式
+    demo_file: fixtures/05_storyboard.md
+    # 阶段动作：模型交出 panels.json 后，由 Harness 确定性执行。
+    # 快通道只出前 3 格样片（草稿诚实性：草稿只给样片，精修通道才铺满）。
+    actions:
+      - tool: generate_images
+        plan: panels.json
+        fast_limit: 3
+    # 一致性硬校验（FR-02）：分镜格必须复用角色锚点原文，否则判失败重做。
+    # 「什么算一致」是漫剧的知识，写在这里（数据），runner 只读声明调校验器。
+    # slow_only: 快通道（草稿）下角色设计阶段未跑、characters.md 不存在，
+    # 跳过校验（草稿诚实性：一致性是精修通道的承诺，见 draft_gaps）。
+    consistency_checks:
+      - kind: panel_anchor_consistency
+        plan: panels.json
+        anchors: characters.md
+        slow_only: true
+
+  # ---------------- C6 ----------------
+  # 快通道包含它：配音「方案」是纯文本产出、很便宜，
+  # 但它正是草稿能不能被判断的关键（用户要听的是"这句台词配这个音色对不对"，不是音频波形）。
+  - id: voice
+    name: 配音与音效
+    icon: "🎙️"
+    description: 台词分配音色、标注停顿与重音；BGM 与音效点位；精修通道合成配音音频
+    prompt: prompts/06_voice.md
+    tools_available: [write_artifact, record_decision]
+    produces: [voice.md, lines.json]
+    fast_channel: true
+    checkpoint_required: true
+    human_approval_default: false
+    success_criteria:
+      - 文件 voice.md 存在且非空
+      - 文件 lines.json 存在且非空
+    review_focus:
+      - 每句台词的预估时长与对应格子的时长是否对得上
+    demo_file: fixtures/06_voice.md
+    # 草稿只给"方案"（音色/停顿/重音），音频合成留给精修通道 —— 与 draft_gaps 一致。
+    actions:
+      - tool: synthesize_lines
+        plan: lines.json
+        slow_only: true
+
+  # ---------------- C7 ----------------
+  - id: compose
+    name: 合成
+    icon: "🎞️"
+    description: 分镜运动、字幕、时间轴对齐 → 竖屏 mp4；交付前跑一次自审
+    prompt: prompts/07_compose.md
+    tools_available: [write_artifact, read_artifact, list_artifacts, record_decision]
+    produces: [edit_plan.md, video/final.mp4]
+    fast_channel: false
+    checkpoint_required: true
+    human_approval_default: false
+    success_criteria:
+      - 文件 edit_plan.md 存在且非空
+      - 文件 video/final.mp4 存在且非空
+    review_focus:
+      - 时间轴总长是否与规格一致（±10%）
+      - 是否有静默降级未标注
+    demo_file: fixtures/07_edit_plan.md
+    # 合成阶段自带"备齐素材"：先补齐缺失的分镜图与配音（幂等，已存在的复用），
+    # 再渲染成片 —— 这样「草稿（只跑了 3 格）→ 继续优化」也能拿到完整成片。
+    # generate_panel_videos 在 render_video 之前：先给关键格生成真实视频片段，
+    # render_video 才能把这些片段排进时间轴（否则成片全是静态运镜）。
+    actions:
+      - tool: generate_images
+        plan: panels.json
+      - tool: synthesize_lines
+        plan: lines.json
+      - tool: generate_panel_videos
+        plan: panels.json
+      - tool: render_video
+        plan: panels.json
