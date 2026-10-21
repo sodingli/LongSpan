@@ -3,10 +3,9 @@
 
 用法：
     cd backend
-    PY=/Users/lidashuai5/.workbuddy/binaries/python/envs/default/bin/python
-    $PY scripts/check_llm.py
-    $PY scripts/check_llm.py --model deepseek-reasoner
-    $PY scripts/check_llm.py --base-url https://api.moonshot.cn/v1 --api-key sk-xxx --model moonshot-v1-8k
+    python3 scripts/check_llm.py
+    python3 scripts/check_llm.py --model deepseek-reasoner
+    python3 scripts/check_llm.py --base-url https://api.moonshot.cn/v1 --api-key sk-xxx --model moonshot-v1-8k
 
 它会真实发一条极短请求，验证「接口地址 + Key + 模型名」三者是否匹配。
 退出码：0 = 通了；1 = 没通（原因在最后一行 ERROR 后）。

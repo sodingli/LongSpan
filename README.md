@@ -23,13 +23,33 @@
 
 ## 快速开始
 
+> **环境要求**：Python 3.10+、Node 18+（渲染成片另需本机 Chrome / Chromium）。
+> 解释器或 node 不在 `PATH` 里时，用环境变量 `LONGSPAN_PYTHON`、`LONGSPAN_NODE_BIN` 指定，
+> 或写进根目录的 `.longspan.local`（已 gitignore，只影响本机，无需改脚本）：
+>
+> ```bash
+> LONGSPAN_PYTHON=/path/to/python
+> LONGSPAN_NODE_BIN=/path/to/node/bin
+> LONGSPAN_CHROME=/path/to/chrome        # 可选：自定义浏览器路径
+> ```
+
+### 0. 装依赖
+
+```bash
+cd backend && python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cd ../frontend && npm install
+```
+
 ### 1. 启动后端
 
 ```bash
 cd backend
-PY=/Users/lidashuai5/.workbuddy/binaries/python/envs/default/bin/python
-$PY -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
+
+或者图省事：根目录 `bash start.sh` 一条命令同时拉起前后端。
 
 首次运行会自动建库（SQLite，位于 `backend/.data/longspan.db`）并扫描技能目录。
 
@@ -92,19 +112,19 @@ export LONGSPAN_LLM_FALLBACK_MODELS=deepseek-v4-pro   # 可选：备用模型链
 
 ```bash
 cd backend
-$PY scripts/check_llm.py
-$PY scripts/check_llm.py --base-url https://api.moonshot.cn/v1 --api-key sk-xxx --model moonshot-v1-8k
-$PY scripts/check_llm.py --fallback "deepseek-v4-pro,xxx@https://other.host/v1"   # 顺带探测备用模型
+python3 scripts/check_llm.py
+python3 scripts/check_llm.py --base-url https://api.moonshot.cn/v1 --api-key sk-xxx --model moonshot-v1-8k
+python3 scripts/check_llm.py --fallback "deepseek-v4-pro,xxx@https://other.host/v1"   # 顺带探测备用模型
 ```
 
 ### 2. 启动前端
 
 ```bash
 cd frontend
-export PATH=/Users/lidashuai5/.workbuddy/binaries/node/versions/22.22.2-6/bin:$PATH
-npm install     # 若装不动：已内置 .npmrc 指向 registry.npmmirror.com
 npm run dev     # → http://localhost:5173
 ```
+
+> 若 `npm install` 装不动：仓库已内置 `.npmrc` 指向 `registry.npmmirror.com`，删掉可换回官方源。
 
 > 前端把 `/api` 代理到 `127.0.0.1:8000`（见 `vite.config.ts`），无需处理跨域。
 
@@ -112,11 +132,10 @@ npm run dev     # → http://localhost:5173
 
 ```bash
 cd backend
-PY=/Users/lidashuai5/.workbuddy/binaries/python/envs/default/bin/python
-$PY scripts/check_llm.py         # 模型/接口连通性自检（配 Key 后先跑这个）
-$PY scripts/smoke.py fast        # 主干冒烟：跑完快通道
-$PY scripts/e2e_http.py          # 25 项端到端验收（含 SSE、关卡、草稿、升级续跑）
-$PY scripts/seed_demo.py         # 灌入 3 个演示任务，覆盖三种状态
+python3 scripts/check_llm.py         # 模型/接口连通性自检（配 Key 后先跑这个）
+python3 scripts/smoke.py fast        # 主干冒烟：跑完快通道
+python3 scripts/e2e_http.py          # 25 项端到端验收（含 SSE、关卡、草稿、升级续跑）
+python3 scripts/seed_demo.py         # 灌入 3 个演示任务，覆盖三种状态
 ```
 
 > 改动数据模型后需要 `rm -rf .data` —— SQLAlchemy 的 `create_all` 不会迁移已有表。

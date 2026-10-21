@@ -6,7 +6,7 @@
 - 跑完额外输出「参考图通道是否被触发」的判定依据，供验证报告引用
 
 用法：
-    /Users/lidashuai5/.workbuddy/binaries/python/envs/default/bin/python scripts/verify_consistency.py
+    python3 scripts/verify_consistency.py
 
 真实调用 LLM + 生图 + 视频，耗时数分钟、有真实费用。
 """

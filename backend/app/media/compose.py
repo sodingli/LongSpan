@@ -29,12 +29,14 @@ logger = logging.getLogger("longspan.media.compose")
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 REMOTION_DIR = BACKEND_DIR / "media" / "remotion"
 
-NODE_BIN_CANDIDATES = [
-    "/Users/lidashuai5/.workbuddy/binaries/node/versions/22.22.2-6/bin",
-]
-CHROME_CANDIDATES = [
+# node 的 bin 目录候选：默认走 PATH；需要指定版本时设 LONGSPAN_NODE_BIN
+NODE_BIN_CANDIDATES = [d for d in [os.environ.get("LONGSPAN_NODE_BIN", "")] if d]
+CHROME_CANDIDATES = [c for c in [os.environ.get("LONGSPAN_CHROME", "")] if c] + [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
 ]
 
 VALID_MOTIONS = {"zoom-in", "zoom-out", "pan-left", "pan-right", "pan-up", "pan-down", "static"}

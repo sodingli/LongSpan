@@ -1,7 +1,7 @@
 """M0 冒烟测试：跑通一条完整流水线（含人工关卡自动确认）。
 
 用法：
-    /Users/lidashuai5/.workbuddy/binaries/python/envs/default/bin/python scripts/smoke.py [fast|slow]
+    python3 scripts/smoke.py [fast|slow]
 
 验收判据（对应 MRD §13 M0）：
   1. 能跑完一条完整流水线

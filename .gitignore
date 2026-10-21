@@ -8,6 +8,8 @@ __pycache__/
 .env
 .env.local
 *.env.local
+# 本机专属启动配置（解释器 / node 路径等）
+.longspan.local
 
 # ---- 运行时数据 ----
 .data/
@@ -32,5 +34,5 @@ dist/
 # ---- 运行时缓存（webpack 等）----
 .cache/
 
-# ---- WorkBuddy 工具目录（项目备忘/会话数据，不入代码库）----
+# ---- 本地工具目录（IDE / Agent 会话数据等，不入代码库）----
 .workbuddy/
