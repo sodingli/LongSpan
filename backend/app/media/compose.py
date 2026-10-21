@@ -41,6 +41,11 @@ CHROME_CANDIDATES = [c for c in [os.environ.get("LONGSPAN_CHROME", "")] if c] + 
 
 VALID_MOTIONS = {"zoom-in", "zoom-out", "pan-left", "pan-right", "pan-up", "pan-down", "static"}
 
+# 格间 crossfade 重叠（秒）：下一格的 from 比本格结尾提前这么多，
+# 渲染端在本重叠窗里把下一格淡入到本格上（Panel 不再淡出，接力给下一格的淡入）。
+# 同时也是片头卡→格 1、最后格→片尾卡的叠化窗。
+TRANSITION_SECONDS = 0.5
+
 
 def _node_bin() -> str:
     for d in NODE_BIN_CANDIDATES:
@@ -95,9 +100,11 @@ def normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
     height = int(spec.get("height") or 1920)
     intro = spec.get("intro") or None
     outro = spec.get("outro") or None
+    transition = max(0.0, min(float(spec.get("transitionSeconds") or TRANSITION_SECONDS), 2.0))
     degraded: list[str] = []
 
-    t = float(intro["durationInSeconds"]) if intro and intro.get("durationInSeconds") else 0.0
+    # 起点：片头卡让出大部分时长，但提前 transition 入画 —— 格 1 与片头卡叠化。
+    t = max(0.0, float(intro["durationInSeconds"]) - transition) if intro and intro.get("durationInSeconds") else 0.0
     panels: list[dict[str, Any]] = []
     unknown_motions: list[str] = []
     frame_notes: list[str] = []
@@ -127,6 +134,11 @@ def normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
             continue
 
         video = str(p.get("video") or "").strip()
+        # fromSeconds 显式给出（工具侧已按 crossfade 排好）→ 原样信任；
+        # 缺失才按顺序排（带重叠）。混用时以显式值为准，顺序游标只增不减。
+        explicit_from = p.get("fromSeconds")
+        if isinstance(explicit_from, (int, float)) and explicit_from >= 0:
+            t = max(t, float(explicit_from))
         panels.append(
             {
                 "src": src or frames[0],
@@ -141,10 +153,11 @@ def normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 "isPlaceholder": is_ph,
             }
         )
-        t += dur
+        t += dur - transition
 
     if outro and outro.get("durationInSeconds"):
-        t += float(outro["durationInSeconds"])
+        # 片尾卡提前 transition 入画，与最后一格叠化
+        t += float(outro["durationInSeconds"]) - transition
 
     audio_in = spec.get("audio") or []
     audio = [
@@ -164,6 +177,7 @@ def normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "fps": fps,
         "width": width,
         "height": height,
+        "transitionSeconds": transition,
         "durationInSeconds": round(t, 3),
         "intro": intro,
         "outro": outro,
@@ -226,11 +240,11 @@ async def render_video(
             raise RuntimeError(f"分镜图全部缺失，无法合成：{missing}")
         spec["degraded"].append(f"以下素材缺失已剔除：{missing}")
 
-    # 重算时长（剔除后可能变短）
+    # 重算时长（剔除后可能变短）；片尾卡与最后一格叠化，要减去重叠窗
     end = spec["panels"][-1]["fromSeconds"] + spec["panels"][-1]["durationInSeconds"]
     if spec.get("outro"):
-        end += float(spec["outro"]["durationInSeconds"])
-    spec["durationInSeconds"] = round(end, 3)
+        end += float(spec["outro"]["durationInSeconds"]) - spec.get("transitionSeconds", TRANSITION_SECONDS)
+    spec["durationInSeconds"] = round(max(end, 1.0), 3)
 
     props_path = (workspace / "video" / "render_props.json").resolve()
     props_path.parent.mkdir(parents=True, exist_ok=True)

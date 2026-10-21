@@ -39,7 +39,13 @@ export const Panel: React.FC<{
   speaker?: string
   label?: string
   isPlaceholder?: boolean
-}> = ({ src, frames, video, motion, durationInFrames, subtitle, speaker, label, isPlaceholder }) => {
+  /** 入画叠化帧数：Python 侧已把 from 前移 transition 窗口，
+   * 上一格此刻仍在画面下方，本格在这段窗口里淡入接力（crossfade）。 */
+  fadeInFrames?: number
+  /** 出画淡出帧数：只给「最后一格且没有片尾卡」用，避免结尾戛然而止。
+   * 中间格**绝不淡出** —— 两格重叠区双双变暗会出现黑闪（旧版实测）。 */
+  fadeOutFrames?: number
+}> = ({ src, frames, video, motion, durationInFrames, subtitle, speaker, label, isPlaceholder, fadeInFrames = 0, fadeOutFrames = 0 }) => {
   const frame = useCurrentFrame()
   const { fps, width } = useVideoConfig()
   const end = Math.max(1, durationInFrames - 1)
@@ -52,14 +58,16 @@ export const Panel: React.FC<{
   // 交叉过渡时长：0.35s，但不能长到把短片段整个吃掉
   const xfade = Math.max(2, Math.min(Math.round(fps * 0.35), Math.floor(segLen / 3)))
 
-  // 入画 / 出画淡入淡出（各 0.22s）—— 让格与格之间的切换不生硬
-  const fadeFrames = Math.min(Math.round(fps * 0.22), Math.floor(durationInFrames / 3))
-  const opacity = interpolate(
-    frame,
-    [0, fadeFrames, end - fadeFrames, end],
-    [0, 1, 1, 0],
-    { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }
-  )
+  // 入画叠化 + （仅末格）出画淡出。两者取小，避免重叠区间闪烁。
+  const fIn = Math.max(0, Math.min(Math.round(fadeInFrames), Math.floor(durationInFrames / 2)))
+  const fOut = Math.max(0, Math.min(Math.round(fadeOutFrames), Math.floor(durationInFrames / 2)))
+  const inOpacity = fIn > 0
+    ? interpolate(frame, [0, fIn], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
+    : 1
+  const outOpacity = fOut > 0
+    ? interpolate(frame, [end - fOut, end], [1, 0], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
+    : 1
+  const opacity = Math.min(inOpacity, outOpacity)
 
   // 字幕：等入画结束后再出现，避免和转场撞在一起
   const subDelay = Math.min(Math.round(fps * 0.35), Math.floor(durationInFrames / 2))

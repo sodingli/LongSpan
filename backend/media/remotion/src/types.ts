@@ -39,6 +39,12 @@ export type AudioClip = {
   speaker?: string
 }
 
+/**
+ * 格间 crossfade 重叠（秒）：Python 侧已把下一格的 fromSeconds 前移这么多，
+ * 本格仍在画面下方时下一格淡入 —— 这是格间"叠化接力"的窗口宽度。
+ */
+export const DEFAULT_TRANSITION_SECONDS = 0.5
+
 export type Motion =
   | 'zoom-in'
   | 'zoom-out'
@@ -58,6 +64,8 @@ export type ComicDramaProps = {
   height: number
   /** 全片总时长（秒）——由 Python 侧算好，Remotion 不猜 */
   durationInSeconds: number
+  /** 格间 crossfade 重叠（秒），缺省 DEFAULT_TRANSITION_SECONDS */
+  transitionSeconds?: number
   /** 片头卡 */
   intro?: { durationInSeconds: number; title: string; subtitle?: string } | null
   /** 片尾卡（空则不生成） */

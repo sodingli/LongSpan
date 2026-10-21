@@ -8,6 +8,7 @@ import {
   useVideoConfig,
 } from 'remotion'
 import { Panel } from './Panel'
+import { DEFAULT_TRANSITION_SECONDS } from './types'
 import type { ComicDramaProps } from './types'
 
 /**
@@ -59,8 +60,11 @@ export const ComicDrama: React.FC<ComicDramaProps> = ({
   intro,
   outro,
   showWatermark = true,
+  transitionSeconds = DEFAULT_TRANSITION_SECONDS,
 }) => {
   const baseFont = Math.round(width * 0.05)
+  // 格间 crossfade 重叠窗（帧）：Python 侧排时间轴时已把每格 from 前移这么多
+  const fadeIn = Math.max(0, Math.round(transitionSeconds * fps))
 
   return (
     <AbsoluteFill style={{ backgroundColor: '#080b13' }}>
@@ -119,6 +123,12 @@ export const ComicDrama: React.FC<ComicDramaProps> = ({
       {/* ---------------- 分镜 ---------------- */}
       {panels.map((p, i) => {
         const durFrames = Math.max(1, Math.round(p.durationInSeconds * fps))
+        // 只有「最后一格且没有片尾卡」才淡出：中间格的接力交给下一格的淡入，
+        // 双双淡出会在重叠区出现黑闪（旧版实测）。
+        const fadeOut =
+          !outro && i === panels.length - 1
+            ? Math.max(0, Math.round(Math.min(transitionSeconds, p.durationInSeconds / 3) * fps))
+            : 0
         return (
           <Sequence
             key={`panel-${i}`}
@@ -135,6 +145,8 @@ export const ComicDrama: React.FC<ComicDramaProps> = ({
               speaker={p.speaker}
               label={p.label}
               isPlaceholder={p.isPlaceholder}
+              fadeInFrames={fadeIn}
+              fadeOutFrames={fadeOut}
             />
           </Sequence>
         )
@@ -143,7 +155,7 @@ export const ComicDrama: React.FC<ComicDramaProps> = ({
       {/* ---------------- 片尾 ---------------- */}
       {outro ? (
         <Sequence
-          from={Math.round(outroStartSeconds(panels, intro) * fps)}
+          from={Math.round(outroStartSeconds(panels, intro, transitionSeconds) * fps)}
           durationInFrames={Math.round(outro.durationInSeconds * fps)}
         >
           <Centered
@@ -199,11 +211,13 @@ export const ComicDrama: React.FC<ComicDramaProps> = ({
   )
 }
 
-/** 片尾的起始秒：片头 + 所有分镜之后 */
+/** 片尾的起始秒：最后一格结尾前移 transition，与片尾卡叠化 */
 function outroStartSeconds(
   panels: ComicDramaProps['panels'],
-  intro: ComicDramaProps['intro']
+  intro: ComicDramaProps['intro'],
+  transitionSeconds: number = DEFAULT_TRANSITION_SECONDS
 ): number {
   const introDur = intro ? intro.durationInSeconds : 0
-  return panels.reduce((max, p) => Math.max(max, p.fromSeconds + p.durationInSeconds), introDur)
+  const maxEnd = panels.reduce((max, p) => Math.max(max, p.fromSeconds + p.durationInSeconds), introDur)
+  return Math.max(0, maxEnd - transitionSeconds)
 }

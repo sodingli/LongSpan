@@ -10,6 +10,7 @@ M1 追加 TTS、Remotion 合成、FFmpeg、真图像生成。
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import logging
@@ -607,51 +608,31 @@ async def _generate_images(
     }
 
 
-def _keyframe_indices(panels: list) -> list[str]:
-    """确定哪些格要做「图生视频」—— 关键格策略（成本与动效的折中）。
-
-    为什么是确定性规则而非模型标记（2026-10-21 经验教训）：
-    让模型在 panels.json 里自报「哪些是高潮格」又是一层「模型自觉」——
-    它不报或乱报时，要么全片没动效、要么要再追一轮校验。这里直接按结构取：
-    首格（开场定调）+ 中间格（叙事/情绪顶点）+ 尾格（收束），三者去重。
-    关键格的视频片段播完，其余格仍用静态 Ken Burns 运镜，衔接自然。
-
-    返回格号（字符串）列表，按播放顺序。
-    """
-    if not panels:
-        return []
-    n = len(panels)
-    picks: list[str] = []
-    for pos in (0, n // 2, n - 1):
-        if pos < n:
-            item = panels[pos]
-            key = _item_index(item, pos + 1) if isinstance(item, dict) else str(pos + 1)
-            if key not in picks:
-                picks.append(key)
-    return picks
-
-
 async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> dict:
-    """FR-06：对关键格调用「图生视频」模型，产出真正的连续动效片段。
+    """FR-06：**全格视频化 + 链式首尾帧** —— 每一格都生成真实的模型视频段。
 
-    这是把「一句话 → 动态漫」从「幻灯片 + 运镜」升级为「关键镜头是模型生成的视频」
-    的关键一步。video.py 的 generate_clip 早已就绪（万相 wan3.0 图生视频），
-    此前只暴露在画布手动模式，自动流水线没有动作去调它 —— 于是成片里每格
-    video=null，全是静态图。这里补上这个动作。
+    效果优先策略（2026-10-21 用户拍板「先不考虑成本」）：
 
-    - 关键格策略：首格 + 中间格 + 尾格（见 _keyframe_indices），去重。
-    - 每格用其首帧（panels 图）作 first_frame，时长 5 秒，走全局视频模型。
-    - 结果写入 media/images.json 的 video 字段（复用 canvas_store.set_panel_video），
-      render_video 阶段自然消费。
-    - 幂等：该格已有 status=ready 且文件在的视频片段，跳过（不重复计费）。
-    - 降级诚实：视频生成失败 → 该格退回静态运镜，如实记录，不整段卡死。
+    - 全格视频化：不再只做首/中/尾三个关键格。9 格静态 Ken Burns 夹 3 段真视频
+      的「真动假动交替」是成片不连贯的最大来源（实测归因）。
+    - 链式首尾帧：第 i 格的片段以**本格分镜图**为 first_frame、
+      **下一格分镜图**为 last_frame —— 片段结尾恰好是下一格的开场画面，
+      播到下一格时画面无缝续上，从根上消除格间跳变。
+      两端锚点都是静态分镜图，所以 12 段**互相独立、可并行**（限流 3 路），
+      不需要「等上一段渲完抽尾帧」的串行 24 分钟。
+    - 提示词带上下文：本格动作 + 下一格场景写进同一段提示词，
+      并按官方要求在文字里「指名」首帧/尾帧素材（光传不提，模型不会真参考）。
+    - 幂等：只复用带 `chained` 标记且文件在的片段 —— 旧的关键格片段没有尾帧锚点，
+      复用会让链断在半路，宁可重新生成。
+    - 降级诚实：某格失败退回静态运镜并如实上报；断口由渲染端 crossfade 兜底，
+      不让一格失败拖死整条链。
     """
     from ..canvas_store import set_panel_video
     from ..media.video import generate_clip, video_ready
 
     panels, shape_note = _plan_items(plan, "panels")
     if not panels:
-        return {"error": "清单里没有 panels 数组，无法定位关键格", "hint": "依赖 storyboard 的 panels.json。"}
+        return {"error": "清单里没有 panels 数组，无法视频化", "hint": "依赖 storyboard 的 panels.json。"}
 
     ok, why = video_ready()
     if not ok:
@@ -660,62 +641,125 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
     images: dict[str, dict] = _read_json_file(ctx, IMAGE_INDEX_REL) or {}
     workspace = ctx.storage.run_workspace(ctx.run_id)
 
-    picks = _keyframe_indices(panels)
-    if not picks:
-        return {"degraded": ["没有可做视频的关键格"], "generated": 0, "reused": 0}
+    # 按清单顺序取格号；只有带分镜图的格才进链条（链的锚点就是分镜图）
+    ordered: list[tuple[str, dict]] = []
+    for i, p in enumerate(panels, 1):
+        if not isinstance(p, dict):
+            continue
+        key = _item_index(p, i)
+        img = images.get(key) or {}
+        frame_path = str(img.get("path") or "").strip()
+        if not frame_path or not ctx.storage.exists(ctx.run_id, frame_path):
+            continue
+        ordered.append((key, {"panel": p, "frame": frame_path}))
+
+    if not ordered:
+        return {"degraded": ["没有任何格带分镜图，无法视频化"], "generated": 0, "reused": 0}
+
+    chain_enabled = not (isinstance(plan, dict) and plan.get("chain_frames") is False)
 
     generated: list[str] = []
     reused: list[str] = []
     degraded: list[str] = []
+    chained_flags: dict[str, bool] = {}  # 本轮每格是否带尾帧锚（从生成结果记，不读过期快照）
     if shape_note:
         degraded.append(f"panels.json {shape_note}")
 
-    for key in picks:
+    async def _one(pos: int) -> None:
+        key, item = ordered[pos]
+        p = item["panel"]
         img = images.get(key) or {}
-        # 已有可用视频片段 → 复用（幂等，防续跑重复计费）
         clip = img.get("video") if isinstance(img.get("video"), dict) else {}
-        if str(clip.get("status") or "") == "ready" and clip.get("path") and ctx.storage.exists(ctx.run_id, clip["path"]):
+        # 复用条件：ready + 文件在 + （链式模式下）片段本身是带尾帧锚点生成的。
+        # 旧的关键格片段没有 chained 标记 —— 它的结尾不是下一格开场，复用必跳变。
+        chained_ok = (not chain_enabled) or bool(clip.get("chained"))
+        if (
+            str(clip.get("status") or "") == "ready"
+            and clip.get("path")
+            and chained_ok
+            and ctx.storage.exists(ctx.run_id, clip["path"])
+        ):
             reused.append(key)
-            continue
-        # 取该格首帧作参考（图生视频的输入）
-        frame_path = str(img.get("path") or "").strip()
-        if not frame_path or not ctx.storage.exists(ctx.run_id, frame_path):
-            degraded.append(f"第 {key} 格缺分镜图，跳过视频化")
-            continue
-        # 视频提示词：从 panels 里取该格的画面描述（prompt），交给模型生成动效
-        panel_item = next((p for p in panels if isinstance(p, dict) and _item_index(p, 0) == key), {})
-        prompt = str(
-            panel_item.get("prompt") or panel_item.get("image_prompt") or panel_item.get("scene") or ""
-        ).strip()
-        if not prompt:
-            prompt = "让画面产生自然的镜头运动，保持人物与画风一致"
-        try:
-            out = await generate_clip(
-                workspace,
-                prompt=prompt[:1200],
-                first_frame=frame_path,
-                last_frame=None,
-                reference_video=None,
-                duration=5,
-                mode=None,
-                out_rel=f"panels/panel-{key}.mp4",
-                model=None,
-            )
-            out.update({"status": "ready", "prompt": prompt[:300]})
+            chained_flags[key] = bool(clip.get("chained"))
+            return
+
+        base_prompt = str(
+            p.get("prompt") or p.get("image_prompt") or p.get("scene") or ""
+        ).strip() or "让画面产生自然的镜头运动，保持人物与画风一致"
+
+        # 链式尾帧：本格片段必须收在下一格的开场画面上
+        last_frame: str | None = None
+        if chain_enabled and pos + 1 < len(ordered):
+            next_key, next_item = ordered[pos + 1]
+            next_scene = str(
+                next_item["panel"].get("scene") or next_item["panel"].get("prompt") or ""
+            ).strip()
+            last_frame = next_item["frame"]
+            prompt = (
+                f"{base_prompt}\n\n"
+                "首帧是本镜头的开场画面。镜头完成上述动作后，"
+                f"结尾平滑过渡并定格到尾帧画面（下一镜头：{next_scene[:120]}）；"
+                "首帧与尾帧是同一连贯镜头的起点与落点，人物身份、服装与画风全程一致。"
+            )[:1200]
+        else:
+            prompt = f"{base_prompt}\n\n画面从首帧开始，动作自然完整，保持人物与画风一致。"[:1200]
+
+        # 审核/网关有随机性：同一张图此前过审、这次被拦的实例真实存在
+        # （火山内容审核对半写实人脸的判定不稳定）。每格最多 3 次尝试，
+        # 全失败才退回静态 —— 重试是廉价的，静默放弃一格动效才是贵的。
+        out: dict[str, Any] | None = None
+        last_err: Exception | None = None
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(2.0 * attempt)
+            try:
+                out = await generate_clip(
+                    workspace,
+                    prompt=prompt,
+                    first_frame=item["frame"],
+                    last_frame=last_frame,
+                    reference_video=None,
+                    duration=5,
+                    mode=None,
+                    out_rel=f"panels/panel-{key}.mp4",
+                    model=None,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                logger.warning("格 %s 视频化第 %s 次失败 run=%s: %s", key, attempt + 1, ctx.run_id, exc)
+        if out is not None:
+            out.update({"status": "ready", "prompt": prompt[:300], "chained": bool(last_frame)})
             set_panel_video(ctx.storage, ctx.run_id, key, out)
             generated.append(key)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("关键格视频化失败 run=%s key=%s: %s", ctx.run_id, key, exc)
-            degraded.append(f"第 {key} 格视频生成失败，退回静态运镜：{str(exc)[:200]}")
+            chained_flags[key] = bool(last_frame)
+        else:
+            degraded.append(f"第 {key} 格视频生成失败（重试 3 次），退回静态运镜：{str(last_err)[:200]}")
 
+    # 限流并行：每段独立提交（锚点都是静态分镜图，无依赖），3 路并发
+    # 是对网关限流与下游排队的安全余量。
+    sem = asyncio.Semaphore(3)
+
+    async def _worker(pos: int) -> None:
+        async with sem:
+            await _one(pos)
+
+    await asyncio.gather(*(_worker(i) for i in range(len(ordered))))
+
+    chained_count = sum(1 for v in chained_flags.values() if v)
     return {
-        "keyframes": picks,
+        "panels": [k for k, _ in ordered],
         "generated": generated,
         "reused": reused,
         "degraded": degraded,
+        "chain": {
+            "enabled": chain_enabled,
+            "chained_clips": chained_count,
+            "static_fallback": len(ordered) - len(generated) - len(reused),
+        },
         "summary": (
-            f"关键格视频化：新生成 {len(generated)} 段（{', '.join(f'格{g}' for g in generated) or '无'}）、"
-            f"复用 {len(reused)} 段，其余格静态运镜"
+            f"全格视频化（链式首尾帧）：新生成 {len(generated)} 段、复用 {len(reused)} 段、"
+            f"静态兜底 {len(ordered) - len(generated) - len(reused)} 格（共 {len(ordered)} 格）"
         ),
     }
 
@@ -872,6 +916,140 @@ async def _synthesize_lines(ctx: ToolContext, plan: dict | None = None) -> dict:
     }
 
 
+def _norm_text(s: Any) -> str:
+    """去空白与标点后的归一化文本，用于台词↔字幕的互含匹配。"""
+    return re.sub(r"[\s，。！？…、,.!?；;：:\"'“”‘’（）()\[\]【】《》—\-·]+", "", str(s or ""))
+
+
+def _match_lines_to_panels(
+    lines: list, panels: list
+) -> tuple[dict[str, list[tuple[str, dict]]], list[str]]:
+    """把台词句映射到所属格。返回 ({格号: [(句键, 句对象)]}, 匹配过程说明)。
+
+    三级策略（从可信到兜底）：
+    1. 句里显式写了 panel 字段 → 直接用；
+    2. 台词文本与 panels.json 的 subtitle 互含（去标点后）→ 按文本匹配；
+    3. 都没有 → **插空**：按叙事顺序落进「已锚定句」之间的空格里
+       （文本完全匹配上的句是锚点；未匹配句只会分给它前后锚点之间的格，
+       绝不从第一个格重新数起 —— 否则中间一句没匹配上会整体前移错位）。
+
+    为什么绝不做「句号 = 格号」：lines.json 的 index 是**句号**不是格号，
+    模型不写 panel 时拿 index 当格号会把台词整体错位（实测 19eaa 任务
+    9 句 index 从 3 起，按 index 映射全偏）。身份键分离是这里的地基。
+    """
+    notes: list[str] = []
+
+    # 面板顺序位置表（格号 → 在播放顺序里的下标）
+    pos_of: dict[str, int] = {}
+    sub_titles: list[tuple[str, int, str]] = []  # (格号, 位置, 归一化字幕)
+    for i, p in enumerate(panels, 1):
+        if not isinstance(p, dict):
+            continue
+        pk = _item_index(p, i)
+        pos_of.setdefault(pk, len(pos_of))
+        t = _norm_text(p.get("subtitle") or p.get("line") or p.get("dialogue"))
+        if t:
+            sub_titles.append((pk, pos_of[pk], t))
+
+    # 第一遍：显式格号 / 文本互含 → 锚点；其余进 unmatched（保持句序）
+    assigned: list[list] = []  # [句序, 句键, 句对象, 格号或 None]
+    n_unmatched = 0
+    for i, ln in enumerate(lines, 1):
+        if not isinstance(ln, dict):
+            continue
+        lk = _line_key(ln, i)
+        row = [i, lk, ln, None]
+        pv = ln.get("panel", ln.get("panel_index", ln.get("panelIndex")))
+        try:
+            row[3] = str(int(pv))
+            assigned.append(row)
+            continue
+        except (TypeError, ValueError):
+            pass
+        nt = _norm_text(ln.get("text") or ln.get("line") or ln.get("content"))
+        if len(nt) >= 4:
+            for pk, _pos, st in sub_titles:
+                if nt in st or st in nt:
+                    row[3] = pk
+                    break
+        if row[3] is None:
+            n_unmatched += 1
+        assigned.append(row)
+
+    n_explicit = sum(1 for r in assigned if r[3] and r[3] and _has_panel_field(r[2]))
+    n_text = sum(1 for r in assigned if r[3]) - n_explicit
+
+    # 第二遍：未锚定的句按叙事顺序插进前后锚点之间的空格
+    if n_unmatched:
+        if not sub_titles:
+            # 连字幕都没有：均匀摊到所有格（保底，不丢句）
+            keys = list(pos_of.keys())
+            if keys:
+                j = 0
+                for r in assigned:
+                    if r[3] is None:
+                        r[3] = keys[min(j, len(keys) - 1)]
+                        j += 1
+                notes.append(f"{n_unmatched} 句无任何可匹配锚点，已均匀摊到 {len(keys)} 个格")
+        else:
+            used_in_gap: set[int] = set()  # 插空已占用的面板位置（按区间重置）
+            prev_pos: int | None = None    # 前一个锚点的面板位置
+            filled = 0
+            for r in assigned:
+                if r[3] is not None:
+                    prev_pos = pos_of.get(r[3], prev_pos)
+                    used_in_gap = set()
+                    continue
+                nxt_pos = next(
+                    (pos_of[r2[3]] for r2 in assigned if r2[0] > r[0] and r2[3]), None
+                )
+                lo = (prev_pos + 1) if prev_pos is not None else 0
+                hi = nxt_pos if nxt_pos is not None else len(pos_of)
+                cand = [
+                    (pk, pos) for pk, pos, _ in sub_titles
+                    if lo <= pos < hi or (nxt_pos is None and pos == hi - 1)
+                ]
+                cand = [(pk, pos) for pk, pos in cand if pos not in used_in_gap] or cand
+                if cand:
+                    pk = cand[0][0]
+                    used_in_gap.add(cand[0][1])
+                    r[3] = pk
+                    filled += 1
+                else:
+                    # 锚点之间没有空格可用：贴到前一个锚点的格上（宁可同格多句，不丢句）
+                    if prev_pos is not None:
+                        back = next(pk for pk, pos, _ in sub_titles if pos == prev_pos)
+                    elif nxt_pos is not None:
+                        back = next(
+                            r2[3] for r2 in assigned if r2[0] > r[0] and r2[3]
+                        )
+                    else:
+                        back = sub_titles[0][0]
+                    r[3] = back
+                    filled += 1
+            notes.append(
+                f"{n_unmatched} 句无显式格号且文本未完全匹配，已按叙事顺序插到锚点之间的格"
+                if filled else "全部台词均按显式格号/文本匹配定位"
+            )
+
+    mapping: dict[str, list[tuple[str, dict]]] = {}
+    for _seq, lk, ln, pk in assigned:
+        if pk:
+            mapping.setdefault(pk, []).append((lk, ln))
+    if n_explicit:
+        notes.append(f"{n_explicit} 句按显式 panel 字段映射，{n_text} 句按字幕文本匹配")
+    return mapping, notes
+
+
+def _has_panel_field(ln: dict) -> bool:
+    v = ln.get("panel", ln.get("panel_index", ln.get("panelIndex")))
+    try:
+        int(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
     """把分镜图 + 配音 + 字幕排成时间轴，渲染竖屏 mp4。
 
@@ -891,22 +1069,23 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
     audio_index: dict[str, dict] = _read_json_file(ctx, AUDIO_INDEX_REL) or {}
     lines, _ = _plan_items(_read_json_file(ctx, "lines.json"), "lines")
 
-    # 字幕兜底：panels.json 若没带 subtitle/line 字段，就从 lines.json 按格号取台词。
-    # 为什么要兜：真实发生过"panels.json 被上游复写、丢了字幕字段"，
-    # 于是成片一个字幕都没有 —— 画面全对、就是没词，属于典型的静默劣化。
+    # 台词→格 映射：三级匹配（显式 panel 字段 → 字幕文本互含 → 顺序分配）。
+    # 旧实现 `_panel_key(ln, 0)` 在句里没写 panel 时会退回「句号当格号」，
+    # 台词整体错位一格 —— 配音听起来"对得上但总是慢半拍"就是这么来的。
+    mapping, mapping_notes = _match_lines_to_panels(lines, panels)
+    line_to_panel: dict[str, str] = {
+        lk: pk for pk, items in mapping.items() for lk, _ in items
+    }
+    # 字幕兜底：panels.json 若没带 subtitle 字段，就从映射到的台词里取。
     line_by_panel: dict[str, str] = {}
-    for ln in lines:
-        if not isinstance(ln, dict):
-            continue
-        txt = str(ln.get("text") or ln.get("line") or ln.get("content") or "").strip()
-        if not txt:
-            continue
-        pk = _panel_key(ln, 0)
-        if pk == "0":
-            continue
-        # 同一格的多句要全部保留（用 " / " 连接），不能再只取首句 ——
-        # 否则同格第 2 句起"有声音没字幕/有字幕没声音"，字幕与配音对不上。
-        line_by_panel[pk] = f"{line_by_panel[pk]} / {txt}" if pk in line_by_panel else txt
+    for pk, items in mapping.items():
+        for _, ln in items:
+            txt = str(ln.get("text") or ln.get("line") or ln.get("content") or "").strip()
+            if not txt:
+                continue
+            # 同一格的多句要全部保留（用 " / " 连接），不能再只取首句 ——
+            # 否则同格第 2 句起"有声音没字幕/有字幕没声音"，字幕与配音对不上。
+            line_by_panel[pk] = f"{line_by_panel[pk]} / {txt}" if pk in line_by_panel else txt
 
     title = str(
         (plan.get("title") if isinstance(plan, dict) else None)
@@ -915,11 +1094,39 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
 
     spec_panels: list[dict] = []
     skipped: list[str] = []
+    freeze_notes: list[str] = []
     frame_stats = {"multi": 0, "single": 0, "video": 0}
     clip_retimed: list[str] = []
-    # 时间轴起点必须与渲染器一致：先让出片头时长，否则字幕与配音会整体提前 2 秒。
+
+    # ---- 内容驱动时间轴 ----
+    # 旧逻辑：12 格 × 5s 均分（panels.json 的规划值），配音时长完全不参与排版，
+    # 声画"对得上但贴不紧"。现在：每格时长 = max(视频片段长, 配音实际需求)，
+    # 片段长优先 —— 链式首尾帧的接缝要求片段完整播完。
+    from ..media.compose import TRANSITION_SECONDS
+
+    OVERLAP = TRANSITION_SECONDS  # 格间 crossfade 重叠：下一格提前入画，叠化接力
+    LEAD = 0.35  # 每格内第一句在格起点之后 0.35s 开口，别贴脸
+    GAP = 0.15   # 句与句之间的呼吸
+    TAIL = 0.55  # 台词说完后画面再留的呼吸
+
+    # 每格的配音实际需求时长（LEAD + 各句时长 + 句间 GAP + TAIL）
+    audio_need: dict[str, float] = {}
+    for pk, items in mapping.items():
+        durs = []
+        for lk, _ in items:
+            c = audio_index.get(lk) or {}
+            if c.get("path") and ctx.storage.exists(ctx.run_id, c["path"]):
+                try:
+                    durs.append(float(c.get("duration_seconds") or 1.5))
+                except (TypeError, ValueError):
+                    durs.append(1.5)
+        if durs:
+            audio_need[pk] = LEAD + sum(durs) + GAP * (len(durs) - 1) + TAIL
+
+    # 时间轴起点：片头卡让出大部分时长，但提前 OVERLAP 入画，
+    # 让格 1 的画面在片头卡淡出的同时叠化进来（intro 卡自己带淡出）。
     intro_dur = 2.0
-    t = intro_dur
+    t = max(0.0, intro_dur - OVERLAP)
     starts: dict[str, float] = {}
     panel_dur: dict[str, float] = {}
     for i, p in enumerate(panels, 1):
@@ -963,15 +1170,30 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         if str(clip.get("status") or "") == "ready" and clip_rel and ctx.storage.exists(ctx.run_id, clip_rel):
             video_rel = clip_rel
             frame_stats["video"] += 1
-            # 片段长度由模型决定（5s / 10s），与分镜时长对不上时以片段为准：
-            # 让片段"播到一半被切掉"或"播完定格"都是明显的粗糙感。
+            # 片段长度由模型决定（5s / 10s）。链式接缝要求片段**完整播完**
+            # （结尾定格在下一格开场画面），所以有视频时以片段长为基准。
             try:
                 clip_dur = float(clip.get("duration") or 0)
             except (TypeError, ValueError):
                 clip_dur = 0.0
-            if clip_dur and abs(clip_dur - dur) > 0.6:
-                clip_retimed.append(f"第 {key} 格 {dur:.1f}s → {clip_dur:.1f}s（跟随视频片段）")
+            if clip_dur:
+                if abs(clip_dur - dur) > 0.6:
+                    clip_retimed.append(f"第 {key} 格 {dur:.1f}s → {clip_dur:.1f}s（跟随视频片段）")
                 dur = clip_dur
+        else:
+            clip_dur = 0.0
+
+        # 配音需求参与排版：说没说完不由规划值决定，由音频真实时长决定。
+        need = audio_need.get(key, 0.0)
+        if video_rel:
+            if need > dur + 0.05:
+                # 配音比片段长：格子延长，片段播完后定格在尾帧（= 下一格开场画面，
+                # 视觉上仍是连续的），留痕说明而不是静默拉长。
+                dur = need
+                freeze_notes.append(f"第 {key} 格配音 {need:.1f}s 超出片段 {clip_dur:.1f}s，尾部定格")
+        elif need > dur:
+            dur = need
+        dur = round(dur, 3)
 
         starts[key] = round(t, 3)
         panel_dur[key] = dur
@@ -979,7 +1201,8 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
             "src": img["path"],
             "frames": frame_paths,
             "video": video_rel or None,
-            "durationInSeconds": round(dur, 3),
+            "fromSeconds": starts[key],
+            "durationInSeconds": dur,
             "motion": str(p.get("motion") or p.get("camera") or "zoom-in").lower(),
             "subtitle": str(
                 p.get("subtitle") or p.get("line") or p.get("dialogue")
@@ -989,7 +1212,8 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
             "label": f"格 {key}",
             "isPlaceholder": bool(img.get("is_placeholder")),
         })
-        t += dur
+        # 下一格提前 OVERLAP 入画：本格尾与下格头重叠叠化（crossfade 接力）。
+        t += dur - OVERLAP
 
     if not spec_panels:
         return {"error": "全部格都没有分镜图，无法合成", "hint": "先生成分镜图（generate_images）。"}
@@ -1001,8 +1225,6 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
     audio_missing: list[str] = []
     audio_overflow: list[str] = []
     cursor: dict[str, float] = {}
-    LEAD = 0.35  # 每格内第一句在格起点之后 0.35s 开口，别贴脸
-    GAP = 0.15   # 句与句之间的呼吸
     for i, ln in enumerate(lines, 1):
         if not isinstance(ln, dict):
             continue
@@ -1012,14 +1234,20 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
             # 以前这里直接 continue —— 台词凭空消失且无人知晓。现在必须留痕。
             audio_missing.append(f"第 {key} 句")
             continue
-        pk = _panel_key(ln, 0)
+        pk = line_to_panel.get(key)
+        if pk is None:
+            audio_missing.append(f"第 {key} 句（三级匹配都没能定位所属格）")
+            continue
         base = starts.get(pk)
         if base is None:
             audio_missing.append(f"第 {key} 句（找不到所属格 {pk}，该格可能缺图被剔除）")
             continue
         offset = cursor.get(pk, LEAD)
         dur_panel = panel_dur.get(pk, 0.0)
-        clip_dur = float(clip.get("duration_seconds") or 1.5)
+        try:
+            clip_dur = float(clip.get("duration_seconds") or 1.5)
+        except (TypeError, ValueError):
+            clip_dur = 1.5
         if dur_panel and offset + clip_dur > dur_panel + 0.05:
             # 句长超出本格时长：夹住起点，让最后一句落在格内（宁可挤，不越格串到下一画面）
             offset = max(LEAD, dur_panel - clip_dur - 0.05)
@@ -1028,6 +1256,9 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
             "src": clip["path"],
             "from": round(base + offset, 3),
             "volume": 1.0,
+            # 音轨真实时长带给渲染器：Sequence 精确收口，不再靠"自然长度"漂移
+            "durationInSeconds": round(clip_dur, 3),
+            "speaker": str(ln.get("role") or "").strip() or None,
         })
         cursor[pk] = offset + clip_dur + GAP
 
@@ -1036,6 +1267,7 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         "fps": 30,
         "width": 1080,
         "height": 1920,
+        "transitionSeconds": OVERLAP,
         "intro": {"durationInSeconds": intro_dur, "title": title, "subtitle": "动态漫 · Longspan 合成"},
         "panels": spec_panels,
         "audio": spec_audio,
@@ -1054,6 +1286,9 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         )
     if audio_overflow:
         degraded.append("以下台词因所在格时长不足已贴格尾对齐：" + "、".join(audio_overflow))
+    if freeze_notes:
+        degraded.append("以下格的配音长于视频片段，片段播完后定格到尾帧：" + "、".join(freeze_notes))
+    degraded.extend(f"台词映射：{n}" for n in mapping_notes)
     if shape_note:
         degraded.append(f"panels.json {shape_note}")
     if clip_retimed:
@@ -1264,22 +1499,22 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="generate_panel_videos",
-            description="对关键格（首格/中间高潮格/尾格）调用图生视频模型，产出真实连续动效片段，写入 images.json 的 video 字段供 render_video 消费。",
-            when_to_use="阶段动作：compose 阶段在 render_video 之前执行。幂等，已有 ready 片段的格会复用。",
+            description="全格视频化 + 链式首尾帧：每一格都调用图生视频模型；第 i 格片段以本格分镜图为 first_frame、下一格分镜图为 last_frame，片段结尾恰好是下一格开场，格间无缝衔接。写入 images.json 的 video 字段（带 chained 标记）供 render_video 消费。",
+            when_to_use="阶段动作：compose 阶段在 render_video 之前执行。幂等：只复用带 chained 标记的 ready 片段（旧关键格片段无尾帧锚点，会重新生成）。",
             inputs={
                 "type": "object",
                 "properties": {"plan": {"type": "object", "description": "panels.json 的内容"}},
             },
-            outputs="{keyframes[],generated[],reused[],degraded[]}",
-            cost_hint="按段计费（图生视频模型，约数元/段）；视频模型不可用或失败时该格退回静态运镜",
+            outputs="{panels[],generated[],reused[],chain{enabled,chained_clips,static_fallback},degraded[]}",
+            cost_hint="按段计费（每格一段图生视频，约数元/段，全格化后费用 ≈ 格数 × 单价）；视频模型不可用或失败时该格退回静态运镜",
             failure_modes=[
                 {
                     "case": "视频模型未配置或接口报错",
                     "fallback": "该格退回静态 Ken Burns 运镜，并写入 degraded 列表 —— 禁止静默降级",
                 },
                 {
-                    "case": "某关键格缺分镜图",
-                    "fallback": "跳过该格视频化，记入 degraded",
+                    "case": "某格缺分镜图",
+                    "fallback": "跳过该格视频化，记入 degraded；链条在断口由渲染端 crossfade 兜底",
                 },
             ],
             handler=_generate_panel_videos,

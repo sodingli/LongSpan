@@ -60,23 +60,51 @@ COMIC_STYLE_CLAUSES: list[tuple[str, str, str]] = [
         "Stylized 2D anime character design, anime face with large expressive eyes, "
         "clean drawn lineart, flat cel shading on skin, no realistic skin texture, no photography",
     ),
+    # 2026-10-21 实测：即便有上面两条，模型在句首写 "thick paint realistic
+    # illustration" 仍会产出半写实厚涂人脸 —— 这类图过不了视频模型的内容审核
+    # （火山 InputImageSensitiveContentDetected.PrivacyInformation「疑似真人」，
+    # 12 格里 10 格被拦，重试也救不回来）。平涂赛璐璐 TV 动画画风是实测能
+    # 稳定过审的风格，同时让全片风格统一。
+    (
+        "平涂赛璐璐条款",
+        "tv anime",
+        "Flat 2D TV anime screenshot style, thick clean outlines, uniform flat colors, "
+        "simplified facial shading, absolutely no realistic skin texture, no painterly brushwork, no oil painting texture",
+    ),
+]
+
+# 模型爱在句首写写实倾向的画种描述，与风格锚直接对冲 —— 出现即中和并留痕
+_REALISM_PATTERNS = [
+    (re.compile(r"\bthick\s+paint\s+realistic\s+illustration\b", re.I), "stylized anime illustration"),
+    (re.compile(r"\brealistic\s+illustration\b", re.I), "stylized anime illustration"),
+    (re.compile(r"\bhyper[- ]?realistic\b", re.I), "stylized anime"),
+    (re.compile(r"\bphotorealistic\b(?!.*not\b)", re.I), "stylized anime"),
 ]
 
 
 def ensure_style_anchor(prompt: str) -> tuple[str, str | None]:
     """漫剧类生图提示词的风格锚校验：缺「反写实 / 角色风格化」条款就在开头补齐。
 
+    另有一层**写实倾向中和**：模型句首写 "realistic illustration" 这类画种描述
+    时，补再多锚也会被它带偏（实测半写实人脸过不了视频内容审核），直接替换并留痕。
+
     返回 (修正后的提示词, 留痕说明)。提示词本来就齐 → 原样返回 (prompt, None)。
     校验是字符串级的 —— 模型写出的提示词再"看起来对"，缺了关键字就是缺了，
     不做语义层猜测（可计量、可复核）。
     """
+    notes: list[str] = []
+    for pat, repl in _REALISM_PATTERNS:
+        prompt, n = pat.subn(repl, prompt)
+        if n:
+            notes.append(f"中和写实倾向描述 {n} 处（→ {repl}）")
     low = (prompt or "").lower()
     missing = [(key, clause) for key, keyword, clause in COMIC_STYLE_CLAUSES if keyword not in low]
-    if not missing:
+    if not missing and not notes:
         return prompt, None
-    patched = ", ".join(clause for _, clause in missing) + ". " + prompt
-    note = "生图提示词缺少风格锚（" + "、".join(k for k, _ in missing) + "），已在开头自动补齐"
-    return patched, note
+    if missing:
+        prompt = ", ".join(clause for _, clause in missing) + ". " + prompt
+        notes.append("生图提示词缺少风格锚（" + "、".join(k for k, _ in missing) + "），已在开头自动补齐")
+    return prompt, "；".join(notes)
 
 
 def attach_note(out: dict[str, Any], note: str) -> None:
