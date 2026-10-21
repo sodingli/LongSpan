@@ -416,6 +416,22 @@ _STATUS_OK = {"succeeded", "success", "completed", "done", "finished", "ok"}
 _STATUS_FAIL = {"failed", "failure", "error", "cancelled", "canceled", "rejected", "unknown"}
 
 
+def _is_real_error(err: Any) -> bool:
+    """error 字段存在 ≠ 真报错。
+
+    京东云在任务正常运行时也返回 `error: {code:0, type:"", message:""}` 占位，
+    只看"有没有 error"会把每个 running 的任务判成失败。
+    """
+    if not err:
+        return False
+    if isinstance(err, dict):
+        code = err.get("code")
+        if code not in (None, 0, "0", ""):
+            return True
+        return bool(str(err.get("message") or err.get("type") or "").strip())
+    return bool(str(err).strip())
+
+
 async def poll_task(task_id: str) -> dict:
     """轮询直到出结果。返回 {status: succeeded|failed, video_url?, raw?, error?}。"""
     if provider() == "dashscope":
@@ -457,17 +473,24 @@ async def poll_task(task_id: str) -> dict:
         else:
             result = (body or {}).get("result") or body or {}
             if isinstance(result, dict):
-                status = str(result.get("status") or result.get("state") or "").lower()
+                # 京东云把状态放在**顶层** task_status；其它网关可能放在 result.status|state
+                status = str(
+                    result.get("status")
+                    or result.get("state")
+                    or (body or {}).get("task_status")
+                    or (body or {}).get("status")
+                    or ""
+                ).lower()
                 if status in _STATUS_OK:
                     video_url = _find_video_url(body)
                     if video_url:
                         return {"status": "succeeded", "video_url": video_url, "raw": body}
                     return {"status": "failed", "error": f"任务已完成但没有视频地址：{json.dumps(body, ensure_ascii=False)[:400]}"}
                 if status in _STATUS_FAIL:
-                    reason = result.get("message") or result.get("error") or result.get("reason") or body
+                    reason = result.get("message") or result.get("reason") or body
                     return {"status": "failed", "error": str(reason)[:500]}
-                error = result.get("error")
-                if error:
+                error = result.get("error") or (body or {}).get("error")
+                if _is_real_error(error):
                     return {"status": "failed", "error": str(error)[:500]}
 
         if asyncio.get_event_loop().time() > deadline:
