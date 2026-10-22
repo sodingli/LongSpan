@@ -143,7 +143,18 @@ def ensure_style_anchor(prompt: str) -> tuple[str, str | None]:
         if n:
             notes.append(f"中和写实倾向描述 {n} 处（→ {repl}）")
     low = (prompt or "").lower()
+    # 无脸镜头：显式"不出现脸"的局部特写，以及空镜（本就不该有人）——
+    # 两种情况都不能注入"anime face with large expressive eyes"，否则等于
+    # 用风格条款命令模型画脸（2026-10-22 实测：空镜"小船驶向雾中"因此被
+    # 画出蓝发少女，成片结尾凭空多一个人）。
     headless = is_headless_framing(prompt)
+    if not headless:
+        try:
+            from ..harness.consistency import is_empty_shot
+
+            headless = is_empty_shot(prompt)
+        except Exception:  # noqa: BLE001 —— 判定失败退回常规条款（不阻断生图）
+            headless = False
     clauses = []
     for key, keyword, clause in COMIC_STYLE_CLAUSES:
         if keyword in low:

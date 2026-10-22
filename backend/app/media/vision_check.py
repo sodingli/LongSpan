@@ -228,3 +228,194 @@ def patch_framing_prompt(prompt: str, shot: str | None = None) -> str:
     if p and not p.endswith("."):
         p += "."
     return f"{p} {patch}."
+
+
+# --------------------------------------------------------------------------- #
+# 双图角色一致性比对（FR-08 一致性抽检的主判据，2026-10-22）
+# --------------------------------------------------------------------------- #
+# 为什么不用「人脸框 + SSIM」做主判据（实测教训）：
+#   视觉模型给出的框位置**不可靠**（同一张图有时给归一化、有时给像素，
+#   偏到背景上是常态）。框一歪，裁出来的就是天空和船，SSIM 直接崩到 0.00 ——
+#   10 格里 4 格"裁切失败"、其余分数全在 0.2~0.5 的噪声区，误报率远超 30%。
+#   直接让模型看两张图回答"是不是同一个角色"，语义上就是我们要的那个问题，
+#   也避开了框的误差链。几何度量（直方图/SSIM）保留为辅助参考，不参与告警。
+_COMPARE_PROMPT = (
+    "你会看到两张竖屏动画分镜图：第一张是角色的**定妆参考图**，第二张是这一格的分镜画面。\n"
+    "请判断第二张画面里的主要人物，是不是第一张定妆图里的同一个人（同一角色）。\n"
+    "只输出一个 JSON 对象，不要解释、不要代码块：\n"
+    '{"found": true/false, "same_character": 1, "reason": "一句中文说明依据"}\n'
+    "规则：\n"
+    "1. found：第二张画面里是否有人物（正脸/侧脸/背影都算）；纯空镜填 false，此时 same_character 填 0；\n"
+    "2. same_character 为 1~5 的整数，5 = 毫无疑问是同一角色，1 = 明显是另一个人；\n"
+    "3. 判断依据只看：脸型与五官、发型与发色、肤色、年龄感、服装。"
+    "画面景别/角度/光线不同**不算不一致**（远景小脸、侧脸、背影都可能是同一角色）；\n"
+    "4. 若第二张是背影/遮挡看不到脸，按发型、体型、服装判断，并在 reason 里注明「背影判断」；\n"
+    "5. 只输出 JSON。"
+)
+
+
+async def compare_character(
+    reference_path: Path | str, panel_path: Path | str, *, timeout: float = 120.0
+) -> dict[str, Any]:
+    """判断分镜图里的人物与定妆图是否为同一角色。返回 {checked, found, same(1~5), score, reason}。
+
+    只用于抽检告警：失败返回 checked=False（不阻断、不计入分母）。
+    """
+    mode = str(getattr(settings, "vision_check_mode", "auto") or "auto").lower()
+    if mode == "off":
+        return {"checked": False, "reason": "视觉能力已关闭"}
+    url, key, model = _endpoint()
+    if not url:
+        return {"checked": False, "reason": "视觉能力未配置"}
+
+    def _data_url(p: Path | str) -> str | None:
+        try:
+            raw = Path(p).read_bytes()
+        except Exception:  # noqa: BLE001
+            return None
+        mime = "image/png" if str(p).lower().endswith(".png") else "image/jpeg"
+        return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+
+    ref_url, pan_url = _data_url(reference_path), _data_url(panel_path)
+    if not ref_url or not pan_url:
+        return {"checked": False, "reason": "读图失败"}
+
+    body = {
+        "model": model,
+        "input": {"messages": [{"role": "user", "content": [
+            {"image": ref_url},
+            {"image": pan_url},
+            {"text": _COMPARE_PROMPT},
+        ]}]},
+        "parameters": {"result_format": "message", "temperature": 0},
+    }
+
+    def _post() -> httpx.Response:
+        return httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=body, timeout=timeout,
+        )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        resp = await asyncio.to_thread(_post)
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": False, "reason": f"请求失败：{exc}"[:200]}
+    latency = int((loop.time() - started) * 1000)
+    if resp.status_code >= 400:
+        return {"checked": False, "reason": f"返回 {resp.status_code}：{resp.text[:160]}"}
+    try:
+        data = resp.json()
+        content = data["output"]["choices"][0]["message"]["content"]
+        text = "".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": False, "reason": f"返回结构异常：{exc}"}
+
+    verdict = _parse_json_loose(text)
+    if verdict is None:
+        return {"checked": False, "reason": f"输出无法解析：{text[:120]}", "latency_ms": latency}
+    try:
+        same = int(round(float(verdict.get("same_character") or 0)))
+    except (TypeError, ValueError):
+        same = 0
+    same = max(0, min(5, same))
+    found = bool(verdict.get("found"))
+    return {
+        "checked": True,
+        "found": found,
+        "same": same,
+        # 归一到 0~1 便于和阈值比较：1 分 → 0，5 分 → 1
+        "score": round((same - 1) / 4, 3) if same else 0.0,
+        "reason": str(verdict.get("reason") or "").strip()[:200],
+        "model": model,
+        "latency_ms": latency,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 人脸框定位（FR-08 一致性抽检的输入，2026-10-22）
+# --------------------------------------------------------------------------- #
+# 为什么要单独问一次「人脸在哪」：人脸比对必须裁到脸再比。整图比对的
+# 区分度实测只有 0.55 vs 0.57（两个不同角色 vs 同一角色），噪声级别，
+# 完全不能用于告警。
+_FACE_PROMPT = (
+    "这是一张竖屏动画分镜图。请只输出一个 JSON 对象，不要解释、不要代码块：\n"
+    '{"has_face": true/false, "box": [x, y, w, h]}\n'
+    "规则：\n"
+    "1. 画面里没有人物、或人物背对镜头/被遮挡看不到正脸 → has_face 填 false，box 填 [0,0,0,0]；\n"
+    "2. 有多个人物时，取**面积最大、最正对镜头**的那张脸；\n"
+    "3. box 是这张脸外接矩形的归一化坐标（0~1 的小数）：x,y 为左上角，w,h 为宽高；"
+    "只框脸（含头发与下巴），不要框整个身体；\n"
+    "4. 只输出 JSON。"
+)
+
+
+async def detect_face_box(
+    image_path: Path, *, timeout: float = 90.0, use_cache: bool = True
+) -> dict[str, Any]:
+    """定位图中最大的一张人脸（归一化框）。返回 {checked, has_face, box, reason}。
+
+    只用于"抽检/比对"，失败一律返回 checked=False —— 抽检缺一格不影响生产。
+    use_cache 由调用方（脚本）用工作区文件实现，本函数只负责单次调用。
+    """
+    mode = str(getattr(settings, "vision_check_mode", "auto") or "auto").lower()
+    if mode == "off":
+        return {"checked": False, "has_face": False, "box": None, "reason": "视觉能力已关闭"}
+    url, key, model = _endpoint()
+    if not url:
+        return {"checked": False, "has_face": False, "box": None, "reason": "视觉能力未配置"}
+    try:
+        raw = Path(image_path).read_bytes()
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": False, "has_face": False, "box": None, "reason": f"读图失败：{exc}"}
+
+    mime = "image/png" if str(image_path).lower().endswith(".png") else "image/jpeg"
+    b64 = base64.b64encode(raw).decode()
+    body = {
+        "model": model,
+        "input": {"messages": [{"role": "user", "content": [
+            {"image": f"data:{mime};base64,{b64}"},
+            {"text": _FACE_PROMPT},
+        ]}]},
+        "parameters": {"result_format": "message", "temperature": 0},
+    }
+
+    def _post() -> httpx.Response:
+        return httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=body, timeout=timeout,
+        )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        resp = await asyncio.to_thread(_post)
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": False, "has_face": False, "box": None, "reason": f"请求失败：{exc}"[:200]}
+    latency = int((loop.time() - started) * 1000)
+    if resp.status_code >= 400:
+        return {"checked": False, "has_face": False, "box": None,
+                "reason": f"返回 {resp.status_code}：{resp.text[:160]}"}
+    try:
+        data = resp.json()
+        content = data["output"]["choices"][0]["message"]["content"]
+        text = "".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": False, "has_face": False, "box": None, "reason": f"返回结构异常：{exc}"}
+
+    verdict = _parse_json_loose(text)
+    if verdict is None:
+        return {"checked": False, "has_face": False, "box": None,
+                "reason": f"输出无法解析：{text[:120]}", "latency_ms": latency}
+    box = verdict.get("box")
+    has_face = bool(verdict.get("has_face")) and isinstance(box, (list, tuple)) and len(box) >= 4
+    return {
+        "checked": True,
+        "has_face": has_face,
+        "box": [round(float(v), 4) for v in box[:4]] if has_face else None,
+        "model": model,
+        "latency_ms": latency,
+    }

@@ -551,6 +551,52 @@ _FRAMING_DECL_RE = re.compile(
 _CLOSE_SHOT_KINDS = {"close", "extreme-close"}
 _CLOSE_WORD_IN_PROMPT = re.compile(r"\b(extreme\s+close|close[-\s]?up|macro)\b", re.IGNORECASE)
 
+# --------------------------------------------------------------------------- #
+# 空镜判定（2026-10-22，一致性抽检抓到的真缺陷）
+# --------------------------------------------------------------------------- #
+# 事故（run 2942b7ea 第 10 格）：action 写"小船驶向海面薄雾深处"——纯空镜，
+# prompt 里也确实没有人物词，但**没有任何 no-people 声明**。生图模型按
+# "画面要有人"的默认倾向，画进一个蓝发绿衣少女（与本片角色毫无关系），
+# 成片结尾多出一个陌生人。构图校验查不出（画面本身完整），只有角色比对能抓。
+# → 结论：空镜不能靠"没写人物"来隐式表达，必须显式声明；而"显式"这件事
+#   不该指望模型自觉（MRD §7.4 原则 4），由工具确定性注入。
+_NO_PEOPLE_DECL_RE = re.compile(
+    r"(?:\bno\s+(?:people|persons?|characters?|humans?|figures?|one)\b"
+    r"|\bempty\s+(?:scene|shot|frame|interior|street|room)\b"
+    r"|\bunoccupied\b|\bdeserted\b|空无一人|无人|没有人物|空镜|画面无人物)",
+    re.IGNORECASE,
+)
+# 出现这些词就认为该格有（或可能有）人物：主语、人物类名词、身体部位、代词。
+# 中英文都要覆盖 —— 真实分镜里两种语言混用（画风锚英文 + 动作描述中文），
+# 只查英文会把"他站在码头尽头"误判成空镜，进而给它注入 no-people（灾难）。
+_HUMAN_WORD_RE = re.compile(
+    r"(?:\b(?:man|men|woman|women|boy|girl|child|children|kid|person|people|character|"
+    r"fisherman|mechanic|driver|chef|waiter|teacher|student|doctor|nurse|soldier|"
+    r"grandma|grandpa|grandmother|grandfather|mother|father|son|daughter|"
+    r"face|head|hands?|eyes?|smile|expression|shoulder|torso|figure|silhouette|"
+    r"he|she|his|her|him|they|their)\b"
+    r"|[他她你我俺咱]|老人|老头|少女|少年|女孩|男孩|女人|男人|孩子|爷爷|奶奶|父亲|母亲|"
+    r"渔民|司机|厨师|服务员|医生|护士|士兵|主角|人物|角色|脸庞|面孔|眼睛|眼神|双手|手指|侧脸)",
+    re.IGNORECASE,
+)
+
+
+def is_empty_shot(prompt: str) -> bool:
+    """该格是否为「空镜」（画面里不该出现人物）。
+
+    判定：显式 no-people 声明 → 是；否则只要出现任何人物词/身体部位/代词 → 否；
+    两者都没有 → 是（描述的是物件、风景、船只等）。
+
+    用途：① 生图前确定性注入 no-people 声明；② 跳过人物参考图（参考图会给
+    空镜补出完整人物）。
+    """
+    p = (prompt or "").strip()
+    if not p:
+        return True
+    if _NO_PEOPLE_DECL_RE.search(p):
+        return True
+    return not _HUMAN_WORD_RE.search(p)
+
 
 def _panel_prompt(p: dict) -> str:
     return str(

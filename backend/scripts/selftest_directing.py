@@ -20,10 +20,12 @@ sys.path.insert(0, str(BACKEND))
 from app.harness.consistency import (  # noqa: E402
     extract_anchors,
     is_character_anchor,
+    is_empty_shot,
     validate_framing,
     validate_scene_references,
     validate_shot_budget,
 )
+from app.harness.tools import _apply_empty_shot_guard  # noqa: E402
 
 BUDGET = {
     "max_distinct_scenes": 3,
@@ -262,6 +264,30 @@ Stylized 2D anime cel-shaded illustration. A 65-year-old Chinese fisherman, grey
     }]}
     ok, reasons = validate_framing(empty)
     results.append(check("空镜不误伤", ok, reasons, None))
+
+    # ---- 空镜判定（2026-10-22 真缺陷：空镜被画出陌生人，见 W4 一致性抽检） ----
+    # 正样本：物件/风景描述本身就是空镜
+    for p in (
+        "Medium shot of a small fishing boat sailing into the mist at dawn, calm sea",
+        "船舱内部，木箱和渔网堆在角落，晨光从舷窗照进来",
+        "Empty street at night, neon reflections on wet asphalt, no people",
+    ):
+        results.append(check(f"空镜判定命中：{p[:24]}", is_empty_shot(p), [], None))
+    # 反样本：中英文「有人物」的表述都必须判非空镜（误判会注入 no-people，灾难）
+    for p in (
+        "A 65-year-old fisherman with grey-white hair mending a net on the deck",
+        "Close-up of a weathered hand slipping a letter into a shirt pocket",
+        "他站在码头尽头，望着海面",
+        "少女蹲在废墟里，手里握着一株幼苗",
+    ):
+        results.append(check(f"非空镜判定命中：{p[:24]}", not is_empty_shot(p), [], None))
+
+    # 注入幂等：已声明的 prompt 不得重复追加
+    injected, note = _apply_empty_shot_guard("A wooden boat drifting in the fog")
+    again, note2 = _apply_empty_shot_guard(injected)
+    results.append(check("空镜声明注入幂等", bool(note) and note2 is None and again == injected, [], None))
+    _, note3 = _apply_empty_shot_guard("他站在码头尽头，望着海面")
+    results.append(check("有人物的格不注入 no-people", note3 is None, [], None))
 
     print()
     total, passed = len(results), sum(results)

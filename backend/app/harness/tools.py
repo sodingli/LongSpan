@@ -422,6 +422,32 @@ def _apply_scene_anchor(
     return f"{prompt}. Scene (fixed backdrop, do not change): {anchor}", None
 
 
+EMPTY_SHOT_CLAUSE = (
+    "Empty scene — absolutely no people, no characters, no human figures in frame, "
+    "no silhouettes of persons; only the objects and the environment described."
+)
+
+
+def _apply_empty_shot_guard(prompt: str) -> tuple[str, str | None]:
+    """空镜守卫：判定为空镜且提示词缺 no-people 声明时，确定性补一句。
+
+    为什么必须"注入"而不是"校验后打回"：模型写空镜提示词时天然不会写
+    "没有人物"（它只描述有东西），校验打回会陷入重做循环；而这条声明是
+    纯粹的机械补齐，没有任何创作判断 —— 正是"能机器保证的就不要写成提示词约定"。
+    已声明则原样返回（幂等）。
+    """
+    from .consistency import _NO_PEOPLE_DECL_RE, is_empty_shot
+
+    if not is_empty_shot(prompt):
+        return prompt, None
+    if _NO_PEOPLE_DECL_RE.search(prompt or ""):
+        return prompt, None
+    p = (prompt or "").rstrip()
+    if p and not p.endswith("."):
+        p += "."
+    return f"{p} {EMPTY_SHOT_CLAUSE}", "本格为空镜，已自动注入 no-people 声明（防止凭空补出人物）"
+
+
 # --------------------------------------------------------------------------- #
 # 人物一致性（FR-03/FR-04）：定妆图 + 参考图映射
 #
@@ -498,12 +524,14 @@ def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, 
     notes: list[str] = []
     tags = _anchor_tags(prompt)
 
-    # 空镜排除（2026-10-22 补）：prompt 显式声明「no people」的格，绝不能带人物
-    # 参考图 —— 参考图的语义是"画面主体长这样"，空镜带它会自动补出完整人物
-    # （实测教训：空车提示词被画出陌生人）。锚点画风句逐字在 prompt 里也会命中，
-    # 所以这个判定必须放在一切查找之前。
-    if re.search(r"\bno\s+(people|persons?|characters?|humans?|figures?)\b", prompt, re.IGNORECASE):
-        notes.append("本格声明为空镜（no people），已跳过人物参考图")
+    # 空镜排除（2026-10-22 补）：该格不该出现人物时，绝不能带人物参考图 ——
+    # 参考图的语义是"画面主体长这样"，空镜带它会自动补出完整人物
+    # （实测教训：空镜"小船驶向雾中"被画进一个无关的蓝发少女）。
+    # 判定与生图注入共用 consistency.is_empty_shot，避免两处口径不一致。
+    from .consistency import is_empty_shot
+
+    if is_empty_shot(prompt):
+        notes.append("本格判定为空镜，已跳过人物参考图")
         return None, None, notes
 
     # 第 1 级：标签 → 文件名
@@ -747,6 +775,16 @@ async def _generate_images(
         degraded.extend(ref_notes)
         # 锚点标签是机器路标，不是画面内容 —— 送生图前剥掉，避免污染生成结果
         clean_prompt = _strip_anchor_tags(prompt) or prompt
+
+        # 空镜守卫（2026-10-22，一致性抽检抓到的真缺陷）：空镜必须有 no-people
+        # 声明，否则模型按"画面要有人"的默认倾向补出陌生人（实测：空镜"小船驶向
+        # 雾中"画出蓝发少女，成片结尾凭空多一个人）。声明由工具确定性注入 ——
+        # 这件事不能指望模型自觉写（MRD §7.4 原则 4）。
+        # **必须在风格锚之前**：风格锚会给提示词补 "anime face with large expressive
+        # eyes"，一句话就把空镜判定打回"有人物"，守卫从此失效（实测踩到）。
+        clean_prompt, empty_note = _apply_empty_shot_guard(clean_prompt)
+        if empty_note:
+            degraded.append(f"第 {key} 格：{empty_note}")
 
         # 风格锚校验（FR-04 补充）：漫剧类技能的生图提示词缺「反写实 / 角色风格化」
         # 条款就在开头补齐并留痕 —— 模型漏写不等于允许写实漂移（2026-10-20 实测教训）。

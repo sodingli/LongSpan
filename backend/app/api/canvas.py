@@ -404,17 +404,22 @@ async def regenerate_panel(
 
     # 锚点标签是机器路标不是画面内容（管线同款处理）：送生图前剥掉。
     # 注意 panels.json 里落盘的仍是原文（管线重跑还要靠它匹配锚点）。
-    from ..harness.tools import _strip_anchor_tags
+    from ..harness.tools import _apply_empty_shot_guard, _strip_anchor_tags
 
     send_prompt = _strip_anchor_tags(prompt) or prompt
+
+    # 空镜守卫（与管线同款，且必须在风格锚之前）：手改一格空镜同样会被凭空补出
+    # 人物；而风格锚会补 "anime face with large expressive eyes"，一句话就让空镜
+    # 判定失效（先注入声明，风格锚才会走"无脸条款"）。
+    send_prompt, empty_note = _apply_empty_shot_guard(send_prompt)
 
     # 风格锚校验（FR-04 补充）：漫剧类任务的提示词缺「反写实 / 角色风格化」条款，
     # 在生图入口补齐并留痕 —— 不让写实漂移从画布重绘这条路溜进来。
     style_note = None
     if run.skill_id in COMIC_STYLE_SKILLS:
         send_prompt, style_note = ensure_style_anchor(send_prompt)
-    if ref_notes:
-        style_note = "；".join([n for n in [style_note] if n] + ref_notes)
+    notes = [n for n in (style_note, empty_note) if n] + list(ref_notes)
+    style_note = "；".join(notes) or None
     bus.emit(
         db, run_id, EventType.TOOL_CALL,
         f"重画第 {index} 格（模型 {model or '默认'}"
