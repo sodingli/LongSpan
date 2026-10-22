@@ -23,7 +23,22 @@ from sqlalchemy.orm import Session
 from ..models import Event, Gate, Run, Step
 
 
+def _naive(dt: datetime | None) -> datetime | None:
+    """统一成 naive UTC（DB 里存的是 naive，`datetime.now(timezone.utc)` 是 aware）。
+
+    2026-10-22 踩坑：`_finish` 刚写入的 finished_at 是 aware，与 DB 里 naive 的
+    gate 时间一比较就 `can't compare offset-naive and offset-aware datetimes`，
+    整段指标被 except 吞掉 → 任务结束却没有 metrics.json。统一在入口抹掉 tzinfo。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 def _sec(a: datetime | None, b: datetime | None) -> float:
+    a, b = _naive(a), _naive(b)
     if not a or not b:
         return 0.0
     return max(0.0, (b - a).total_seconds())
@@ -88,19 +103,18 @@ def compute_run_metrics(db: Session, run: Run) -> dict[str, Any]:
     # 实测坑（run 233a8a68）：characters gate 挂了 7 小时才被批，但 run 早已结束 ——
     # 残留批准的 decided_at 晚于 run.finished_at，盲目累加会把"用户睡觉的时间"
     # 算进等人，等人占比飙到 819%。所以必须夹在 run 窗口内。
-    now = datetime.now(timezone.utc)
-    run_end = run.finished_at or now
-    run_start = run.created_at or run.started_at or run_end
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # 与 DB 的 naive 时间同域
+    run_end = _naive(run.finished_at) or now
+    run_start = _naive(run.created_at) or _naive(run.started_at) or run_end
     windows: list[tuple[datetime, datetime]] = []
     for g in db.query(Gate).filter(Gate.run_id == run.id).all():
-        start = max(g.created_at or run_start, run_start)
-        end = min(g.decided_at or now, run_end)
+        start = max(_naive(g.created_at) or run_start, run_start)
+        end = min(_naive(g.decided_at) or now, run_end)
         if end > start:
             windows.append((start, end))
     wait_seconds = 0.0
     if windows:
         windows.sort()
-        merged_end = windows[0][0]
         cur_start, cur_end = windows[0]
         for s, e in windows[1:]:
             if s > cur_end:
@@ -111,7 +125,7 @@ def compute_run_metrics(db: Session, run: Run) -> dict[str, Any]:
         wait_seconds += (cur_end - cur_start).total_seconds()
     pending_gates = sum(
         1 for g in db.query(Gate).filter(Gate.run_id == run.id).all()
-        if not g.decided_at and (g.created_at or run_start) < run_end
+        if not g.decided_at and (_naive(g.created_at) or run_start) < run_end
     )
 
     panel_count = _panel_count(run)
