@@ -406,9 +406,24 @@ async def regenerate_panel(
     attach_note(out, style_note or "")
 
     idx = cs.load_image_index(storage, run_id)
-    idx[str(index)] = out
+    # **合并**而不是整体覆盖（2026-10-22 修）：旧代码 `idx[index] = out` 会把该格已有的
+    # 中/尾帧与视频片段一起静默抹掉 —— 用户重画一张首帧，另外两帧和视频凭空消失，
+    # 成片里那格变回静态图，且没有任何提示。
+    entry = dict(idx.get(str(index)) or {})
+    frames = dict(entry.get("frames") or {}) if isinstance(entry.get("frames"), dict) else {}
+    frames["first"] = out
+    entry.update(out)
+    entry["frames"] = frames
+    # 首帧变了 → 该格旧视频片段的首帧已过期，必须作废（否则成片还是旧画面）
+    stale_video = isinstance(entry.get("video"), dict)
+    if stale_video:
+        entry.pop("video", None)
+    idx[str(index)] = entry
     cs.save_image_index(storage, run_id, idx)
-    cs.record_edit(storage, run_id, "regenerate", {"index": str(index), "model": model or ""})
+    cs.record_edit(
+        storage, run_id, "regenerate",
+        {"index": str(index), "model": model or "", "video_invalidated": stale_video},
+    )
 
     ok = not out.get("is_placeholder")
     bus.emit(
@@ -416,9 +431,15 @@ async def regenerate_panel(
         EventType.ARTIFACT_CREATED if ok else EventType.AGENT_THOUGHT,
         f"第 {index} 格已重画：{out.get('path')}" if ok else f"第 {index} 格重画降级为占位图：{out.get('fallback_reason', '')[:120]}",
         stage_id=stage_id,
-        payload={"human_edit": "regenerate", "index": index, "path": out.get("path"), "degraded": not ok},
+        payload={
+            "human_edit": "regenerate", "index": index, "path": out.get("path"),
+            "degraded": not ok, "video_invalidated": stale_video,
+        },
     )
-    return {"ok": ok, "panel": out, "model": model, "service": service}
+    result = {"ok": ok, "panel": out, "model": model, "service": service}
+    if stale_video:
+        result["note"] = "该格视频片段已作废（首帧已变），需要重新生成视频"
+    return result
 
 
 # --------------------------------------------------------------------- 上传替换

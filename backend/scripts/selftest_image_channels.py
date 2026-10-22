@@ -78,6 +78,33 @@ def main() -> int:
     out, note = ensure_style_anchor("a photorealistic rendering of a dock")
     check("写实词仍被中和（photorealistic 肯定句）", "photorealistic rendering" not in out and "stylized anime rendering" in out, str(note))
 
+    # ---- 2.6 视觉后检：解析与取景补丁（离线，不发请求）----
+    from app.media.vision_check import FRAMING_PATCH, _parse_json_loose, patch_framing_prompt
+
+    v1 = _parse_json_loose('```json\n{"has_person": true, "person_cut": false, "issue": ""}\n```')
+    check("视觉结论解析：剥代码栅栏", isinstance(v1, dict) and v1.get("has_person") is True, str(v1))
+    v2 = _parse_json_loose('好的：{"has_person":true,"person_cut":true,}')
+    check("视觉结论解析：容忍尾随逗号与前置废话", isinstance(v2, dict) and v2.get("person_cut") is True, str(v2))
+    check("视觉结论解析：非 JSON 返回 None", _parse_json_loose("画面看起来不错") is None, "")
+
+    p = "Extreme close-up of a weathered hand on the shirt pocket"
+    patched = patch_framing_prompt(p)
+    check("取景补丁：手部局部用 hand 版声明", FRAMING_PATCH in patched, patched[-90:])
+    check("取景补丁：幂等（已声明则原样返回）", patch_framing_prompt(patched) == patched, "")
+    check("取景补丁：非手部用通用声明", "no face, no head, no torso" in patch_framing_prompt("Close-up of a letter on wood"), "")
+    check("取景补丁：保留原句并落到句末", patch_framing_prompt("A letter on wood").startswith("A letter on wood."), "")
+
+    # off 模式：一行配置就关（不阻断生产），且如实说明
+    from app.config import settings as _st
+
+    old_mode = _st.vision_check_mode
+    try:
+        _st.vision_check_mode = "off"
+        res = asyncio.run(__import__("app.media.vision_check", fromlist=["inspect_image"]).inspect_image(__file__))
+        check("视觉后检：off 模式不请求且 checked=False", res.get("checked") is False and res.get("ok") is True, str(res)[:90])
+    finally:
+        _st.vision_check_mode = old_mode
+
     # ---- 3. 通道解析 ----
     from app.config import settings
 

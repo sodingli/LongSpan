@@ -17,6 +17,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("longspan.tools")
@@ -561,6 +562,100 @@ def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, 
     return None, None, notes
 
 
+async def _inspect_and_maybe_redraw(
+    ctx: ToolContext,
+    out: dict,
+    prompt: str,
+    key: str,
+    ratio: str,
+    model_ov: str | None,
+    service_ov: str | None,
+) -> dict:
+    """生图后的多模态自检：检出构图残缺（如"无头半身"）→ 补取景声明重画一次。
+
+    2026-10-22 实测事故：extreme-close 拍"手伸进衬衫内袋"，结构校验全过，
+    但成图里人物**没有脑袋**（胸口拉满画框、头被裁在画外）—— 所有文本校验
+    都只能判断"话没说对"，判断不了"画没画对"（见 media/vision_check.py）。
+
+    三条边界：
+    - 只在真实生图后检查（占位卡没有画面内容可看）；
+    - 检查本身失败（网络/解析）**绝不阻断**，只留痕；
+    - 被否的原图另存 panels/rejected/ 下，便于人工对比"检出了什么"。
+
+    返回 {"out": 最终采用的结果, "detail": 视觉判定留痕, "notes": 降级说明}。
+    """
+    from ..config import settings
+    from ..media.image import generate_image
+    from ..media.vision_check import inspect_image, patch_framing_prompt
+
+    notes: list[str] = []
+    if out.get("is_placeholder"):
+        return {"out": out, "detail": None, "notes": notes}
+
+    try:
+        abs_path = ctx.storage.abs_path(ctx.run_id, out["path"])
+    except Exception as exc:  # noqa: BLE001
+        return {"out": out, "detail": {"checked": False, "reason": f"定位图片失败：{exc}"}, "notes": notes}
+
+    # 本格是否**有意**的局部特写：prompt 已声明 no face / only … fills the frame。
+    # 声明了 → 画面里没有头是预期结果（严格判定会把干净特写误判成"头部被裁"）。
+    from .consistency import _FRAMING_DECL_RE
+
+    allow_headless = bool(_FRAMING_DECL_RE.search(prompt or ""))
+    verdict = await inspect_image(abs_path, allow_headless=allow_headless)
+    if not verdict.get("checked"):
+        notes.append(f"第 {key} 格视觉自检未执行：{str(verdict.get('reason') or '')[:180]}")
+        return {"out": out, "detail": verdict, "notes": notes}
+    if verdict.get("ok"):
+        return {"out": out, "detail": verdict, "notes": notes}
+
+    issue = str(verdict.get("issue") or "构图残缺")
+    notes.append(f"第 {key} 格视觉自检未通过：{issue}")
+
+    limit = int(getattr(settings, "vision_retry_limit", 1) or 0)
+    patched = patch_framing_prompt(prompt)
+    if limit <= 0:
+        notes.append(f"第 {key} 格未自动重画（vision_retry_limit=0），请人工确认")
+        return {"out": out, "detail": verdict, "notes": notes}
+    if patched == prompt:
+        notes.append(f"第 {key} 格提示词已含取景声明仍画错，不再重画（提示词层面已无可补）")
+        return {"out": out, "detail": verdict, "notes": notes}
+
+    # 被否的原图留一份，人工复核时能直接对比（不许悄悄换掉）
+    try:
+        raw = abs_path.read_bytes()
+        rejected_rel = f"panels/rejected/{Path(out['path']).stem}-vision{Path(out['path']).suffix}"
+        ctx.storage.write_bytes(ctx.run_id, rejected_rel, raw)
+        notes.append(f"第 {key} 格被否的原图已留档：{rejected_rel}")
+    except Exception:  # noqa: BLE001
+        notes.append(f"第 {key} 格被否的原图留档失败（不影响重画）")
+
+    notes.append(f"第 {key} 格已补取景声明重画一次")
+    out2 = await generate_image(
+        ctx.storage, ctx.run_id, patched, out["path"], ratio,
+        model_override=model_ov, service_override=service_ov,
+    )
+    out2["index"] = out.get("index", key)
+    out2["vision_retry"] = {"prompt_patched": True, "first_issue": issue}
+
+    # 重画后再看一眼：还错就如实标注，交给人工，不再无限重试（两次都错多半是设计问题）
+    try:
+        abs2 = ctx.storage.abs_path(ctx.run_id, out2["path"])
+        verdict2 = await inspect_image(abs2, allow_headless=True)  # 已补声明，按局部特写口径复检
+    except Exception as exc:  # noqa: BLE001
+        verdict2 = {"checked": False, "ok": True, "reason": f"重画后复检失败：{exc}"}
+    out2["vision_retry"]["after"] = verdict2
+    if verdict2.get("checked") and not verdict2.get("ok"):
+        notes.append(
+            f"第 {key} 格重画后仍不达标：{verdict2.get('issue')}（已保留最新图，请人工确认）"
+        )
+    elif verdict2.get("checked"):
+        notes.append(f"第 {key} 格重画后复检通过")
+    else:
+        notes.append(f"第 {key} 格重画后复检未执行：{str(verdict2.get('reason') or '')[:120]}")
+    return {"out": out2, "detail": verdict2, "notes": notes}
+
+
 async def _generate_images(
     ctx: ToolContext, plan: dict | None = None, fast_limit: int | None = None
 ) -> dict:
@@ -601,6 +696,32 @@ async def _generate_images(
         prev = index.get(key) or {}
         if prev.get("path") and ctx.storage.exists(ctx.run_id, prev["path"]):
             reused.append(prev["path"])
+            # 历史图补检：视觉自检是 2026-10-22 才有的，之前的图从没被"看过"，
+            # 复用它们等于把没验过的画面继续带进成片。这里只判定不重画 ——
+            # 重画属于"改产物"，由人工或整阶段重跑决定（不替用户做决定）。
+            if not prev.get("vision") and not prev.get("is_placeholder"):
+                from ..media.vision_check import inspect_image
+                from .consistency import _FRAMING_DECL_RE
+
+                try:
+                    v = await inspect_image(
+                        ctx.storage.abs_path(ctx.run_id, prev["path"]),
+                        allow_headless=bool(_FRAMING_DECL_RE.search(prompt or "")),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    v = {"checked": False, "ok": True, "reason": f"补检异常：{exc}"}
+                if v.get("checked"):
+                    prev = {**prev, "vision": v}
+                    index[key] = prev
+                    if not v.get("ok"):
+                        degraded.append(
+                            f"第 {key} 格历史分镜图视觉自检未通过：{v.get('issue')}"
+                            "（未重画，请人工确认是否重跑该格）"
+                        )
+                else:
+                    degraded.append(
+                        f"第 {key} 格历史分镜图未做视觉自检：{str(v.get('reason') or '')[:140]}"
+                    )
             continue
         if not prompt:
             degraded.append(f"第 {key} 格缺少画面提示词，已跳过（不算完成）")
@@ -641,6 +762,18 @@ async def _generate_images(
             out["scene_note"] = scene_note
         if ref_role:
             out["subject_reference_role"] = ref_role
+
+        # 多模态后检（唯一会「看图」的一层）：文本校验防不了"画没画对"。
+        # 检出构图残缺（实测：无头半身）→ 补取景声明重画一次；检查本身失败不阻断。
+        original_out = out
+        vision = await _inspect_and_maybe_redraw(
+            ctx, out, clean_prompt, key, ratio, model_ov, service_ov
+        )
+        out = vision["out"]
+        degraded.extend(vision["notes"])
+        if vision.get("detail"):
+            out["vision"] = vision["detail"]
+
         # 关键：**合并**进已有条目，不能整体覆盖 —— 条目里可能已经有人工补的
         # 中间帧 / 尾帧 / 视频片段，直接 index[key]=out 会把它们静默抹掉。
         entry = dict(index.get(key) or {})
@@ -648,6 +781,13 @@ async def _generate_images(
         frames["first"] = out
         entry.update(out)
         entry["frames"] = frames
+        # 图被视觉自检判否并重画 → 该格旧视频片段的首帧已经不对，必须作废。
+        # 只提示"需重生成"是不够的：下游会继续用旧 mp4，成片里还是那张错图。
+        if out is not original_out and isinstance(entry.get("video"), dict):
+            entry.pop("video", None)
+            degraded.append(
+                f"第 {key} 格分镜图已重画，该格视频片段已作废（需重新生成，否则成片仍是旧画面）"
+            )
         index[key] = entry
         created.append(out["path"])
         if out.get("is_placeholder"):

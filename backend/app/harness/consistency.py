@@ -509,3 +509,97 @@ def validate_scene_references(
             + "，这样生图时无法注入同一段背景"
         )
     return (not failures), failures
+
+
+# --------------------------------------------------------------------------- #
+# 取景完整性（FR-01 补充，2026-10-22 实测事故）
+# --------------------------------------------------------------------------- #
+# 事故（run 2942b7ea 第 8 格）：shot_size=extreme-close，prompt 写
+#   "Extreme close-up of an old fisherman's weathered hand touching the inner pocket
+#    of his faded blue cloth shirt"
+# —— 手是主体，但又要求衬衫内袋同框；模型把整个胸口拉满画框，**头被切在画外**，
+#    成片里出现一个"没有脑袋的半身人"。结构校验全过（景别合法、动作单一、锚点在位），
+#    因为问题不在结构，在**这句话本身描述的取景在物理上自相矛盾**。
+#
+# 能机器判的只有一件事：**局部大特写里若同时把躯干/衣着写进画框，必须显式声明边界**
+# （"only the hand fills the frame / no face, no head"）。声明了，模型知道该怎么裁；
+# 不声明，它就会给你一个悬空的衣领。
+_BODY_PART_RE = re.compile(
+    r"\b(hands?|wrists?|fingers?|fingertips?|palms?|thumbs?|feet|foot|ankles?|shins?|knees?)\b",
+    re.IGNORECASE,
+)
+_TORSO_CLOTHING_RE = re.compile(
+    r"\b(shirt|shirts|pocket|pockets|chest|torso|collar|jacket|coat|uniform|blouse|"
+    r"sleeve|sleeves|lapel|apron|overalls?|robe)\b",
+    re.IGNORECASE,
+)
+_HEAD_RE = re.compile(r"\b(face|head|heads|eyes?|expression|profile|cheek|chin|forehead)\b", re.IGNORECASE)
+
+# 合法的取景声明：明确说"画框里只有什么"或"头/脸不入画"。
+_FRAMING_DECL_RE = re.compile(
+    r"(only\s+[^.,;]{0,80}?\bfills?\s+the\s+frame"
+    r"|fills?\s+the\s+(?:whole\s+)?frame"
+    r"|no\s+(?:face|head|torso|body|person)\b"
+    r"|(?:face|head)\s+(?:is\s+)?(?:cropped|cropped out|out\s+of\s+frame|not\s+(?:visible|in\s+frame))"
+    r"|crops?\s+out\s+the\s+(?:face|head)"
+    r"|headless\s+composition"
+    r"|仅(?:有|见)?(?:手|局部)|不(?:出现|入画)(?:头部|面部|脸|躯干)|头部不(?:在|入)画)",
+    re.IGNORECASE,
+)
+
+# 这些景别才可能出"局部大特写"：中景/全景人物是完整入画的，不查。
+_CLOSE_SHOT_KINDS = {"close", "extreme-close"}
+_CLOSE_WORD_IN_PROMPT = re.compile(r"\b(extreme\s+close|close[-\s]?up|macro)\b", re.IGNORECASE)
+
+
+def _panel_prompt(p: dict) -> str:
+    return str(
+        p.get("prompt") or p.get("image_prompt") or p.get("scene") or p.get("description") or ""
+    ).strip()
+
+
+def validate_framing(panels_json: Any) -> tuple[bool, list[str]]:
+    """取景完整性：局部大特写把躯干写进画框时，必须声明画框边界。
+
+    判定（五条同时成立才报）：
+      1. 景别为 close / extreme-close（或 prompt 自述 close-up）；
+      2. prompt 里有身体局部词（hand / finger / wrist …）；
+      3. prompt 里有躯干/衣着词（shirt / pocket / chest …）；
+      4. prompt 里**没有**头部词（face / head / eyes …）；
+      5. prompt 里**没有**取景边界声明。
+    → 这五条同时成立时，这句话描述的取景是"人的胸口 + 手，但不提头"，
+      模型只能把头顶裁掉 —— 成片里就是一个没有脑袋的半身人（实测事故）。
+
+    为什么不直接禁止"手 + 衣服"：手伸进衣袋是合法镜头。要禁的是**不声明边界**。
+    所以修法只有一句话：补一句 "only the hand and the fabric fill the frame,
+    no face, no head, no torso"（或改成 medium shot 让人完整入画）。
+    """
+    panels = _extract_items(panels_json, _PANEL_LIST_KEYS)
+    if not panels:
+        return False, ["panels.json 里没有可校验的 panels 数组"]
+
+    failures: list[str] = []
+    for i, p in enumerate(panels, 1):
+        prompt = _panel_prompt(p)
+        if not prompt:
+            continue
+        shot = normalize_shot_size(p.get("shot_size"))
+        is_close = shot in _CLOSE_SHOT_KINDS or bool(_CLOSE_WORD_IN_PROMPT.search(prompt))
+        if not is_close:
+            continue
+        if not _BODY_PART_RE.search(prompt):
+            continue
+        if not _TORSO_CLOTHING_RE.search(prompt):
+            continue
+        if _HEAD_RE.search(prompt):
+            continue
+        if _FRAMING_DECL_RE.search(prompt):
+            continue
+        failures.append(
+            f"格 {_panel_no(p, i)} 是局部特写（{shot or 'close-up'}），却把躯干/衣着写进画框"
+            "又没声明边界：模型只能把头顶裁掉，会生成「没有脑袋的半身人」。"
+            "改法二选一 —— ① 补取景声明："
+            '"only the hand and the fabric fill the frame, no face, no head, no torso"；'
+            "② 升一档景别（medium / medium close-up）让人物完整入画。"
+        )
+    return (not failures), failures

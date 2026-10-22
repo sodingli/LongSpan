@@ -41,6 +41,7 @@ from ..canvas_store import effective_image_config, effective_llm_model
 from .agent import AgentRunner, build_system_prompt
 from .consistency import (
     extract_anchors,
+    validate_framing,
     validate_panel_anchors,
     validate_scene_references,
     validate_shot_budget,
@@ -592,6 +593,8 @@ class RunManager:
                 failures.extend(self._check_shot_budget(run_id, check, budget))
             elif kind == "scene_reference":
                 failures.extend(self._check_scene_references(run_id, check))
+            elif kind == "framing_consistency":
+                failures.extend(self._check_framing(run_id, check))
             elif kind:
                 # 未识别的一致性校验类型：不静默忽略，如实上报（架构铁律 #2）。
                 failures.append(f"一致性校验类型未识别：{kind}（manifest 声明了 runner 不支持的类型）")
@@ -627,6 +630,22 @@ class RunManager:
         if scenes is None:
             return [f"场景引用校验读不懂 {scenes_rel}（JSON 解析失败，先修清单格式）"]
         ok, reasons = validate_scene_references(plan, scenes)
+        return [] if ok else reasons
+
+    def _check_framing(self, run_id: str, check: dict) -> list[str]:
+        """取景完整性（2026-10-22 实测事故）：局部特写不得"躯干入画却不声明边界"。
+
+        事故：extreme-close 拍"手伸进衬衫内袋"，prompt 里既有 hand 又有 shirt/pocket、
+        却没提头部 —— 模型把胸口拉满画框、头被裁在画外，成片出现"无头半身人"。
+        结构校验全过（景别合法/动作单一/锚点在位），因为错在这句话描述的取景自相矛盾。
+        """
+        plan_rel = str(check.get("plan") or "panels.json")
+        if not storage.exists(run_id, plan_rel):
+            return [f"取景校验缺少分镜清单 {plan_rel}（分镜未产出）"]
+        plan = _read_json_artifact(run_id, plan_rel)
+        if plan is None:
+            return [f"取景校验读不懂 {plan_rel}（JSON 解析失败，先修清单格式）"]
+        ok, reasons = validate_framing(plan)
         return [] if ok else reasons
 
     def _check_panel_anchors(self, run_id: str, check: dict) -> list[str]:

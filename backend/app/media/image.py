@@ -94,11 +94,44 @@ _REALISM_PATTERNS = [
 ]
 
 
+# 无脸镜头（prompt 已声明 no face / only … fills the frame）专用的角色风格化条款。
+# 为什么单独一份（2026-10-22 实测）：通用条款里写着 "anime face with large expressive eyes"，
+# 而这类镜头的 prompt 明确要求"画面里没有脸" —— 两条指令直接对冲，模型只能二选一：
+# 要么给你塞进一张脸（破坏取景），要么两边都糊弄（生成悬空的衣领）。
+_COMIC_FACE_CLAUSE = (
+    "Stylized 2D anime character design, anime face with large expressive eyes, "
+    "clean drawn lineart, flat cel shading on skin, no realistic skin texture, no photography"
+)
+_COMIC_NOFACE_CLAUSE = (
+    "Stylized 2D anime rendering, clean drawn lineart, flat cel shading on skin and cloth, "
+    "no realistic skin texture, no photography"
+)
+
+# 判断「本格是有意的局部特写」：与 harness.consistency._FRAMING_DECL_RE 同源判据的轻量版
+# （media 层不反向依赖 harness，避免循环导入；两边都覆盖"no face/only … fills the frame"）。
+_HEADLESS_HINT_RE = re.compile(
+    r"(no\s+(?:face|head|torso|body|person)\b"
+    r"|only\s+[^.,;]{0,80}?\bfills?\s+the\s+frame"
+    r"|headless\s+composition"
+    r"|不(?:出现|入画)(?:头部|面部|脸|躯干))",
+    re.IGNORECASE,
+)
+
+
+def is_headless_framing(prompt: str) -> bool:
+    """该提示词是否显式要求「画面里不出现脸/头」（有意的局部特写）。"""
+    return bool(_HEADLESS_HINT_RE.search(prompt or ""))
+
+
 def ensure_style_anchor(prompt: str) -> tuple[str, str | None]:
     """漫剧类生图提示词的风格锚校验：缺「反写实 / 角色风格化」条款就在开头补齐。
 
-    另有一层**写实倾向中和**：模型句首写 "realistic illustration" 这类画种描述
-    时，补再多锚也会被它带偏（实测半写实人脸过不了视频内容审核），直接替换并留痕。
+    另有两层修正：
+    - **写实倾向中和**：模型句首写 "realistic illustration" 这类画种描述时，补再多锚
+      也会被它带偏（实测半写实人脸过不了视频内容审核），直接替换并留痕；
+    - **无脸镜头换条款**：prompt 已声明"画面里没有脸/头"时，角色风格化条款改用不含
+      "anime face with large expressive eyes" 的版本 —— 否则两条指令对冲，模型要么
+      给你塞一张脸（破坏取景），要么生成一个悬空的衣领。
 
     返回 (修正后的提示词, 留痕说明)。提示词本来就齐 → 原样返回 (prompt, None)。
     校验是字符串级的 —— 模型写出的提示词再"看起来对"，缺了关键字就是缺了，
@@ -110,7 +143,15 @@ def ensure_style_anchor(prompt: str) -> tuple[str, str | None]:
         if n:
             notes.append(f"中和写实倾向描述 {n} 处（→ {repl}）")
     low = (prompt or "").lower()
-    missing = [(key, clause) for key, keyword, clause in COMIC_STYLE_CLAUSES if keyword not in low]
+    headless = is_headless_framing(prompt)
+    clauses = []
+    for key, keyword, clause in COMIC_STYLE_CLAUSES:
+        if keyword in low:
+            continue
+        if headless and key == "角色风格化强化句":
+            clause = _COMIC_NOFACE_CLAUSE
+        clauses.append((key, clause))
+    missing = clauses
     if not missing and not notes:
         return prompt, None
     if missing:

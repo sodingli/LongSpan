@@ -258,6 +258,11 @@ stages:
       - kind: scene_reference
         plan: panels.json
         scenes: scenes.json
+      # 取景完整性（2026-10-22 实测事故）：局部特写把躯干/衣着写进画框却不说头在哪，
+      # 模型只能把头顶裁掉 → 成片出现"无头半身人"。与角色锁定无关，草稿同样要守
+      # （分镜结构错，草稿也没法看），所以不设 slow_only。
+      - kind: framing_consistency
+        plan: panels.json
 
   # ---------------- C6 ----------------
   # 快通道包含它：配音「方案」是纯文本产出、很便宜，

@@ -84,6 +84,16 @@ class Settings(BaseSettings):
     # 通道路由：auto（带参考图的格优先走支持参考图的通道，保持相对顺序）/
     #           main（永远主通道优先，参考图不支持就如实标注未生效）
     image_routing: str = "auto"
+    # ---- 视觉自检（生图后的多模态检查）----
+    # 唯一「看图」的一层：文本校验只能防「话没说对」，防不了「画没画对」。
+    # 实测事故：extreme-close 拍手+衬衫内袋 → 结构校验全过，但成图没有脑袋。
+    # mode: auto（有 Key 就检）/ on（强制检，缺配置则如实报未检查）/ off（关闭）
+    vision_check_mode: str = "auto"
+    vision_api_key: str = ""        # 留空 = 复用 image_api_key（同一中转）
+    vision_base_url: str = ""       # 留空 = 复用 image_base_url
+    vision_model: str = "qwen3-vl-plus"
+    # 检出构图残缺后自动重画的次数上限（0 = 只标注不重画；1 次足够，两次都画错多半是提示词问题）
+    vision_retry_limit: int = 1
     # Remotion 渲染并发 tab 数：本机 macOS < 15 时高并发会部分 tab 连不上
     # （"Visited localhost:3000 but got no response"），实测 2 稳定
     render_concurrency: int = 2

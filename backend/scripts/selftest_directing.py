@@ -20,6 +20,7 @@ sys.path.insert(0, str(BACKEND))
 from app.harness.consistency import (  # noqa: E402
     extract_anchors,
     is_character_anchor,
+    validate_framing,
     validate_scene_references,
     validate_shot_budget,
 )
@@ -206,6 +207,61 @@ Stylized 2D anime cel-shaded illustration. A 65-year-old Chinese fisherman, grey
         not is_character_anchor("a faded blue cloth shirt on a wooden bench, flat cel colors"),
         [], None,
     ))
+
+    # ---- 取景完整性（2026-10-22 实测事故：无头半身人）----
+
+    # ⑯ 反样本：大特写拍手 + 衬衫内袋，不提头在哪 → 模型只能把头顶裁掉
+    bad = {"panels": [{
+        "index": 8, "shot_size": "extreme-close",
+        "prompt": ("Extreme close-up of an old fisherman's weathered hand touching the inner "
+                   "pocket of his faded blue cloth shirt, morning light"),
+    }]}
+    ok, reasons = validate_framing(bad)
+    results.append(check("无头半身（手+衣着但不提头）应被拦", ok, reasons, "没有脑袋"))
+
+    # ⑰ 修法一：补取景边界声明 → 通过
+    fixed = {"panels": [{
+        "index": 8, "shot_size": "extreme-close",
+        "prompt": ("Extreme close-up of an old fisherman's weathered hand touching the inner "
+                   "pocket of his shirt, only the hand and the fabric fill the frame, "
+                   "no face, no head, no torso in frame"),
+    }]}
+    ok, reasons = validate_framing(fixed)
+    results.append(check("补取景声明后应通过", ok, reasons, None))
+
+    # ⑱ 修法二：升一档景别（medium 人物完整入画）→ 通过
+    lifted = {"panels": [{
+        "index": 8, "shot_size": "medium",
+        "prompt": ("Medium shot of an old fisherman's weathered hand touching the inner pocket "
+                   "of his shirt"),
+    }]}
+    ok, reasons = validate_framing(lifted)
+    results.append(check("升景别到 medium 后应通过", ok, reasons, None))
+
+    # ⑲ 有头部词 → 不报（画面里有脸，头不会被裁）
+    with_head = {"panels": [{
+        "index": 8, "shot_size": "close",
+        "prompt": ("Close-up of an old fisherman's face and hand, his hand resting on the "
+                   "pocket of his shirt"),
+    }]}
+    ok, reasons = validate_framing(with_head)
+    results.append(check("含 face/hand 的近景不误伤", ok, reasons, None))
+
+    # ⑳ 纯手部特写（画框里没有躯干衣着）→ 不报
+    hand_only = {"panels": [{
+        "index": 2, "shot_size": "extreme-close",
+        "prompt": "Extreme close-up of a weathered hand holding a paper envelope, blurred dock behind",
+    }]}
+    ok, reasons = validate_framing(hand_only)
+    results.append(check("纯手部特写不误伤", ok, reasons, None))
+
+    # ㉑ 空镜（没有人物）→ 不报
+    empty = {"panels": [{
+        "index": 10, "shot_size": "wide",
+        "prompt": "Wide shot of a small fishing boat sailing into the morning mist",
+    }]}
+    ok, reasons = validate_framing(empty)
+    results.append(check("空镜不误伤", ok, reasons, None))
 
     print()
     total, passed = len(results), sum(results)
