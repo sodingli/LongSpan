@@ -80,6 +80,8 @@ COMIC_STYLE_CLAUSES: list[tuple[str, str, str]] = [
 # （2026-10-22 补：角色卡锚点里出现 "Thick oil painting style, realistic texture,
 # heavy brushstrokes"，定妆图直接生成半写实人像 —— 与平涂分镜图风格分裂，
 # 且这类写实人脸过不了视频内容审核。中和规则必须覆盖锚点原文里的全部写实画种词。）
+# 注意否定前缀保护（2026-10-22 实测 bug）：「no/NOT photorealistic」是否定句，
+# 误中和会反转成「NOT stylized anime」（= 要求写实）—— 语义灾难。lookbehind 挡掉。
 _REALISM_PATTERNS = [
     (re.compile(r"\bthick\s+oil\s+painting\s+style\b", re.I), "flat 2D anime style"),
     (re.compile(r"\boil\s+painting\s+style\b", re.I), "flat 2D anime style"),
@@ -87,8 +89,8 @@ _REALISM_PATTERNS = [
     (re.compile(r"\bheavy\s+brushstrokes\b", re.I), "clean bold lineart"),
     (re.compile(r"\bthick\s+paint\s+realistic\s+illustration\b", re.I), "stylized anime illustration"),
     (re.compile(r"\brealistic\s+illustration\b", re.I), "stylized anime illustration"),
-    (re.compile(r"\bhyper[- ]?realistic\b", re.I), "stylized anime"),
-    (re.compile(r"\bphotorealistic\b(?!.*not\b)", re.I), "stylized anime"),
+    (re.compile(r"(?<!no )(?<!not )(?<!non-)\bhyper[- ]?realistic\b", re.I), "stylized anime"),
+    (re.compile(r"(?<!no )(?<!not )(?<!non-)\bphotorealistic\b(?!.*\bnot\b)", re.I), "stylized anime"),
 ]
 
 

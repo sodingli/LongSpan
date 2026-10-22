@@ -56,6 +56,20 @@ def _clean_anchor(text: str) -> str:
     return t
 
 
+def is_character_anchor(anchor_text: str) -> bool:
+    """锚点是否描述「一个具体角色」（而非全局画风/纯场景描述）。
+
+    判据与 panels 校验同源：正向人物特征词（_PERSON_HINTS_RE）。
+    全局画风锚点（如「供场景生图复用」的画风块）只有画风词、没有人物词，
+    一旦混进角色表会出两个事故（2026-10-22「通道机制验证」实测）：
+      1. 定妆图工具为它生成一张「无主角色图」—— 模型自由发挥，画出与故事
+         完全无关的人物（该次生图照常计费），且画风与真角色不对等；
+      2. 锚点校验里它是指纹之一 —— 分镜 prompt 抄了画风句就能「命中锚点」
+         蒙混过关，角色锚点校验被放水。
+    """
+    return _mentions_person(anchor_text or "")
+
+
 def extract_anchors(characters_md: str) -> dict[str, str]:
     """从 characters.md 提取「角色标识 → 锚点原文」映射。
 
@@ -99,6 +113,11 @@ def extract_anchors(characters_md: str) -> dict[str, str]:
         for block in blocks:
             val = _clean_anchor(block)
             if len(val) < 40:
+                continue
+            # 无标签的裸代码块里混着「全局画风锚点」等非角色块 —— 它不是任何角色，
+            # 编号成 anchor_N 会生成无主定妆图 + 放水锚点校验（见 is_character_anchor）。
+            # 只保留含正向人物特征的块。
+            if not is_character_anchor(val):
                 continue
             idx += 1
             anchors[f"anchor_{idx}"] = val

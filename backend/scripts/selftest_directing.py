@@ -17,7 +17,12 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
-from app.harness.consistency import validate_scene_references, validate_shot_budget  # noqa: E402
+from app.harness.consistency import (  # noqa: E402
+    extract_anchors,
+    is_character_anchor,
+    validate_scene_references,
+    validate_shot_budget,
+)
 
 BUDGET = {
     "max_distinct_scenes": 3,
@@ -158,6 +163,49 @@ def main() -> int:
     ok, reasons = validate_shot_budget(p, BUDGET)
     bad = [r for r in reasons if "景别" in r]
     results.append(check("extreme-close 不被误归一成 close", ok or not bad, reasons, None))
+
+    # ---- 锚点提取（2026-10-22：全局画风锚点混进角色表 → 无主定妆图事故）----
+
+    # ⑭ 形态 C（裸代码块）里混着「全局画风锚点」：只有画风词、没有人物词，
+    #    不得被编号成角色锚点（否则会生成无主定妆图 + 校验放水）。
+    md_mixed = """# 角色设计
+
+### 老渔民
+
+#### 一致性锚点（冻结字符串）
+```
+Stylized 2D anime cel-shaded illustration. A 65-year-old Chinese fisherman, grey-white short hair, deep wrinkles, calm tired eyes, faded blue cloth shirt. NOT a photograph, NOT photorealistic.
+```
+
+### 全局画风锚点（供场景生图复用）
+```
+2D anime cel-shaded illustration, Chinese donghua style, clean ink lines, flat cel colors, anime screenshot frame, NOT a photograph, NOT photorealistic, NOT live-action, NOT 3D render.
+```
+"""
+    anchors = extract_anchors(md_mixed)
+    results.append(check(
+        "裸代码块里的全局画风锚点不进角色表",
+        set(anchors) == {"anchor_1"} and "fisherman" in anchors.get("anchor_1", ""),
+        [f"提取结果: {list(anchors)}"],
+        None,
+    ))
+
+    # ⑮ is_character_anchor 的边界：有具体人物特征 → 是角色；纯画风/场景 → 不是
+    results.append(check(
+        "is_character_anchor：含人物特征判为角色",
+        is_character_anchor("A 65-year-old Chinese fisherman, grey-white short hair, calm tired eyes"),
+        [], None,
+    ))
+    results.append(check(
+        "is_character_anchor：纯画风描述判为非角色",
+        not is_character_anchor("2D anime cel-shaded illustration, clean ink lines, flat cel colors, anime screenshot frame"),
+        [], None,
+    ))
+    results.append(check(
+        "is_character_anchor：只有服装没有人物也判非角色",
+        not is_character_anchor("a faded blue cloth shirt on a wooden bench, flat cel colors"),
+        [], None,
+    ))
 
     print()
     total, passed = len(results), sum(results)

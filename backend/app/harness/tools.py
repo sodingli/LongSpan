@@ -457,6 +457,18 @@ def _character_art_rel(role: str) -> str:
     return f"characters/{safe or 'unknown'}.jpg"
 
 
+# 定妆图的固定风格强化条款（comic 技能下注入，2026-10-22）。
+# 定妆图是全片 subject_reference 的源头：源头半写实，逐格参考只会把写实带进每一格。
+# 与 image.ensure_style_anchor 的通用锚互补 —— 那层是「缺了才补」的校验，
+# 这层是定妆场景下**无条件**注入的强约束（老人/皱纹/深肤色等描述写实拉力强，必须压住）。
+CHARACTER_ART_STYLE = (
+    "Flat 2D anime character design, thick clean outlines, uniform flat cel shading, "
+    "simplified anime face with large expressive eyes, no realistic skin texture, no pores, "
+    "no watercolor rendering, no painterly brushwork, no photorealistic face, "
+    "stylized 2D illustration only"
+)
+
+
 def _read_character_art(storage: Any, run_id: str, role: str) -> str | None:
     """找某个角色的定妆图绝对路径；不存在返回 None。"""
     rel = _character_art_rel(role)
@@ -822,7 +834,7 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
     plan 参数预留（当前从 characters.md 直接提取锚点，不依赖额外清单）。
     """
     from ..media.image import COMIC_STYLE_SKILLS, ensure_style_anchor, generate_image
-    from .consistency import extract_anchors
+    from .consistency import extract_anchors, is_character_anchor
 
     anchors_rel = "characters.md"
     if not ctx.storage.exists(ctx.run_id, anchors_rel):
@@ -836,10 +848,21 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
         return {"error": f"读取 characters.md 失败：{exc}"}
 
     anchors = extract_anchors(characters_md)
+    # 双保险：非角色锚点（全局画风锚点/纯场景描述）混进来会生成「无主定妆图」
+    # —— 模型自由发挥画出与故事无关的人物（2026-10-22 实测：画风锚点被画成
+    # 机能风少女），照常计费、污染角色库，还会被参考图兜底逻辑误用。留痕跳过。
+    skipped_noncharacter: list[str] = []
+    for key in [k for k in anchors if not is_character_anchor(anchors[k])]:
+        skipped_noncharacter.append(f"{key}（锚点不含人物特征，疑似全局画风锚点）")
+        del anchors[key]
     if not anchors:
         return {
-            "error": "characters.md 里没有可提取的一致性锚点",
+            "error": (
+                "characters.md 里没有可生成定妆图的角色锚点"
+                + (f"（{len(skipped_noncharacter)} 个锚点因不含人物特征被跳过）" if skipped_noncharacter else "")
+            ),
             "hint": "角色设计阶段必须为每个角色给出「一致性锚点」冻结字符串（见 C4 prompt）。",
+            "skipped": skipped_noncharacter,
         }
 
     img_cfg = ctx.extra.get("image_config") or {} if isinstance(ctx.extra, dict) else {}
@@ -849,6 +872,11 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
     created: list[str] = []
     reused: list[str] = []
     degraded: list[str] = []
+    details: list[dict] = []
+    if skipped_noncharacter:
+        degraded.append(
+            "跳过非角色锚点（不生成无主定妆图）：" + "、".join(skipped_noncharacter)
+        )
     style_gate = str(ctx.extra.get("skill_id") or "") in COMIC_STYLE_SKILLS
     for role, anchor in anchors.items():
         rel = _character_art_rel(role)
@@ -861,11 +889,19 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
             f"{anchor}. Character design sheet, front-facing bust portrait of this single "
             "character, neutral clean background, centered composition, consistent style."
         )
-        # 风格锚门禁（与分镜生图同款，2026-10-22 补）：锚点原文可能带写实画种词
-        # （实测 "Thick oil painting style, realistic texture" 生出半写实人像定妆图，
-        # 与平涂分镜图风格分裂、还过不了视频审核）—— 必须过同一个中和 + 补齐逻辑。
-        style_note = None
         if style_gate:
+            # 定妆图固定注入强化平涂条款（2026-10-22 补，不只「缺了才补」）：
+            # 定妆图是全片 subject_reference 的源头，源头一写实，人物一致性全盘漂。
+            # 「65岁老人+深皱纹」这类描述对模型的写实拉力极强，靠锚点校验补齐的
+            # 通用锚压不住（实测老渔夫定妆图生成半写实人像）—— 必须在定妆指令里
+            # 直接写死平涂赛璐璐 + 反纹理渲染的强约束。
+            prompt = (
+                f"{CHARACTER_ART_STYLE}. {prompt}"
+            )
+            # 风格锚门禁（与分镜生图同款，2026-10-22 补）：锚点原文可能带写实画种词
+            # （实测 "Thick oil painting style, realistic texture" 生出半写实人像定妆图，
+            # 与平涂分镜图风格分裂、还过不了视频审核）—— 必须过同一个中和 + 补齐逻辑。
+            style_note = None
             prompt, style_note = ensure_style_anchor(prompt)
             if style_note:
                 degraded.append(f"{role} 定妆图：{style_note}")
@@ -874,19 +910,29 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
             model_override=model_ov, service_override=service_ov,
         )
         created.append(out["path"])
+        # 留痕：定妆图实际用的 prompt（含强化条款 + 风格锚补齐）——
+        # 「这张参考图为什么长这样」必须可复核，不能只靠猜。
+        details.append({
+            "role": role,
+            "path": out["path"],
+            "prompt_used": str(out.get("prompt_used") or prompt)[:1200],
+        })
         if out.get("is_placeholder"):
             degraded.append(
                 f"{out['path']} 为占位定妆图（{out.get('fallback_reason', '')[:120]}），"
                 "参考图通道已降级为「仅锚点文字」"
             )
 
-    return {
+    result = {
         "created": created,
         "reused": reused,
         "degraded": degraded,
         "roles": list(anchors.keys()),
         "summary": f"角色定妆图：新生成 {len(created)} 张、复用 {len(reused)} 张（共 {len(anchors)} 个角色）",
     }
+    if details:
+        result["details"] = details
+    return result
 
 
 async def _synthesize_lines(ctx: ToolContext, plan: dict | None = None) -> dict:

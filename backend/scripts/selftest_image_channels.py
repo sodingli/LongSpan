@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.media.image import (  # noqa: E402
     ImageChannel,
+    ensure_style_anchor,
     is_moderation_error,
     parse_channels,
     soften_prompt,
@@ -59,6 +60,23 @@ def main() -> int:
     # 正常画面不被误伤
     clean = "a young mechanic standing in a scrapyard at dawn, flat 2D anime style"
     check("正常画面 L1 不被误伤", soften_prompt(clean, 1).startswith(clean), "")
+
+    # ---- 2.5 风格锚中和：否定前缀保护（2026-10-22 实测 bug）----
+    # 「NOT photorealistic」句尾出现时曾被中和成「NOT stylized anime」——语义反转
+    # （= 要求写实）。否定前缀（no / not / non-）开头的写实词必须原样保留。
+    neg_cases = [
+        ("NOT photorealistic", "Flat 2D design, calm eyes, NOT photorealistic."),
+        ("no photorealistic face", "flat colors, no photorealistic face"),
+        ("non-photorealistic", "non-photorealistic cel style"),
+    ]
+    for keep, src in neg_cases:
+        out, _note = ensure_style_anchor(src)
+        check(f"否定前缀保护: “{keep}” 不被中和", keep in out, out[:80])
+    # 写实倾向仍必须被中和
+    out, note = ensure_style_anchor("hyper-realistic portrait of an old sailor")
+    check("写实词仍被中和（hyper-realistic）", "hyper-realistic" not in out and "hyper realistic" not in out, str(note))
+    out, note = ensure_style_anchor("a photorealistic rendering of a dock")
+    check("写实词仍被中和（photorealistic 肯定句）", "photorealistic rendering" not in out and "stylized anime rendering" in out, str(note))
 
     # ---- 3. 通道解析 ----
     from app.config import settings
