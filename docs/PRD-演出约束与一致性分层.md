@@ -86,7 +86,9 @@ P2 自动后检（观察期，只告警不阻断）
         plan: panels.json
         anchors: characters.md
         slow_only: true
-      - kind: shot_budget            # 新增：快通道也校验（成本为零）
+      - kind: shot_budget            # 预算取自同一份 directing.shot_budget，不重复写数字
+        plan: panels.json
+      - kind: scene_reference        # 场景引用完整性
         plan: panels.json
         scenes: scenes.json
 ```
@@ -122,12 +124,14 @@ P2 自动后检（观察期，只告警不阻断）
 ```
 
 - 每格 `panels.json` 增加 `scene_id`；
-- 生图时把 `scene.anchor` 拼在 prompt 前部（与角色锚点同一条"冻结字符串"纪律）；
-- 校验器 `kind: scene_anchor_consistency`：格引用的 `scene_id` 必须存在，且 prompt 含该场景锚点的前 80 字符指纹（复用 `consistency._anchor_substring`）。
+- **场景锚点由生成工具确定性拼到提示词末尾**（`tools._apply_scene_anchor`），
+  **不要求模型在 prompt 里重复背景描述** —— 能机器保证的事不交给模型自觉；
+- 校验器 `kind: scene_reference`：只做**引用完整性**（`scene_id` 必须真实存在、
+  场景卡必须有 `anchor`），不做文本指纹比对（避免误伤）。
 
 **收益**：即使角色漂，观众也会觉得"这个世界是同一个世界"—— 场景一致性对观感的权重被长期低估。
 
-**验收**：12 格引用的 `scene_id` 全部存在于 `scenes.json`，且每格 prompt 含对应场景锚点指纹。
+**验收**：12 格引用的 `scene_id` 全部存在于 `scenes.json`，且每格生成的提示词里能看到同一段场景锚点。
 
 ---
 
@@ -260,3 +264,48 @@ P2 自动后检（观察期，只告警不阻断）
 - [ ] 跑一集完整任务：M1 ≤1/12、M3 ≤3、M4 = 100%
 - [ ] `media/images.json` 能看出每格通道选择与理由（FR-06 落地后）
 - [ ] 换题材只改 manifest，git diff 里无 `backend/app/**` 改动（MRD §0.6 判定线 2）
+
+---
+
+## 十、实施状态（滚动更新）
+
+### 10.1 FR 落地情况
+
+| FR | 状态 | 落点 | 备注 |
+| --- | --- | --- | --- |
+| FR-01 镜头预算 | ✅ 已落地 | `skill.StageDef.directing` / `consistency.validate_shot_budget` / `runner._check_shot_budget` | 预算唯一来源是 manifest，check 只声明"强制它" |
+| FR-02 场景卡 | ✅ 已落地 | `scenes.json` / `consistency.validate_scene_references` / `tools._apply_scene_anchor` | 场景锚点由工具注入，不靠模型复用 |
+| FR-03 A-B-A | ✅ 已落地 | `shot_budget.aba_rule` + 提示词骨架表 | 三连换场直接判失败 |
+| FR-04 单格单动作 | ✅ 已落地 | `shot_budget.one_action_per_panel` + `action`/`motion` 硬字段 | 命中"然后/接着/同时"即判失败 |
+| FR-05 转场白名单 | ⚠️ 部分 | 写进提示词与 `review_focus` | 尚无机器校验（露脸率需多模态判断，归 FR-08） |
+| FR-06 生图选路 | ⬜ 未开始 | — | 待决策 D15 |
+| FR-07 画布重绘参考图 | ⬜ 未开始 | — | 依赖 FR-06 |
+| FR-08 抽检 + 看板 | ⬜ 未开始 | — | P2，只告警 |
+
+### 10.2 伴随落地（不在原 PRD 里，但必须做）
+
+1. **硬约束违约 = 阶段失败**：`orchestration.on_unmet_hard`（默认 `fail`）。
+   原实现里一致性校验失败只写进 `step.detail`，阶段照样 `completed` —— 分镜带着 3 条结构违约进入下游，
+   视频首尾帧、字幕对位、时间轴全部建立在错误结构上。**约束一旦能"带病通过"，就退回成建议。**
+2. **零成本自检脚本**：`backend/scripts/audit_storyboard.py <run_id>`，生图之前就能答"这集结构有没有问题"。
+3. **校验器自测**：`backend/scripts/selftest_directing.py`，13 条用例（正样本 + 逐规则反样本），
+   防止"永远说通过"和"永远说不通过"两种坏校验器。
+4. **提示词留痕**：`media/images.json` 每格记录 `prompt_used`（含自动补齐的风格锚与场景锚），
+   回答"这一格为什么长这样"。
+
+### 10.3 三集实测（2026-10-22）
+
+| 任务 | 现象 | 结论 |
+| --- | --- | --- |
+| `c2770db2` | 分镜重做 4 次，仍有 3 条违约，阶段却 `completed` | 发现"带病完成"漏洞 → 已修 |
+| `ac4f10a3` | 分镜仍违约，**阶段硬失败**，整轮停在分镜 | 硬闸生效；同时暴露主场景统计 bug（`distinct.count` 恒为 1）→ 已修 |
+| `fe78692a` | 提示词改为**给定 12 格骨架**后，分镜**一次通过**（attempt 1），场景序列 `S1 S1 S1 S2 S2 S1 S1 S1 S3 S3 S1 S1`、景别无相邻相同 | 证明"先定结构、模型填内容"比"事后校验"有效得多 |
+
+**方法论结论（重要）**：约束要**前置成骨架**，而不是**后置成罚单**。
+同一份规则，只做校验 → 模型打地鼠（修 A 坏 B），4 次重做仍不过；
+给出确定性骨架 → 一次通过。这条经验适用于后续所有技能。
+
+### 10.4 暴露的新问题（进 P1 清单）
+
+- **生图审核误杀**：`fe78692a` 第 1 格被万相判 `Output data may contain inappropriate content` → 降级为占位图（已如实留痕）。
+  空镜 + "车内空无一人 + 司机"这类描述也会触发，说明审核偏保守。P1 需要"审核失败 → 软化重试 → 换通道"三级处理，而不是直接占位。

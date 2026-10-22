@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""演出约束校验器的自测 —— 正样本必须通过，每个反样本必须**报对那一条**。
+
+为什么要这个文件：
+    一个只会说"不通过"的校验器，和没有校验器一样不可用；
+    一个永远说"通过"的校验器更糟 —— 它会让整条产线误以为自己守住了规范。
+    所以这里两侧都测：合规分镜过，逐条破坏只报对应那一类错。
+
+零依赖、零成本、不连网：python scripts/selftest_directing.py
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+BACKEND = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BACKEND))
+
+from app.harness.consistency import validate_scene_references, validate_shot_budget  # noqa: E402
+
+BUDGET = {
+    "max_distinct_scenes": 3,
+    "max_scene_cuts": 6,
+    "primary_scene_ratio": 0.5,
+    "aba_rule": True,
+    "forbid_adjacent_same_shot": True,
+    "one_action_per_panel": True,
+    "require_motion": True,
+}
+
+# 合规样本：3 个场景、A-B-A 换场、景别不撞、每格一个动作。
+SCENE_SEQ = ["S1", "S1", "S2", "S1", "S1", "S1", "S3", "S1", "S1", "S2", "S1", "S1"]
+SHOT_SEQ = [
+    "wide", "medium", "close", "medium", "wide", "extreme-close",
+    "wide", "medium", "close", "wide", "medium", "close",
+]
+MOTIONS = ["static", "zoom-in", "pan-left", "zoom-out", "static", "zoom-in",
+           "pan-right", "zoom-in", "static", "pan-left", "zoom-out", "static"]
+
+
+def good_panels() -> dict:
+    panels = []
+    for i in range(12):
+        panels.append({
+            "index": i + 1,
+            "scene_id": SCENE_SEQ[i],
+            "shot_size": SHOT_SEQ[i],
+            "action": f"机械师完成第 {i + 1} 个动作",
+            "motion": MOTIONS[i],
+            "prompt": "CHENMO_ANCHOR: anchor text ...",
+        })
+    return {"panels": panels}
+
+
+def good_scenes() -> dict:
+    return {"scenes": [
+        {"id": "S1", "name": "废料场", "anchor": "vast scrap-metal wasteland, overcast sky"},
+        {"id": "S2", "name": "维修间", "anchor": "cluttered repair shed, single hanging bulb"},
+        {"id": "S3", "name": "门口", "anchor": "rusted gate under a broken streetlight"},
+    ]}
+
+
+def check(name: str, ok: bool, reasons: list[str], expect_fail_with: str | None) -> bool:
+    """expect_fail_with=None 表示期望通过；否则期望失败且原因里含该关键词。"""
+    hit = any(expect_fail_with in r for r in reasons) if expect_fail_with else False
+    passed = ok if expect_fail_with is None else (not ok and hit)
+    mark = "PASS" if passed else "FAIL"
+    print(f"[{mark}] {name}")
+    if not passed:
+        print("       ok=", ok)
+        for r in reasons:
+            print("       -", r)
+    return passed
+
+
+def main() -> int:
+    results: list[bool] = []
+
+    # ① 正样本
+    ok, reasons = validate_shot_budget(good_panels(), BUDGET)
+    results.append(check("合规分镜应通过", ok, reasons, None))
+    ok2, r2 = validate_scene_references(good_panels(), good_scenes())
+    results.append(check("合规场景引用应通过", ok2, r2, None))
+
+    # ② 场景超预算
+    p = good_panels()
+    p["panels"][3]["scene_id"] = "S9"
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    results.append(check("第 4 个场景应触发超预算", ok, reasons, "超出预算"))
+
+    # ③ A→B→C 三连换场
+    p = good_panels()
+    for i, sid in enumerate(["S1", "S2", "S3"], start=0):
+        p["panels"][i]["scene_id"] = sid
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    results.append(check("三连换场应被拦", ok, reasons, "必须改成 A-B-A"))
+
+    # ④ 相邻同景别
+    p = good_panels()
+    p["panels"][1]["shot_size"] = p["panels"][0]["shot_size"]
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    results.append(check("相邻同景别应被拦", ok, reasons, "景别"))
+
+    # ⑤ 单格多动作
+    p = good_panels()
+    p["panels"][4]["action"] = "他捡起管子，然后抬头望向远处"
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    results.append(check("单格多动作应被拦", ok, reasons, "多个动作"))
+
+    # ⑥ 缺 scene_id
+    p = good_panels()
+    del p["panels"][0]["scene_id"]
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    results.append(check("缺 scene_id 应被拦", ok, reasons, "缺少 scene_id"))
+
+    # ⑦ 缺 motion
+    p = good_panels()
+    del p["panels"][2]["motion"]
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    results.append(check("缺 motion 应被拦", ok, reasons, "缺少 motion"))
+
+    # ⑧ 未知场景号（引用完整性）
+    p = good_panels()
+    p["panels"][0]["scene_id"] = "S8"
+    ok, reasons = validate_scene_references(p, good_scenes())
+    results.append(check("未知场景号应被拦", ok, reasons, "不存在的场景号"))
+
+    # ⑨ 没有场景卡
+    ok, reasons = validate_scene_references(good_panels(), None)
+    results.append(check("缺 scenes.json 应被拦", ok, reasons, "未产出或其中没有 scenes"))
+
+    # ⑩ 裸数组形态也必须能校验（宽容解析）
+    ok, reasons = validate_shot_budget(good_panels()["panels"], BUDGET)
+    results.append(check("裸数组形态应同样通过", ok, reasons, None))
+
+    # ⑪ 主场景判定必须按"出现次数"，不能按"第一次出现的顺序"
+    #    回归用例：首个出现的场景是 S3，但主场景其实是 S1（占 8 格）。
+    p = good_panels()
+    seq = ["S3", "S1", "S1", "S1", "S2", "S1", "S1", "S1", "S2", "S1", "S1", "S1"]
+    for i, sid in enumerate(seq):
+        p["panels"][i]["scene_id"] = sid
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    results.append(check("主场景按出现次数判定（S1 占 9/12 应通过）", ok, reasons, None))
+
+    # ⑫ 没有任何场景过半 → 必须报出来，且报的是真实占比
+    p = good_panels()
+    seq = ["S1", "S2", "S3", "S1", "S2", "S3", "S1", "S2", "S3", "S1", "S2", "S3"]
+    for i, sid in enumerate(seq):
+        p["panels"][i]["scene_id"] = sid
+    ok, reasons = validate_shot_budget(p, {**BUDGET, "aba_rule": False, "max_scene_cuts": 12})
+    results.append(check("无主场景应被拦且占比正确", ok, reasons, "只占 33%"))
+
+    print()
+    total, passed = len(results), sum(results)
+    print(f"{passed}/{total} 通过")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

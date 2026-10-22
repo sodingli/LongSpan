@@ -39,7 +39,12 @@ from ..models import (
 from ..store import storage
 from ..canvas_store import effective_image_config, effective_llm_model
 from .agent import AgentRunner, build_system_prompt
-from .consistency import extract_anchors, validate_panel_anchors
+from .consistency import (
+    extract_anchors,
+    validate_panel_anchors,
+    validate_scene_references,
+    validate_shot_budget,
+)
 from .skill import SkillDef, StageDef, registry
 from .tools import ToolContext
 from .tools import registry as tool_registry
@@ -414,10 +419,21 @@ class RunManager:
             },
         )
         prompt_text = registry.read_prompt(skill, stage)
+        # 创作约束（directing）渲染进提示词：先让模型"知道预算"，再由校验器"强制预算"。
+        # 只写进提示词 = 建议；只写进校验 = 事后惩罚。两者都要，缺一不可。
+        stage_desc = stage.description
+        if stage.directing:
+            stage_desc = (
+                f"{stage_desc}\n\n## 本阶段硬性约束（directing，来自技能声明）\n"
+                "以下不是建议值，是校验器的判据：字段缺失或越界都会让本阶段判失败并重做。\n"
+                "```json\n"
+                + json.dumps(stage.directing, ensure_ascii=False, indent=2)
+                + "\n```"
+            )
         system = build_system_prompt(
             skill_md=skill.skill_md,
             stage_name=stage.name,
-            stage_desc=stage.description,
+            stage_desc=stage_desc,
             review_focus=stage.review_focus,
             success_criteria=stage.success_criteria,
             tools_whitelist=stage.tools_available,
@@ -474,7 +490,17 @@ class RunManager:
             return await self._run_stage(db, run, skill, stage, quota,
                                          feedback="上一轮未通过验收：" + "；".join(failures))
 
-        # ④.2 重做次数用尽、媒体动作仍然没成 → 硬失败（禁止"带病标完成"）。
+        # ④.2 硬约束（consistency_checks）违约 + 重做次数用尽 → 硬失败。
+        #      为什么不能"带病标完成"：结构违约会污染下游整条链（分镜结构错 →
+        #      视频首尾帧、字幕对位、时间轴全错），用户看到的是一集"看起来完成了"的废片。
+        #      文本类验收未达标（如字数略少）仍按现状交付并在 detail 标注 —— 那不影响契约。
+        #      开关在 manifest.orchestration.on_unmet_hard，默认 fail（约束是契约，不是建议）。
+        on_unmet = str((skill.orchestration or {}).get("on_unmet_hard") or "fail").lower()
+        if consistency_failures and on_unmet == "fail":
+            self._mark_stage_failed(db, step, stage, action_results, failures)
+            return {"status": "_stage_failed", "failures": failures}
+
+        # ④.3 重做次数用尽、媒体动作仍然没成 → 硬失败（禁止"带病标完成"）。
         #      文本类验收未达标仍按现状交付（已在 step.detail 标注），
         #      但"成品没产出"没有可交付的东西，必须如实判失败、让用户续跑。
         if action_failures:
@@ -558,10 +584,50 @@ class RunManager:
             kind = str(check.get("kind") or "").strip()
             if kind == "panel_anchor_consistency":
                 failures.extend(self._check_panel_anchors(run_id, check))
+            elif kind == "shot_budget":
+                # 预算的唯一来源是 stage.directing.shot_budget（manifest 里只写一份），
+                # check 里只声明「强制执行它」，避免两处数字对不上。
+                budget = dict((stage.directing or {}).get("shot_budget") or {})
+                budget.update(check.get("overrides") or {})
+                failures.extend(self._check_shot_budget(run_id, check, budget))
+            elif kind == "scene_reference":
+                failures.extend(self._check_scene_references(run_id, check))
             elif kind:
                 # 未识别的一致性校验类型：不静默忽略，如实上报（架构铁律 #2）。
                 failures.append(f"一致性校验类型未识别：{kind}（manifest 声明了 runner 不支持的类型）")
         return failures
+
+    def _check_shot_budget(self, run_id: str, check: dict, budget: dict) -> list[str]:
+        """演出约束（PRD FR-01）：镜头预算的硬闸。
+
+        读 panels.json，按 manifest 里的 directing.shot_budget 判定场景数/换场次数/
+        景别节奏/单格单动作/运动白名单。判据全部来自数据，runner 不知道"漫剧"。
+        """
+        plan_rel = str(check.get("plan") or "panels.json")
+        if not storage.exists(run_id, plan_rel):
+            return [f"镜头预算校验缺少分镜清单 {plan_rel}（分镜未产出）"]
+        plan = _read_json_artifact(run_id, plan_rel)
+        if plan is None:
+            return [f"镜头预算校验读不懂 {plan_rel}（JSON 解析失败，先修清单格式）"]
+        ok, reasons = validate_shot_budget(plan, budget)
+        return [] if ok else reasons
+
+    def _check_scene_references(self, run_id: str, check: dict) -> list[str]:
+        """场景卡引用完整性（PRD FR-02）：每格的 scene_id 必须指向真实场景。"""
+        plan_rel = str(check.get("plan") or "panels.json")
+        scenes_rel = str(check.get("scenes") or "scenes.json")
+        if not storage.exists(run_id, scenes_rel):
+            return [f"缺少场景卡 {scenes_rel}（每格只能靠重建描述，背景元素必然漂移）"]
+        if not storage.exists(run_id, plan_rel):
+            return [f"场景引用校验缺少分镜清单 {plan_rel}（分镜未产出）"]
+        plan = _read_json_artifact(run_id, plan_rel)
+        scenes = _read_json_artifact(run_id, scenes_rel)
+        if plan is None:
+            return [f"场景引用校验读不懂 {plan_rel}（JSON 解析失败，先修清单格式）"]
+        if scenes is None:
+            return [f"场景引用校验读不懂 {scenes_rel}（JSON 解析失败，先修清单格式）"]
+        ok, reasons = validate_scene_references(plan, scenes)
+        return [] if ok else reasons
 
     def _check_panel_anchors(self, run_id: str, check: dict) -> list[str]:
         """FR-02：分镜格必须复用角色锚点原文（跨格一致性）。

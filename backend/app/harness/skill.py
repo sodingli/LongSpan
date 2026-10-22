@@ -58,6 +58,11 @@ class StageDef:
     #   kind 决定用哪个校验器；plan/anchors 是校验器的输入文件。
     # 「什么算一致」是技能的知识，runner 只负责「读声明 → 调校验器 → 判失败重做」。
     consistency_checks: list[dict] = field(default_factory=list)
+    # 阶段级**创作约束**（演出/版式/字数预算…）—— 同样是数据，不是代码。
+    # 例（漫剧）：shot_budget{max_distinct_scenes, max_scene_cuts, one_action_per_panel…}
+    # 两条去向：① 渲染进提示词，让模型知道预算；② 由 consistency_checks 的校验器强制执行。
+    # 这是「价值在约束与留痕」的最直接落点：约束一旦只写在提示词里，就只是建议。
+    directing: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict) -> "StageDef":
@@ -81,6 +86,7 @@ class StageDef:
             icon=raw.get("icon", ""),
             actions=[dict(a) for a in (raw.get("actions", []) or [])],
             consistency_checks=[dict(c) for c in (raw.get("consistency_checks", []) or [])],
+            directing=dict(raw.get("directing", {}) or {}),
         )
 
     def to_dict(self) -> dict:
@@ -100,6 +106,7 @@ class StageDef:
             "sub_stages": [s.to_dict() for s in self.sub_stages],
             "actions": self.actions,
             "consistency_checks": self.consistency_checks,
+            "directing": self.directing,
         }
 
 

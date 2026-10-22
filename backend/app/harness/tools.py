@@ -388,6 +388,40 @@ def _plan_items(plan: Any, key: str) -> tuple[list, str | None]:
 
 
 # --------------------------------------------------------------------------- #
+# 场景卡（PRD FR-02）：场景锚点由工具确定性注入，不靠模型自觉
+#
+# 为什么是工具注入而不是让模型在 prompt 里复用：
+#   角色锚点必须由模型写（它要接本格动作），所以只能"校验"；
+#   场景锚点是**整段冻结的背景描述**，与动作无关，可以由工具无脑拼在末尾。
+#   能机器保证的事，绝不写成提示词约定 —— 这是 MRD §0.2 的直接执行。
+# --------------------------------------------------------------------------- #
+SCENE_CARDS_REL = "scenes.json"
+
+
+def _read_scene_map(ctx: ToolContext) -> dict[str, dict]:
+    """读 scenes.json → {scene_id: {anchor, name}}；读不到返回空字典（由校验器负责报错）。"""
+    from .consistency import _scene_payload
+
+    raw = _read_json_file(ctx, SCENE_CARDS_REL)
+    return _scene_payload(raw) if raw is not None else {}
+
+
+def _apply_scene_anchor(
+    panel: dict, prompt: str, scene_map: dict[str, dict], key: str
+) -> tuple[str, str | None]:
+    """把该格所属场景的冻结背景描述拼到提示词末尾。返回 (新提示词, 留痕说明)。"""
+    sid = str(panel.get("scene_id") or panel.get("sceneId") or "").strip()
+    if not sid:
+        return prompt, None
+    anchor = str((scene_map.get(sid) or {}).get("anchor") or "").strip()
+    if not anchor:
+        return prompt, f"第 {key} 格引用的场景「{sid}」在 scenes.json 里不存在或缺少 anchor，未注入场景描述"
+    if anchor[:40] in prompt:
+        return prompt, None
+    return f"{prompt}. Scene (fixed backdrop, do not change): {anchor}", None
+
+
+# --------------------------------------------------------------------------- #
 # 人物一致性（FR-03/FR-04）：定妆图 + 参考图映射
 #
 # 为什么需要这里：跨格换脸根因是「生图只吃文字 prompt，没有参考图」。
@@ -532,6 +566,7 @@ async def _generate_images(
         panels = panels[: int(fast_limit)]
 
     index: dict[str, dict] = _read_json_file(ctx, IMAGE_INDEX_REL) or {}
+    scene_map = _read_scene_map(ctx)
     created: list[str] = []
     reused: list[str] = []
     degraded: list[str] = []
@@ -575,12 +610,22 @@ async def _generate_images(
             if style_note:
                 degraded.append(f"第 {key} 格：{style_note}")
 
+        # 场景锚点：确定性注入（PRD FR-02）。不注入 = 每格重新描述背景 = 世界漂移。
+        clean_prompt, scene_note = _apply_scene_anchor(p, clean_prompt, scene_map, key)
+        if scene_note:
+            degraded.append(scene_note)
+
         out = await generate_image(
             ctx.storage, ctx.run_id, clean_prompt, f"panels/panel-{i:02d}.svg", ratio,
             model_override=model_ov, service_override=service_ov,
             subject_reference=subject_ref,
         )
         out["index"] = key
+        # 留痕：记录**实际送进模型**的提示词（含自动补齐的风格锚 + 场景锚）。
+        # 没有它，"这一格为什么长这样"永远只能靠猜 —— 而可解释正是本产品的主张。
+        out["prompt_used"] = clean_prompt[:1200]
+        if scene_note:
+            out["scene_note"] = scene_note
         if ref_role:
             out["subject_reference_role"] = ref_role
         # 关键：**合并**进已有条目，不能整体覆盖 —— 条目里可能已经有人工补的

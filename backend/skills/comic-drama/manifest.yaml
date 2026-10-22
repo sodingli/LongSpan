@@ -88,6 +88,12 @@ orchestration:
   max_send_backs: 3
   max_wall_time_minutes: 40   # 精修通道含生图/配音/渲染，给足时间
 
+  # 硬约束（consistency_checks）重做次数用尽后的处置：
+  #   fail    → 阶段判失败，整轮停下等续跑（默认。约束是契约，违约的分镜会污染
+  #             下游的视频首尾帧、字幕对位与时间轴，交付出去就是一集"看起来完成了"的废片）
+  #   deliver → 带病交付，只在 detail 里标注（仅用于演示/探索，不建议用于生产）
+  on_unmet_hard: fail
+
   # -------------------------------------------------------------------------
   # 草稿诚实性：快通道相比精修「省略了什么」
   #
@@ -199,7 +205,7 @@ stages:
     description: 逐格出画面描述 + 分镜图；先跑前 3 格样片看效果，再铺满全格
     prompt: prompts/05_storyboard.md
     tools_available: [write_artifact, read_artifact, placeholder_image, record_decision, list_artifacts]
-    produces: [storyboard.md, panels.json]
+    produces: [storyboard.md, panels.json, scenes.json]
     fast_channel: true
     checkpoint_required: true
     human_approval_default: false
@@ -207,10 +213,27 @@ stages:
       - 文件 storyboard.md 存在且非空
       - 至少 600 字
       - 文件 panels.json 存在且非空
+      - 文件 scenes.json 存在且非空
     review_focus:
       - 每格是否复用了角色卡里的锚点原文
       - 相邻格之间是否有镜头景别变化（避免"每格都是中景"）
       - 是否标注了镜头运动方式
+      - 场景总数是否控制在预算内（场景越多，模型重建世界的次数越多）
+      - 每格是否只演一个动作、且 action 一句话写清
+      - 换场是否用遮挡/背影/道具特写过渡，而不是硬切
+    # 演出约束（PRD-演出约束与一致性分层 FR-01~FR-05）。
+    # 这里是「价值在约束」的落点：既渲染进提示词（让模型知道预算），
+    # 又由 consistency_checks 的 shot_budget 强制（让模型不能只当建议）。
+    # 调松/调紧只改这里，不动一行代码 —— 这就是"换题材 0 行代码"的判定线。
+    directing:
+      shot_budget:
+        max_distinct_scenes: 3        # 12 格最多 3 个场景
+        max_scene_cuts: 6             # 场景切换次数上限
+        primary_scene_ratio: 0.5      # 主场景至少占一半镜头
+        aba_rule: true                # 禁止 A→B→C 三连换场，必须回到上一个场景
+        forbid_adjacent_same_shot: true   # 相邻格不得同景别
+        one_action_per_panel: true    # 一格只演一个动作
+        require_motion: true          # 每格必须声明镜头运动（静止也要写 static）
     demo_file: fixtures/05_storyboard.md
     # 阶段动作：模型交出 panels.json 后，由 Harness 确定性执行。
     # 快通道只出前 3 格样片（草稿诚实性：草稿只给样片，精修通道才铺满）。
@@ -222,11 +245,19 @@ stages:
     # 「什么算一致」是漫剧的知识，写在这里（数据），runner 只读声明调校验器。
     # slow_only: 快通道（草稿）下角色设计阶段未跑、characters.md 不存在，
     # 跳过校验（草稿诚实性：一致性是精修通道的承诺，见 draft_gaps）。
+    #
+    # shot_budget / scene_reference 不设 slow_only：它们是结构约束，
+    # 与"角色有没有锁定"无关，草稿同样必须遵守 —— 否则草稿的分镜结构也是废的。
     consistency_checks:
       - kind: panel_anchor_consistency
         plan: panels.json
         anchors: characters.md
         slow_only: true
+      - kind: shot_budget
+        plan: panels.json
+      - kind: scene_reference
+        plan: panels.json
+        scenes: scenes.json
 
   # ---------------- C6 ----------------
   # 快通道包含它：配音「方案」是纯文本产出、很便宜，
