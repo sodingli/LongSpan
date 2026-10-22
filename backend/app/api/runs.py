@@ -311,3 +311,44 @@ def download_zip(run_id: str):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="longspan-{run_id}.zip"'},
     )
+
+
+@router.get("/{run_id}/metrics")
+def get_run_metrics(run_id: str, db: Session = Depends(get_db)) -> dict:
+    """一集的三个数（ROADMAP §零.2）：返工率 / 结构违约数 / TTFV 分段。
+
+    实时从既有留痕计算（steps / events / gates），与 metrics.json 落盘口径一致；
+    不存在 cache 失效问题，改了历史（重置阶段重跑）后刷新页面即得新数。
+    """
+    from ..harness.metrics import compute_run_metrics
+
+    run = db.query(Run).filter(Run.id == run_id).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return compute_run_metrics(db, run)
+
+
+@router.get("/metrics/overview")
+def metrics_overview(db: Session = Depends(get_db)) -> dict:
+    """全部任务的指标总览（周报视图）：每个 run 一行三个数 + 判定线状态。"""
+    from ..harness.metrics import compute_run_metrics
+
+    rows = []
+    for run in db.query(Run).order_by(Run.created_at.desc()).limit(50).all():
+        try:
+            m = compute_run_metrics(db, run)
+        except Exception:  # noqa: BLE001
+            continue
+        rows.append({
+            "run_id": m["run_id"],
+            "title": m["title"],
+            "status": m["status"],
+            "created_at": run.created_at.isoformat() if run.created_at else None,
+            "panel_count": m["panel_count"],
+            "rework_rate": m["rework_rate"],
+            "violation_count": m["violation_count"],
+            "human_share": m["human_share"],
+            "ttfv_seconds": m["ttfv_seconds"],
+            "verdicts": m["verdicts"],
+        })
+    return {"rows": rows}

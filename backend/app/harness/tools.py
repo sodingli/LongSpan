@@ -471,11 +471,17 @@ CHARACTER_ART_STYLE = (
 
 
 def _read_character_art(storage: Any, run_id: str, role: str) -> str | None:
-    """找某个角色的定妆图绝对路径；不存在返回 None。"""
-    rel = _character_art_rel(role)
-    if not storage.exists(run_id, rel):
-        return None
-    return str(storage.abs_path(run_id, rel))
+    """找某个角色的定妆图绝对路径；不存在返回 None。
+
+    2026-10-22 修：只认 .jpg 会静默丢图 —— 实际落盘可能是 .png（早期版本/重画
+    留档），文件明明在、参考图却"不存在"。按常见扩展名依次探测。
+    """
+    safe = re.sub(r"[^a-z0-9_\-]", "", (role or "").lower())
+    base = f"characters/{safe or 'unknown'}"
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        if storage.exists(run_id, base + ext):
+            return str(storage.abs_path(run_id, base + ext))
+    return None
 
 
 def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, list[str]]:
@@ -491,6 +497,14 @@ def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, 
     """
     notes: list[str] = []
     tags = _anchor_tags(prompt)
+
+    # 空镜排除（2026-10-22 补）：prompt 显式声明「no people」的格，绝不能带人物
+    # 参考图 —— 参考图的语义是"画面主体长这样"，空镜带它会自动补出完整人物
+    # （实测教训：空车提示词被画出陌生人）。锚点画风句逐字在 prompt 里也会命中，
+    # 所以这个判定必须放在一切查找之前。
+    if re.search(r"\bno\s+(people|persons?|characters?|humans?|figures?)\b", prompt, re.IGNORECASE):
+        notes.append("本格声明为空镜（no people），已跳过人物参考图")
+        return None, None, notes
 
     # 第 1 级：标签 → 文件名
     for tag in tags:
@@ -520,26 +534,25 @@ def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, 
         for key, val in anchors.items():
             if not val:
                 continue
-            # 探针匹配：锚点可能被画风锚挤到 prompt 后半段（前缀相似度会落空），
-            # 改用「锚点前几个逗号子句」在 prompt 里找子串。锚点原文逐字复用时必然命中。
+            # 探针匹配（2026-10-22 改为逐子句计数）。旧逻辑只试「前 3 个子句的
+            # 完整前缀」，但模型复用锚点时常改写画风句（丢 "Stylized" 这一个词
+            # 整个前缀就断了），人物特征句却逐字保留 —— 结果被误判成空镜、
+            # 参考图静默失联（画布重绘实测踩到）。逐子句统计：人物句逐字命中
+            # 即可定位，画风句改写不影响。
             chunks = [c.strip() for c in val.split(",") if c.strip()]
-            score = 0.0
-            for take in (3, 2, 1):
-                probe = ", ".join(chunks[:take])
-                if len(probe) >= 20 and probe in seg:
-                    # score 用探针绝对长度：探针 ≥20 字符且逐字命中，已是「逐字复用」的
-                    # 强证据；不能按探针/锚点全长的比例设阈值（长锚点会被稀释成假阴性）。
-                    score = float(len(probe))
-                    break
+            seg_low = seg  # 保持与旧行为一致：原大小写匹配（锚点原文逐字复用）
+            hits, hit_len = 0, 0
+            for c in chunks:
+                if len(c) >= 6 and c in seg_low:
+                    hits += 1
+                    hit_len += len(c)
+            score = float(hit_len) if hits >= 2 else 0.0
             if score > best_score:
                 best_key, best_score = key, score
         if best_key and best_score >= 20:
             art = _read_character_art(ctx.storage, ctx.run_id, best_key)
             if art:
-                if tags and best_score < 0.95:
-                    notes.append(f"参考图按内容匹配（相似度 {best_score:.2f}）定位到 {best_key}")
-                elif not tags:
-                    notes.append(f"prompt 未写锚点标签，参考图按锚点内容匹配定位到 {best_key}")
+                notes.append(f"参考图按锚点内容匹配（命中长度 {best_score:.0f} 字符）定位到 {best_key}")
                 return art, best_key, notes
 
     # 没有任何标签且内容也匹配不上 → 视为空镜，不带参考图

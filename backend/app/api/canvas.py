@@ -385,21 +385,48 @@ async def regenerate_panel(
 
     from ..media.image import COMIC_STYLE_SKILLS, attach_note, ensure_style_anchor, generate_image
 
+    # FR-07（2026-10-22）：重绘也走「参考图」—— 手改一格，脸不再变。
+    # 复用管线同一套三级查找（标签文件名 → 锚点内容匹配 → 任意定妆图兜底），
+    # 保证画布重绘与自动生成拿到的是同一张定妆图（同一张源头，风格才对等）。
+    ref_path: str | None = None
+    ref_role: str | None = None
+    ref_notes: list[str] = []
+    try:
+        from types import SimpleNamespace
+
+        from ..harness.tools import _find_reference_art
+
+        ref_path, ref_role, ref_notes = _find_reference_art(
+            SimpleNamespace(storage=storage, run_id=run_id), prompt
+        )
+    except Exception as exc:  # noqa: BLE001 —— 参考图是增强，找不到就退回纯文生图
+        ref_notes.append(f"参考图查找失败（退回纯文生图）：{exc}")
+
+    # 锚点标签是机器路标不是画面内容（管线同款处理）：送生图前剥掉。
+    # 注意 panels.json 里落盘的仍是原文（管线重跑还要靠它匹配锚点）。
+    from ..harness.tools import _strip_anchor_tags
+
+    send_prompt = _strip_anchor_tags(prompt) or prompt
+
     # 风格锚校验（FR-04 补充）：漫剧类任务的提示词缺「反写实 / 角色风格化」条款，
     # 在生图入口补齐并留痕 —— 不让写实漂移从画布重绘这条路溜进来。
     style_note = None
     if run.skill_id in COMIC_STYLE_SKILLS:
-        prompt, style_note = ensure_style_anchor(prompt)
+        send_prompt, style_note = ensure_style_anchor(send_prompt)
+    if ref_notes:
+        style_note = "；".join([n for n in [style_note] if n] + ref_notes)
     bus.emit(
         db, run_id, EventType.TOOL_CALL,
-        f"重画第 {index} 格（模型 {model or '默认'}）",
+        f"重画第 {index} 格（模型 {model or '默认'}"
+        + (f"，参考图 {ref_role}" if ref_path else "，无参考图") + "）",
         stage_id=stage_id,
         payload={"human_edit": "regenerate", "index": index, "model": model or "", "service": service or ""},
     )
 
     out = await generate_image(
-        storage, run_id, prompt, f"panels/panel-{int(index):02d}.svg", ratio,
+        storage, run_id, send_prompt, f"panels/panel-{int(index):02d}.svg", ratio,
         model_override=model or None, service_override=service or None,
+        subject_reference=ref_path,
     )
     out["index"] = str(index)
     out["source"] = "model"

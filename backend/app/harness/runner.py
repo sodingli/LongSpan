@@ -993,6 +993,22 @@ class RunManager:
         run.finished_at = datetime.now(timezone.utc)
         run.progress = 1.0 if status == RunStatus.SUCCEEDED else run.progress
         db.commit()
+        # 指标落库（ROADMAP W2）：每次任务结束算一遍三个数（返工率/违约数/TTFV 分段），
+        # 写进工作区 metrics.json。失败/取消也算 —— 失败最贵的周，正是最需要看数的周。
+        try:
+            from .metrics import compute_run_metrics, save_run_metrics
+
+            m = compute_run_metrics(db, run)
+            save_run_metrics(storage, run.id, m)
+            bus.emit(db, run.id, EventType.RUN_STATUS,
+                     "指标已落库：返工率 {}、违约 {} 条、等人占比 {}%".format(
+                         m["rework_rate"], m["violation_count"],
+                         round((m["human_share"] or 0) * 100, 1)),
+                     payload={"metrics": {k: m[k] for k in (
+                         "rework_rate", "violation_count", "human_share", "verdicts")}})
+        except Exception as exc:  # noqa: BLE001 —— 指标是留痕增强，绝不影响任务收尾
+            bus.emit(db, run.id, EventType.AGENT_THOUGHT,
+                     f"指标统计失败（不影响任务）：{exc}")
         bus.emit(db, run.id, EventType.RUN_FINISHED,
                  note or ("任务完成" if status == RunStatus.SUCCEEDED else "任务结束"),
                  payload={"status": status})
