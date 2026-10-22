@@ -268,13 +268,18 @@ def _extract_items(payload: Any, keys: tuple[str, ...]) -> list[dict]:
 
 
 def normalize_shot_size(raw: Any) -> str | None:
-    """把景别描述归一成 wide / medium / close / extreme-close；认不出返回 None。"""
+    """把景别描述归一成 wide / medium / close / extreme-close；认不出返回 None。
+
+    匹配按别名**从长到短**：'extreme-close' 必须先于 'close' 判定，
+    否则 'extreme-close' 里的子串 'close' 会抢先命中，把大特写误归成近景
+    （实测冤枉了合规分镜：close/extreme-close/close 被报成三连 close）。
+    """
     if raw is None:
         return None
     text = str(raw).strip().lower()
     if not text:
         return None
-    for alias, canon in _SHOT_SIZE_ALIASES.items():
+    for alias, canon in sorted(_SHOT_SIZE_ALIASES.items(), key=lambda kv: -len(kv[0])):
         if alias in text:
             return canon
     return None

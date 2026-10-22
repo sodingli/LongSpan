@@ -309,3 +309,43 @@ P2 自动后检（观察期，只告警不阻断）
 
 - **生图审核误杀**：`fe78692a` 第 1 格被万相判 `Output data may contain inappropriate content` → 降级为占位图（已如实留痕）。
   空镜 + "车内空无一人 + 司机"这类描述也会触发，说明审核偏保守。P1 需要"审核失败 → 软化重试 → 换通道"三级处理，而不是直接占位。
+
+### 10.5 生图通道机制落地（2026-10-22 下午，D15 决策 + 审核三级处理）
+
+**D15 决策记录（三条路探完后合并成一条更好的）**：
+
+| 选项 | 实测结论 |
+| --- | --- |
+| 回切 image-01 | 不需要了 —— 仅作备用通道保留在链里 |
+| 建 Seedream 服务 | 放弃 —— 需要单独的京东云控制台服务/app_key，且探完后发现有更好的 |
+| 万相接 imageedit | 不需要了 —— 同网关直接有更强能力 |
+
+**真正的解**：万相中转网关的 `/api/v1/models` 实际有 357 个模型（此前只盲试了几个名字），
+其中 **`qwen-image-3.0-pro` 走 DashScope `multimodal-generation` 同步端点**，实测：
+
+- 支持参考图（messages 里 `{image: data-URL}` 多图输入，官方上限 3 张）——
+  用定妆图实测：中年司机（圆寸/八字纹/蓝工装/05 胸牌）跨场景到便利店货架前**全要素保持**；
+- 支持 `negative_prompt` + `seed`（parameters 原生）；
+- 720*1280 尺寸、单张 30-90 秒同步返回；
+- 之前被 wan2.2 审核误杀的「空车内无人」空镜**直接过审**。
+
+**结论：主通道切 `dashscope-mm` + `qwen-image-3.0-pro`** —— 同通道同时解决
+"画质高一档"与"人物格参考图"，风格天然统一，D15 三选项全部作废。
+
+**机制落地（image.py 重构）**：
+
+1. `ImageChannel` + 能力矩阵（`_CAPS`）：每条通道如实声明 supports_reference / negative / seed；
+2. 通道链：主通道（`LONGSPAN_IMAGE_*`）+ `LONGSPAN_IMAGE_FALLBACKS`（JSON 数组），
+   当前配置 wan22-async → jd-image01；
+3. `image_routing=auto`：带参考图的格优先走支持参考图的通道（稳定排序不打乱主备）；
+4. **审核三级处理**：审核拦截 → 同通道软化重试（L1 敏感词替换+安全声明 / L2 再压情绪词）→
+   换下一通道 → 全败才占位，且 `fallback_reason` **逐通道列出失败原因**（铁律 #2）；
+   `channel_trace` 记录每一步决策（"main：审核拦截，软化 Lv1 重试"）；
+5. `prompt_used` 记录**软化后**实际送进模型的提示词（tools.py 改为 setdefault 不覆盖）；
+6. 自测 `scripts/selftest_image_channels.py`：33 条用例全过
+   （真实审核案例识别、软化逐级生效不叠加、fallbacks 三种形态宽容解析、auto 路由稳定排序、
+   mock 三级编排与全败留痕）。
+
+**附带发现（进 P1）**：该网关还有 vidu/kling 的 reference2image 与 start-end2video、
+wan3.0-video-prime 等视频模型 —— W3 评估视频通道升级时优先实测 vidu start-end2video
+（原生首尾帧协议，可能比现在的"图生视频+首尾帧"更贴合链式方案）。

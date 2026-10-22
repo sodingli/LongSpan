@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     image_size: str = ""            # 留空 = 按比例推导（9:16 → 1024x1792 等）
     image_seed: int = 0             # 0 = 不固定种子（每格不同）
     image_params_json: str = ""     # 高级：额外合并进请求体的 JSON 字段
+    # 备用生图通道链（JSON 数组，主通道失败/审核拦截时依序切换，D15 + 审核三级处理）：
+    #   [{"provider":"dashscope","base_url":"https://…/api/v1","api_key":"sk-…","model":"wan2.2-t2i-plus"},
+    #    {"provider":"jdcloud","base_url":"https://…/v1","api_key":"pk-…","model":"image-01","service":"minimax_image01"}]
+    # provider 支持 dashscope-mm（多模态同步，支持参考图）/ dashscope（异步任务）/ jdcloud / openai-compat
+    image_fallbacks: str = ""
+    # 通道路由：auto（带参考图的格优先走支持参考图的通道，保持相对顺序）/
+    #           main（永远主通道优先，参考图不支持就如实标注未生效）
+    image_routing: str = "auto"
     # Remotion 渲染并发 tab 数：本机 macOS < 15 时高并发会部分 tab 连不上
     # （"Visited localhost:3000 but got no response"），实测 2 稳定
     render_concurrency: int = 2

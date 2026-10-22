@@ -621,9 +621,10 @@ async def _generate_images(
             subject_reference=subject_ref,
         )
         out["index"] = key
-        # 留痕：记录**实际送进模型**的提示词（含自动补齐的风格锚 + 场景锚）。
-        # 没有它，"这一格为什么长这样"永远只能靠猜 —— 而可解释正是本产品的主张。
-        out["prompt_used"] = clean_prompt[:1200]
+        # 留痕：记录**实际送进模型**的提示词（含自动补齐的风格锚 + 场景锚，
+        # 以及审核拦截后的软化版本）。generate_image 已写入它时不覆盖 ——
+        # 软化后的 prompt 才是"这格为什么长这样"的真相；没有它就只能靠猜。
+        out.setdefault("prompt_used", clean_prompt[:1200])
         if scene_note:
             out["scene_note"] = scene_note
         if ref_role:

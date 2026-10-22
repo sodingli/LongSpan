@@ -16,6 +16,8 @@ import hashlib
 import json
 import logging
 import re
+import dataclasses
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -472,6 +474,248 @@ async def _request_dashscope_image(
     return img.content, ext, notes
 
 
+# --------------------------------------------------------------------------- #
+# 通道（channel）：能力矩阵 + 通道链
+#
+# 背景（D15 决策 + 审核三级处理，2026-10-22）：
+#   - 单一 provider 是全局二选一，人物格要参考图就得整集换通道 → 风格分裂；
+#   - 单一 provider 还会被内容审核"一票否决"（实测 wan2.2 把"空车内"判成敏感内容），
+#     之前只能降级占位图 —— 应该先软化重试、再换通道，全败才占位。
+# 因此引入通道链：主通道 + LONGSPAN_IMAGE_FALLBACKS 备用链，每个通道带能力声明。
+# 铁律：全败时 fallback_reason 必须列出**每个通道**的失败原因，不许只报最后一个。
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class ImageChannel:
+    """一条生图通道 = 协议 + 凭据 + 能力声明（能力是路由依据，必须如实声明）。"""
+
+    kind: str                      # dashscope-mm / dashscope / jdcloud / openai-compat
+    base_url: str
+    api_key: str
+    model: str
+    service: str = ""              # 仅 jdcloud 用（预置服务标识）
+    name: str = ""                 # 留痕用通道名，空则按 kind/model 生成
+    supports_reference: bool = False
+    supports_negative: bool = False
+    supports_seed: bool = False
+
+    def label(self) -> str:
+        return self.name or f"{self.kind}/{self.model or 'default'}"
+
+
+# 各协议的能力矩阵（实测结论，勿凭想象改）：
+#   dashscope-mm：multimodal-generation 同步；实测 qwen-image-3.0-pro 支持
+#     参考图（data URL 多图输入）+ negative_prompt + seed + 720*1280；
+#   dashscope：text2image 异步任务；negative/seed 支持，无参考图；
+#   jdcloud：image-01 同步；subject_reference 支持（1 张），negative 不支持；
+#   openai-compat：/images/generations；negative/seed 视服务商而定（如实标注）。
+_CAPS = {
+    "dashscope-mm": (True, True, True),
+    "dashscope": (False, True, True),
+    "jdcloud": (True, False, True),
+    "openai-compat": (False, True, True),
+}
+
+_KNOWN_KINDS = frozenset(_CAPS)
+
+
+def _channel_from_parts(kind: str, base_url: str, api_key: str, model: str,
+                        service: str = "", name: str = "") -> ImageChannel | None:
+    kind = (kind or "").strip().lower()
+    if kind not in _KNOWN_KINDS or not api_key or not base_url:
+        return None
+    ref, neg, seed = _CAPS[kind]
+    return ImageChannel(
+        kind=kind, base_url=base_url.rstrip("/"), api_key=api_key, model=(model or "").strip(),
+        service=(service or "").strip(), name=(name or "").strip(),
+        supports_reference=ref, supports_negative=neg, supports_seed=seed,
+    )
+
+
+def parse_channels() -> list[ImageChannel]:
+    """主通道（LONGSPAN_IMAGE_*）+ 备用链（LONGSPAN_IMAGE_FALLBACKS）→ 通道列表。
+
+    解析规则（对配置宽容，对矛盾报错）：
+      - fallbacks 是 JSON 数组；单个对象也接受（自动包成数组）；
+      - 缺 provider/api_key/base_url 的项跳过并在控制台记日志（配置半残不该炸整轮）；
+      - 未知 provider 跳过 —— 别拿未知协议去赌线上。
+    """
+    channels: list[ImageChannel] = []
+    main = _channel_from_parts(
+        settings.image_provider if settings.image_provider not in ("", "auto") else "openai-compat",
+        settings.image_base_url, settings.image_api_key,
+        settings.image_model, settings.image_service, name="main",
+    )
+    if main:
+        channels.append(main)
+    raw = (settings.image_fallbacks or "").strip()
+    if raw:
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning("IMAGE_FALLBACKS 不是合法 JSON，忽略备用通道：%s", exc)
+            obj = None
+        items = obj if isinstance(obj, list) else ([obj] if isinstance(obj, dict) else [])
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                continue
+            ch = _channel_from_parts(
+                str(it.get("provider") or ""), str(it.get("base_url") or ""),
+                str(it.get("api_key") or ""), str(it.get("model") or ""),
+                str(it.get("service") or ""), str(it.get("name") or f"fallback-{i + 1}"),
+            )
+            if ch:
+                channels.append(ch)
+            else:
+                logger.warning("备用通道 #%d 配置不完整（缺 provider/api_key/base_url 或未知协议），已跳过", i + 1)
+    return channels
+
+
+# 内容审核拦截的特征（实测：万相 "Output data may contain inappropriate content"、
+# 京东云 InputImageSensitiveContentDetected「疑似真人」、DashScope DataInspectionFailed 等）
+_MODERATION_MARKERS = (
+    "inappropriate content", "sensitivecontent", "sensitive content", "content_policy",
+    "content policy", "datainspection", "moderation", "censor",
+    "审核", "敏感内容", "涉政", "风控", "违规内容",
+)
+
+
+def is_moderation_error(err_text: str) -> bool:
+    """判断生图失败是否为内容审核拦截（决定走软化重试还是直接换通道）。"""
+    low = (err_text or "").lower()
+    return any(m in low for m in _MODERATION_MARKERS)
+
+
+# 软化替换（审核误杀自救）：语义降噪，不是合规豁免 —— 真违规内容软化后照样该拦。
+# L1 轻度：替换明显高敏词；L2 重度：再压情绪/冲突词。
+_SOFTEN_L1: list[tuple[str, str]] = [
+    (r"\bblood(y|stained|ied)?\b", "red-toned"),
+    (r"\bblood\b", "red marks"),
+    (r"\bcorpse[s]?\b", "debris"),
+    (r"\bdead (body|bodies)\b", "still figures"),
+    (r"\bdead\b", "still"),
+    (r"\bdeath\b", "stillness"),
+    (r"\bgun(s)?\b", "metal tools"),
+    (r"\brifle(s)?\b", "metal tools"),
+    (r"\bknife(s)?\b", "metal tools"),
+    (r"\bwound(ed)?\b", "tired"),
+    (r"\bkill(ed|ing|s)?\b", "confronted"),
+    (r"\bnaked|nude\b", "plain-clothed"),
+    (r"\bskull(s)?\b", "shell fragments"),
+    (r"血迹|血污|流血", "红色痕迹"),
+    (r"尸体", "杂物"),
+    (r"死亡|死去|死了", "静止"),
+    (r"枪", "金属物"),
+    (r"刀", "工具"),
+    (r"伤口", "伤痕纹样"),
+]
+_SOFTEN_L2: list[tuple[str, str]] = [
+    (r"\bhorror\b", "dim"),
+    (r"\beerie|creepy\b", "quiet"),
+    (r"\bgloomy\b", "dim"),
+    (r"\bfear|frightening\b", "unease"),
+    (r"\bviolent|brutal\b", "intense"),
+    (r"\bcorpse|cadaver\b", "debris"),
+    (r"恐怖|阴森|诡异", "幽暗"),
+    (r"血腥|暴力", "激烈"),
+]
+
+_SOFTEN_SUFFIX_L1 = "wholesome, family-friendly illustration, no violence, no gore"
+_SOFTEN_SUFFIX_L2 = "gentle flat illustration, safe for all audiences, soft lighting"
+
+
+def soften_prompt(prompt: str, level: int) -> str:
+    """按级软化提示词。level=1 轻度、2 重度（累积），其余返回原样。
+
+    从**原始 prompt**出发生成每一级（不要在软化结果上叠加，避免重复拼接）。
+    """
+    if level < 1:
+        return prompt
+    text = prompt
+    for pat, rep in _SOFTEN_L1:
+        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+    if level >= 2:
+        for pat, rep in _SOFTEN_L2:
+            text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+    suffix = _SOFTEN_SUFFIX_L2 if level >= 2 else _SOFTEN_SUFFIX_L1
+    return f"{text}, {suffix}"
+
+
+async def _request_dashscope_mm_image(
+    prompt: str,
+    ratio: str,
+    model: str | None = None,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    size: str | None = None,
+    negative_prompt: str = "",
+    seed: int = 0,
+    extra: dict | None = None,
+    reference_images: list[str] | None = None,
+    timeout: float = 240.0,
+) -> tuple[bytes, str, list[str]]:
+    """DashScope 多模态同步生图（qwen-image / wan2.7-image 等），**支持参考图**。
+
+    协议（实测 2026-10-22，万相中转）：
+      POST {base}/services/aigc/multimodal-generation/generation（同步返回，无任务轮询）
+      input.messages[0].content = [{image: <data URL>}, ..., {text: prompt}]
+      parameters.size = "720*1280"（W*H），negative_prompt / seed 原生支持。
+    实测 qwen-image-3.0-pro：参考图跨场景保持人物一致（发型/五官/服装/胸牌全保留）；
+    「空车内无人」这类被 wan2.2 审核误杀的描述在本模型直接过审。
+
+    reference_images：data URL / 公网 URL 列表（最多 3 张，官方上限），顺序即输入顺序。
+    """
+    base = (base_url or settings.image_base_url).rstrip("/")
+    key = api_key or settings.image_api_key
+    notes: list[str] = []
+    content: list[dict] = []
+    refs = [r for r in (reference_images or []) if r][:3]
+    for r in refs:
+        content.append({"image": r})
+    content.append({"text": prompt[:2000]})
+    params: dict = {"size": _wan_size(size, ratio), "n": 1}
+    if negative_prompt:
+        params["negative_prompt"] = negative_prompt
+    if seed:
+        params["seed"] = int(seed)
+    if extra:
+        params.update(extra)
+    body = {
+        "model": (model or settings.image_model or "qwen-image-3.0-pro"),
+        "input": {"messages": [{"role": "user", "content": content}]},
+        "parameters": params,
+    }
+    async with httpx.AsyncClient(timeout=timeout) as cli:
+        resp = await cli.post(
+            base + "/services/aigc/multimodal-generation/generation",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=body,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"multimodal 生图返回 {resp.status_code}：{resp.text[:300]}")
+        data = resp.json()
+        if data.get("code"):
+            raise RuntimeError(f"multimodal 生图失败（{data.get('code')}）：{data.get('message') or resp.text[:200]}")
+        content_out = ((data.get("output") or {}).get("choices") or [{}])[0].get("message", {}).get("content") or []
+        url = next((c.get("image") or c.get("image_url") for c in content_out if isinstance(c, dict)), "")
+        if not url:
+            raise RuntimeError(f"multimodal 生图返回里没有图片：{resp.text[:200]}")
+        if refs:
+            notes.append(f"已携带人物参考图（{len(refs)} 张，多图输入）")
+        if negative_prompt:
+            notes.append("已携带负向提示词（原生支持）")
+        if seed:
+            notes.append(f"已固定随机种子 seed={seed}")
+        img = await cli.get(url)
+    if img.status_code >= 400:
+        raise RuntimeError(f"下载生图结果失败：HTTP {img.status_code}")
+    ct = img.headers.get("content-type", "")
+    ext = "png" if "png" in ct else ("jpg" if ("jpeg" in ct or "jpg" in ct) else "png")
+    return img.content, ext, notes
+
+
 def _parse_extra(raw: str, kind: str) -> dict:
     """高级参数是 JSON 字符串；写错就在生图前直接报错，不带着坏参数去打接口。"""
     text = (raw or "").strip()
@@ -521,17 +765,21 @@ async def generate_image(
     params: dict | None = None,
     subject_reference: str | None = None,
 ) -> dict[str, Any]:
-    """生成一张分镜图。返回 {path, provider, is_placeholder, fallback_reason?, params_note?}。
+    """生成一张分镜图。返回 {path, provider, is_placeholder, fallback_reason?, params_note?, channel_trace?}。
 
     model_override / service_override 来自「阶段级模型覆盖」——
     只影响这一次调用，不动全局配置（一个任务的实验不该污染整站）。
     params 覆盖全局的 negative_prompt / size / seed / 额外字段，
     优先级：调用方传入 > 全局配置。未生效的参数会回传 params_note，不静默吞掉。
 
-    subject_reference（FR-04，人物一致性）：可选，本地参考图路径或 data URL / 公网 URL。
-    传入本地路径会自动转 data URL。仅京东云 image 接口支持（subject_reference 字段），
-    OpenAI 兼容接口与本地兜底不支持 —— 不支持的 provider 会如实回传 params_note，
-    绝不静默吞掉（架构铁律 #2）。
+    subject_reference（FR-04，人物一致性）：本地参考图路径或 data URL / 公网 URL。
+    路由（image_routing）：auto 时带参考图的格**优先走支持参考图的通道**（保持相对顺序）；
+    main 时永远主通道优先。参考图传到不支持的通道时如实回传 params_note，绝不静默吞掉。
+
+    审核三级处理（D15 伴生，2026-10-22）：
+      1. 内容审核拦截 → 同通道软化提示词重试（Lv1 轻度 / Lv2 重度）；
+      2. 软化仍拦 → 切换下一通道（fallbacks 链）；
+      3. 全部通道失败 → 占位分镜卡 + fallback_reason **逐通道列出失败原因**。
     """
     prompt = (prompt or "").strip()
     if not prompt:
@@ -554,62 +802,88 @@ async def generate_image(
         else:
             subject_ref = _image_to_data_url(sr)
 
-    # 文件名按扩展名修正：真实生图是位图，兜底是 SVG
-    provider_kind = (settings.image_provider or "auto").strip().lower()
-    real_ready = provider_kind != "local" and settings.image_api_key and settings.image_base_url
-    if real_ready:
-        try:
-            if provider_kind == "jdcloud":
-                data, ext, notes = await _request_jdcloud_image(
-                    prompt, ratio, model=model_override, service=service_override,
-                    subject_reference=subject_ref, seed=seed, extra=extra or None,
-                )
-                if negative:
-                    # image-01 协议没有 negative_prompt 字段（官方文档确认），
-                    # 不支持就明说，绝不静默丢弃 —— 防写实靠提示词里的反写实条款。
-                    notes = list(notes) + [
-                        "负面提示词不被 image-01 协议支持，已忽略；防写实请写进提示词的反写实条款"
-                    ]
-                provider_label = f"jdcloud/{model_override or settings.image_model or 'image-01'}"
-            elif provider_kind == "dashscope":
-                # 万相是异步任务制，尺寸由本分支内部归一（不走 OpenAI 的 size 语义）
-                data, ext, notes = await _request_dashscope_image(
-                    prompt, ratio, model=model_override,
-                    size=size or None, negative_prompt=negative, seed=seed, extra=extra or None,
-                )
-                if subject_ref:
-                    notes = list(notes) + [
-                        "参考图（subject_reference）未生效：万相文生图不支持人物参考图，已退化为纯文生图"
-                    ]
-                provider_label = f"dashscope/{model_override or settings.image_model or 'wan2.2-t2i-plus'}"
-            else:
-                # OpenAI 兼容接口不支持 subject_reference，如实回传未生效
-                data, ext, notes = await _request_real_image(
-                    prompt, ratio, model=model_override,
-                    size=size or None, negative_prompt=negative, seed=seed, extra=extra or None,
-                )
-                if subject_ref:
-                    notes = list(notes) + [
-                        "参考图（subject_reference）未生效：当前 provider 不支持人物参考图，已退化为纯文生图"
-                    ]
-                provider_label = model_override or settings.image_model or "openai-compat"
-            p = re.sub(r"\.(svg|png|jpe?g)$", f".{ext}", path, flags=re.IGNORECASE)
-            rel, size_bytes = storage.write_bytes(run_id, p, data)
-            logger.info("真实生图成功 run=%s path=%s bytes=%s", run_id, rel, size_bytes)
-            out: dict[str, Any] = {
-                "path": rel, "provider": provider_label, "is_placeholder": False, "size": size_bytes,
-            }
-            if notes:
-                out["params_note"] = "；".join(notes)
-            if subject_ref:
-                out["used_subject_reference"] = True
-            return out
-        except Exception as e:  # noqa: BLE001
-            logger.warning("真实生图失败，降级为分镜卡：%s", e)
-            fallback_reason = str(e)[:300]
-    else:
-        fallback_reason = "未配置生图服务（IMAGE_API_KEY 为空）"
+    channels = parse_channels()
+    if model_override and channels:
+        # 阶段级模型覆盖只作用于主通道（备用通道的模型在 fallbacks 里各自声明）
+        channels[0] = dataclasses.replace(channels[0], model=model_override)
 
+    routing = (settings.image_routing or "auto").strip().lower()
+    if subject_ref and routing == "auto" and len(channels) > 1:
+        # 参考图能力优先：稳定排序，不打破同能力通道的主备顺序
+        channels = sorted(channels, key=lambda c: 0 if c.supports_reference else 1)
+
+    # 文件名按扩展名修正：真实生图是位图，兜底是 SVG
+    fallback_reasons: list[str] = []
+    trace: list[str] = []
+    data = ext = None
+    notes: list[str] = []
+    used_channel: ImageChannel | None = None
+    used_prompt = prompt
+
+    def _real_ready(ch: ImageChannel) -> bool:
+        return bool(ch.api_key and ch.base_url)
+
+    for ch in channels:
+        if not _real_ready(ch):
+            fallback_reasons.append(f"{ch.label()}: 未配置 api_key/base_url，跳过")
+            continue
+        attempt_prompt = prompt
+        soft_level = 0
+        for attempt in range(3):  # 原始 + Lv1 软化 + Lv2 软化
+            try:
+                data, ext, notes = await _request_via_channel(
+                    ch, attempt_prompt, ratio,
+                    model_override if ch is channels[0] else None,
+                    service_override if ch is channels[0] else None,
+                    size=size, negative_prompt=negative if ch.supports_negative else "",
+                    seed=seed, extra=extra or None,
+                    subject_ref=subject_ref,
+                )
+                used_channel = ch
+                used_prompt = attempt_prompt
+                break
+            except Exception as e:  # noqa: BLE001
+                err = str(e)[:300]
+                if is_moderation_error(err) and soft_level < 2:
+                    soft_level += 1
+                    attempt_prompt = soften_prompt(prompt, soft_level)
+                    trace.append(f"{ch.label()}：审核拦截，软化 Lv{soft_level} 重试")
+                    continue
+                fallback_reasons.append(f"{ch.label()}: {err}")
+                trace.append(f"{ch.label()}：失败，{'换下一通道' if ch is not channels[-1] else '无备用通道'}")
+                break  # 非审核类失败（网络/配置/协议）换通道才有意义
+        if used_channel is not None:
+            break
+
+    if used_channel is not None and data is not None:
+        p = re.sub(r"\.(svg|png|jpe?g)$", f".{ext}", path, flags=re.IGNORECASE)
+        rel, size_bytes = storage.write_bytes(run_id, p, data)
+        logger.info("真实生图成功 run=%s path=%s channel=%s bytes=%s", run_id, rel, used_channel.label(), size_bytes)
+        out: dict[str, Any] = {
+            "path": rel,
+            "provider": f"{used_channel.kind}/{used_channel.model or 'default'}",
+            "is_placeholder": False,
+            "size": size_bytes,
+            "channel": used_channel.label(),
+        }
+        if trace:
+            out["channel_trace"] = trace
+        # 未生效参数如实回传（铁律 #2）
+        ineffective: list[str] = list(notes)
+        if negative and not used_channel.supports_negative:
+            ineffective.append("负面提示词不被该通道协议支持，已忽略；防写实请写进提示词的反写实条款")
+        if subject_ref and not used_channel.supports_reference:
+            ineffective.append("参考图（subject_reference）未生效：该通道不支持人物参考图，已退化为纯文生图")
+        if ineffective:
+            out["params_note"] = "；".join(ineffective)
+        if subject_ref and used_channel.supports_reference:
+            out["used_subject_reference"] = True
+        out["prompt_used"] = used_prompt[:1200]
+        return out
+
+    # 全通道失败 / 未配置 → 占位分镜卡（逐通道留痕，绝不只报最后一个错）
+    reason = "；".join(fallback_reasons) if fallback_reasons else "未配置生图服务（IMAGE_API_KEY 为空）"
+    logger.warning("生图全通道失败，降级占位卡 run=%s：%s", run_id, reason[:400])
     svg = storyboard_card_svg(prompt, ratio)
     p = re.sub(r"\.(png|jpe?g)$", ".svg", path, flags=re.IGNORECASE)
     rel, size_bytes = storage.write_text(run_id, p, svg)
@@ -618,8 +892,51 @@ async def generate_image(
         "provider": "local-svg",
         "is_placeholder": True,
         "size": size_bytes,
-        "fallback_reason": fallback_reason,
+        "fallback_reason": reason,
     }
+    if trace:
+        out["channel_trace"] = trace
     if subject_ref:
         out["params_note"] = "参考图（subject_reference）未生效：本地兜底分镜卡不支持人物参考图"
     return out
+
+
+async def _request_via_channel(
+    ch: ImageChannel,
+    prompt: str,
+    ratio: str,
+    model_override: str | None,
+    service_override: str | None,
+    *,
+    size: str,
+    negative_prompt: str,
+    seed: int,
+    extra: dict | None,
+    subject_ref: str | None,
+) -> tuple[bytes, str, list[str]]:
+    """按通道协议分发请求。model_override / service_override 仅主通道消费。"""
+    if ch.kind == "dashscope-mm":
+        return await _request_dashscope_mm_image(
+            prompt, ratio, model=model_override or ch.model or None,
+            base_url=ch.base_url, api_key=ch.api_key,
+            size=size or None, negative_prompt=negative_prompt, seed=seed,
+            extra=extra, reference_images=[subject_ref] if subject_ref else None,
+        )
+    if ch.kind == "dashscope":
+        return await _request_dashscope_image(
+            prompt, ratio, model=model_override or ch.model or None,
+            base_url=ch.base_url, api_key=ch.api_key,
+            size=size or None, negative_prompt=negative_prompt, seed=seed, extra=extra,
+        )
+    if ch.kind == "jdcloud":
+        return await _request_jdcloud_image(
+            prompt, ratio, model=model_override or ch.model or None,
+            service=service_override or ch.service or None,
+            base_url=ch.base_url, api_key=ch.api_key,
+            subject_reference=subject_ref, seed=seed, extra=extra,
+        )
+    return await _request_real_image(
+        prompt, ratio, model=model_override or ch.model or None,
+        base_url=ch.base_url, api_key=ch.api_key,
+        size=size or None, negative_prompt=negative_prompt, seed=seed, extra=extra,
+    )

@@ -151,6 +151,14 @@ def main() -> int:
     ok, reasons = validate_shot_budget(p, {**BUDGET, "aba_rule": False, "max_scene_cuts": 12})
     results.append(check("无主场景应被拦且占比正确", ok, reasons, "只占 33%"))
 
+    # ⑬ 景别别名匹配从长到短：extreme-close 不能被 'close' 子串抢先误归一
+    p = good_panels()
+    p["panels"][2]["shot_size"] = "close"           # 格 3
+    p["panels"][3]["shot_size"] = "extreme-close"   # 格 4（大特写 ≠ 近景）
+    ok, reasons = validate_shot_budget(p, BUDGET)
+    bad = [r for r in reasons if "景别" in r]
+    results.append(check("extreme-close 不被误归一成 close", ok or not bad, reasons, None))
+
     print()
     total, passed = len(results), sum(results)
     print(f"{passed}/{total} 通过")
