@@ -340,3 +340,70 @@ class Decision(Base):
             "reversible": self.reversible,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class Character(Base):
+    """角色资产：跨 Run 复用的角色档案（定妆图 + 冻结锚点 + 完整角色卡）。
+
+    为什么单独成表而不是继续放在每个 Run 的 characters/ 目录里：
+    漫剧是**系列**产品，系列的资产是角色。放在 Run 内等于每集重新铸造一次，
+    第二集想用第一集的主角只能重新生图、重新赌一致性 —— 这是产品缺陷，
+    不是工程细节。角色的归属应该是「工作台」而不是「某一次任务」。
+
+    复用时把 art + card 物化回目标 Run 的 workspace（characters/<slug>.<ext>
+    与 characters.md 里的角色卡块），下游参考图查找链路无需改动即可吃到，
+    且定妆图是同一个文件，跨集一致性是 100% 而不是「概率上接近」。
+    """
+
+    __tablename__ = "characters"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(128), index=True)        # 展示名（中文）
+    slug: Mapped[str] = mapped_column(String(64), unique=True)        # 文件标识 characters/<slug>.<ext>
+    anchor: Mapped[str] = mapped_column(Text, default="")             # 冻结锚点原文
+    card: Mapped[str] = mapped_column(Text, default="")               # 完整角色卡 markdown（复用时原样注入）
+    style: Mapped[str] = mapped_column(String(64), default="")        # 画风标签
+    skill_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+
+    art_rel: Mapped[str] = mapped_column(Text, default="")            # 源 Run 内相对路径
+    source_run_id: Mapped[str] = mapped_column(String(32), index=True, default="")
+    art_provider: Mapped[str] = mapped_column(String(64), default="") # 哪条生图通道产出的
+
+    usage_count: Mapped[int] = mapped_column(Integer, default=0)      # 被复用次数（含首次）
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)            # 可变/禁止变化/视觉区分度等
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    def to_dict(self, *, with_card: bool = False) -> dict:
+        d = {
+            "id": self.id,
+            "name": self.name,
+            "slug": self.slug,
+            "anchor": self.anchor,
+            "style": self.style,
+            "skill_id": self.skill_id,
+            "art_rel": self.art_rel,
+            "source_run_id": self.source_run_id,
+            "art_provider": self.art_provider,
+            "usage_count": self.usage_count,
+            "meta": self.meta or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if with_card:
+            d["card"] = self.card
+        return d
+
+
+class CharacterUsage(Base):
+    """角色出场记录：哪个角色出现在哪一集（系列进度看板与「出场集数」的数据源）。"""
+
+    __tablename__ = "character_usages"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    character_id: Mapped[str] = mapped_column(String(32), index=True)
+    run_id: Mapped[str] = mapped_column(String(32), index=True)
+    reused: Mapped[bool] = mapped_column(Boolean, default=False)  # True=复用；False=本集新铸造
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
