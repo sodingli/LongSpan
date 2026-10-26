@@ -510,16 +510,19 @@ def _read_character_art(storage: Any, run_id: str, role: str) -> str | None:
     return None
 
 
-def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, list[str]]:
+def _find_reference_art(
+    ctx: Any, prompt: str, action: str | None = None
+) -> tuple[str | None, str | None, list[str]]:
     """为某一格找到参考图（定妆图）。返回 (绝对路径 | None, 角色标识 | None, 降级说明)。
 
-    三级查找（2026-10-21 真实验证教训：只有第 1 级时参考图会静默失联）：
+    四级查找（2026-10-21 起真实验证教训逐级补齐）：
     1. 按锚点标签猜文件名（LINYUANZHOU → characters/linyuanzhou.jpg）；
-    2. **内容匹配**：C4 提取锚点时角色名可能是中文（苏晚/林远舟），文件名只能落成
-       anchor_1.jpg / anchor_2.jpg；而 C5 prompt 里是模型自造的拼音标签
-       `LINYUANZHOU_ANCHOR: <锚点原文>`。两者对不上时，用「prompt 里的锚点原文」
-       与 characters.md 的锚点值做相似度匹配，定位到 anchor_N.jpg。
-    3. 兜底：任意一张已有定妆图（总比没有强），并如实记录降级。
+    2. **指纹确定性匹配**：锚点前 80 字符作为完整子串出现在 prompt 里 → 确定性定位，
+       不依赖标签、也不会跨角色误判（2026-10-23 换脸根因修复）；
+    2b. 逐子句探针匹配（指纹未命中的退路，带区分度阈值防跨角色误判）；
+    3. **action 角色名匹配**：prompt 完全没复用锚点原文时，用分镜 action 里的中文
+       角色名（阿杰/陆子昂/…）与 characters.md 标题顺序对齐，确定性定位；
+    4. 兜底：定妆图仅一张才盲兜底；多张且定位失败则不带参考图 + 告警（传错人=换脸）。
     """
     notes: list[str] = []
     tags = _anchor_tags(prompt)
@@ -550,7 +553,7 @@ def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, 
     except Exception:  # noqa: BLE001
         chars_md = ""
     if chars_md:
-        from .consistency import extract_anchors
+        from .consistency import _anchor_substring, extract_anchors
 
         anchors = extract_anchors(chars_md)
         # 取最后一个标签之后的文本段（该段即锚点原文 + 动作描述）；无标签时用全文
@@ -558,48 +561,125 @@ def _find_reference_art(ctx: Any, prompt: str) -> tuple[str | None, str | None, 
             seg = re.split(r"\b[A-Za-z0-9_\-]+_ANCHOR\s*[:：]\s*", prompt)[-1]
         else:
             seg = prompt
-        best_key, best_score = None, 0.0
+
+        # ── 2a. 指纹确定性匹配（2026-10-23 新增，最高优先级）──────────────
+        # 血泪点：逐子句计数法在「无标签」时会跨角色误判 —— 格 1 明明画的是
+        # 陆子昂（白金厨师服），却因为「马甲/头盔/蓝」等通用词与小杨的锚点
+        # 命中 2 个子句，被错误定位到小杨的定妆图，参考图直接传错人。
+        # 而 C5 约定锚点原文是「逐字复用」的：只要 prompt 复用了锚点，锚点指纹
+        # （前 80 字符）就一定会以**完整子串**形式出现。子串匹配是确定性的，
+        # 不存在「通用词碰巧命中」——这比逐子句猜可靠一个数量级。
+        fp_hits = []
         for key, val in anchors.items():
             if not val:
                 continue
-            # 探针匹配（2026-10-22 改为逐子句计数）。旧逻辑只试「前 3 个子句的
-            # 完整前缀」，但模型复用锚点时常改写画风句（丢 "Stylized" 这一个词
-            # 整个前缀就断了），人物特征句却逐字保留 —— 结果被误判成空镜、
-            # 参考图静默失联（画布重绘实测踩到）。逐子句统计：人物句逐字命中
-            # 即可定位，画风句改写不影响。
+            fp = _anchor_substring(val)
+            if fp and fp in seg:
+                fp_hits.append((key, len(fp)))
+        if fp_hits:
+            # 多个角色同格时取指纹最长（信息量最大）的那个；其余角色由 prompt
+            # 里各自的标签在第 1 级/内容里另行定位。
+            key, fplen = max(fp_hits, key=lambda t: t[1])
+            art = _read_character_art(ctx.storage, ctx.run_id, key)
+            if art:
+                notes.append(
+                    f"参考图按锚点指纹确定性匹配（{fplen} 字符逐字命中）定位到 {key}"
+                )
+                return art, key, notes
+
+        # ── 2b. 逐子句探针匹配（指纹没命中时的退路，加区分度阈值防跨角色误判）──
+        # 旧逻辑只按「最高分」选角色，当两个角色的锚点共享通用词时（马甲/头盔/
+        # 蓝色…）会被错误地选到相似度略高的那个。这里要求最高分必须**显著高于
+        # 次高分**（区分度 ≥1.5× 或领先 ≥40 字符），否则判「角色混淆」——
+        # 宁可走第 3 级兜底 + 告警，也绝不把参考图传错人（传错人 = 确定性换脸）。
+        best_key, best_score, second_score = None, 0.0, 0.0
+        for key, val in anchors.items():
+            if not val:
+                continue
             chunks = [c.strip() for c in val.split(",") if c.strip()]
-            seg_low = seg  # 保持与旧行为一致：原大小写匹配（锚点原文逐字复用）
             hits, hit_len = 0, 0
             for c in chunks:
-                if len(c) >= 6 and c in seg_low:
+                if len(c) >= 6 and c in seg:
                     hits += 1
                     hit_len += len(c)
             score = float(hit_len) if hits >= 2 else 0.0
             if score > best_score:
+                second_score = best_score
                 best_key, best_score = key, score
+            elif score > second_score:
+                second_score = score
         if best_key and best_score >= 20:
-            art = _read_character_art(ctx.storage, ctx.run_id, best_key)
-            if art:
-                notes.append(f"参考图按锚点内容匹配（命中长度 {best_score:.0f} 字符）定位到 {best_key}")
-                return art, best_key, notes
+            # 区分度阈值：最高分须显著领先次高分，否则角色混淆、宁可放弃
+            ambiguous = second_score > 0 and (
+                best_score < second_score * 1.5 and (best_score - second_score) < 40
+            )
+            if ambiguous:
+                notes.append(
+                    f"参考图定位歧义：最高分 {best_key}({best_score:.0f}) 与次高分"
+                    f"({second_score:.0f}) 区分度不足，可能跨角色误判，本格不盲目带参考图"
+                )
+            else:
+                art = _read_character_art(ctx.storage, ctx.run_id, best_key)
+                if art:
+                    notes.append(
+                        f"参考图按锚点内容匹配（命中长度 {best_score:.0f} 字符）定位到 {best_key}"
+                    )
+                    return art, best_key, notes
 
-    # 没有任何标签且内容也匹配不上 → 视为空镜，不带参考图
-    if not tags:
-        return None, None, notes
+    # 第 3 级：action 角色名确定性匹配（2026-10-23 新增）。
+    # prompt 完全没复用锚点原文时（指纹/逐子句都命中不了），用分镜 action 里的
+    # 中文角色名做最后一道确定性定位。action 是 C5 约定的「一个动作、中文、含角色名」
+    # （如「陆子昂站在评审台前」），角色名与 characters.md 标题顺序对齐 anchor_N。
+    # 只有当「角色名数 == 锚点数」且 action 里唯一命中一个角色名时才敢用 ——
+    # 顺序错位或命中多个角色名（同框格）都判不可靠，宁可放弃也不猜。
+    if action and chars_md:
+        from .consistency import extract_role_names
 
-    # 第 3 级：兜底 —— 任意一张已有定妆图
+        role_names = extract_role_names(chars_md)
+        anchor_keys = list(anchors.keys())
+        if role_names and len(role_names) == len(anchor_keys):
+            hits = [i for i, name in enumerate(role_names) if name and name in action]
+            if len(hits) == 1:
+                key = anchor_keys[hits[0]]
+                art = _read_character_art(ctx.storage, ctx.run_id, key)
+                if art:
+                    notes.append(
+                        f"参考图按 action 角色名「{role_names[hits[0]]}」确定性定位到 {key}"
+                    )
+                    return art, key, notes
+
+    # 第 4 级：兜底 —— 定妆图仅一张时盲兜底；多张时宁可放弃也不传错人。
+    # 关键修复（2026-10-23，两段）：
+    #   (a) 旧逻辑「没有标签就 return None」会在模型**没写 XXX_ANCHOR 标签、但画面
+    #       确实有人物**时提前放弃，导致参考图彻底失联（实测 2942b7ea：10 格只 1 格
+    #       带参考图）→ 现在非空镜 + 有定妆图就尝试兜底。
+    #   (b) 但「任意一张定妆图」在**多角色**时是盲目的 —— 传错人 = 确定性换脸，
+    #       危害远大于「不带参考图」（纯文生图至少不会画成另一个人）。所以：
+    #       定妆图 == 1 张时才盲兜底；>= 2 张时若定位失败就**不带参考图 + 告警**，
+    #       把「谁是谁」的决断留给确定性手段（指纹/标签），绝不靠猜。
     try:
         files = ctx.storage.list_files(ctx.run_id)
     except Exception:  # noqa: BLE001
         files = []
     arts = sorted(f for f in files if f.startswith("characters/") and f.endswith((".jpg", ".png")))
-    if arts:
+    if len(arts) == 1:
+        why = f"按标签（{','.join(tags)}）" if tags else "未识别到角色标签"
+        role_clean = re.sub(r"^characters/|\.(jpg|jpeg|png|webp)$", "", arts[0])
         notes.append(
-            f"参考图未按标签（{','.join(tags)}）或内容匹配定位，已兜底使用 {arts[0]}"
+            f"参考图{why}或内容匹配均未定位，全片仅一张定妆图，兜底使用 {arts[0]}"
         )
-        return str(ctx.storage.abs_path(ctx.run_id, arts[0])), arts[0], notes
+        return str(ctx.storage.abs_path(ctx.run_id, arts[0])), role_clean, notes
+    if len(arts) > 1:
+        notes.append(
+            f"参考图定位失败：本格含人物，但 {len(arts)} 张定妆图里无法确定性定位角色"
+            "（无标签、锚点指纹未命中），为避免传错人导致确定性换脸，本格不带参考图，"
+            "交由一致性抽检兜底告警"
+        )
+        return None, None, notes
 
-    notes.append(f"识别到角色标签（{','.join(tags)}）但没有任何定妆图可用，本格未带参考图")
+    notes.append(
+        f"{'识别到角色标签（' + ','.join(tags) + '）但' if tags else ''}没有任何定妆图可用，本格未带参考图"
+    )
     return None, None, notes
 
 
@@ -697,6 +777,34 @@ async def _inspect_and_maybe_redraw(
     return {"out": out2, "detail": verdict2, "notes": notes}
 
 
+async def _consistency_sampling(ctx: ToolContext, out: dict, subject_ref: str | None) -> dict:
+    """生图后的「跨格同人」抽检（FR-08，只告警不阻断）。
+
+    与 _inspect_and_maybe_redraw 的分工：那层查「构图残缺」（无头半身），
+    这层查「换脸」——用视觉模型把本格人物与定妆图比对是不是同一个人。
+    2026-10-23 接入前，vision_check.compare_character 早已实现却从未被调用（死代码），
+    导致"参考图带上了、但画出来是不是那个人"从没有人看过。
+
+    边界（严格对齐 PRD FR-08「只告警，不阻断」）：
+    - 只在真实生图 + 有参考图时抽检；占位卡/空镜跳过；
+    - 抽检失败（网络/解析）只记 checked=False，绝不阻断；
+    - 结论写回 out["consistency"]，人工复核可见。
+    """
+    if not subject_ref or out.get("is_placeholder"):
+        return {"checked": False, "reason": "无参考图或占位卡，跳过一致性抽检"}
+    try:
+        abs_path = ctx.storage.abs_path(ctx.run_id, out["path"])
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": False, "reason": f"定位图片失败：{exc}"}
+    try:
+        from ..media.vision_check import compare_character
+
+        verdict = await compare_character(subject_ref, abs_path)
+    except Exception as exc:  # noqa: BLE001
+        return {"checked": False, "reason": f"一致性抽检异常：{exc}"}
+    return verdict
+
+
 async def _generate_images(
     ctx: ToolContext, plan: dict | None = None, fast_limit: int | None = None
 ) -> dict:
@@ -769,9 +877,11 @@ async def _generate_images(
             continue
 
         # 人物一致性（FR-04）：识别该格用到的角色锚点标签，映射定妆图做参考图。
-        # 三级查找（标签文件名 → 锚点内容匹配 → 任意定妆图兜底），见 _find_reference_art。
+        # 四级查找（标签 → 指纹确定性匹配 → action 角色名 → 单图兜底），见 _find_reference_art。
         # 京东云 subject_reference 当前只支持 1 张参考图 → 多角色格取第一个命中的角色。
-        subject_ref, ref_role, ref_notes = _find_reference_art(ctx, prompt)
+        # action 字段（中文角色名）是「prompt 完全没复用锚点」时的最后确定性兜底。
+        panel_action = str(p.get("action") or p.get("beat") or "").strip()
+        subject_ref, ref_role, ref_notes = _find_reference_art(ctx, prompt, panel_action)
         degraded.extend(ref_notes)
         # 锚点标签是机器路标，不是画面内容 —— 送生图前剥掉，避免污染生成结果
         clean_prompt = _strip_anchor_tags(prompt) or prompt
@@ -825,6 +935,21 @@ async def _generate_images(
         if vision.get("detail"):
             out["vision"] = vision["detail"]
 
+        # 一致性抽检（FR-08，只告警不阻断）：构图自检只查"有没有头"，
+        # 不查"是不是那个人"；这里用视觉模型比对分镜人物与定妆图是否同人。
+        # 结论只留痕 + 告警，不触发重画 —— 判定标准一旦能阻断，就会诱导
+        # "改阈值"而不是"改质量"（MRD §0.6 判定线是决策依据，不是门禁）。
+        cons = await _consistency_sampling(ctx, out, subject_ref)
+        if cons.get("checked"):
+            out["consistency"] = cons
+            if cons.get("found") and cons.get("same", 5) <= 2:
+                degraded.append(
+                    f"第 {key} 格一致性抽检偏低（同人评分 {cons.get('same')}/5）："
+                    f"{cons.get('reason', '')[:100]}（仅告警，未重画，请人工确认）"
+                )
+        elif cons.get("reason"):
+            degraded.append(f"第 {key} 格一致性抽检未执行：{str(cons.get('reason'))[:140]}")
+
         # 关键：**合并**进已有条目，不能整体覆盖 —— 条目里可能已经有人工补的
         # 中间帧 / 尾帧 / 视频片段，直接 index[key]=out 会把它们静默抹掉。
         entry = dict(index.get(key) or {})
@@ -855,6 +980,71 @@ async def _generate_images(
         "degraded": degraded,
         "summary": f"分镜图：新生成 {len(created)} 张、复用 {len(reused)} 张",
     }
+
+
+# 运镜 → 中文镜头运动指令（给图生视频模型看的动作指令，不是给静态生图看的）
+# 键除了 C5 规范的 7 个值，还收录模型常见别名（push-in/pull-out 等），
+# 避免「合法但换了说法」的运镜词映射不到指令而被静默丢弃。
+_MOTION_DIRECTIVE = {
+    "zoom-in": "镜头缓慢推近，从当前景别平稳推进到更近的景别，聚焦主体",
+    "push-in": "镜头缓慢推近，从当前景别平稳推进到更近的景别，聚焦主体",
+    "zoom-out": "镜头缓慢拉远，从当前景别平稳拉宽，逐渐展现更大空间",
+    "pull-out": "镜头缓慢拉远，从当前景别平稳拉宽，逐渐展现更大空间",
+    "pan-left": "镜头平稳向左横移，跟随主体运动方向",
+    "pan-right": "镜头平稳向右横移，跟随主体运动方向",
+    "pan-up": "镜头平稳向上抬升，展现主体或空间的上方",
+    "pan-down": "镜头平稳向下压，展现主体或空间的下方",
+    "orbit": "镜头以主体为中心缓慢环绕，营造环绕审视的动感",
+    "static": "镜头保持静止不动，画面内容本身产生动作",
+}
+
+# 景别 → 中文构图指令（shot_size 字段，来自 spec 骨架，只取宽泛语义避免过度约束）
+_SHOT_SIZE_DIRECTIVE = {
+    "wide": "全景构图，主体完整入画，交代空间环境",
+    "medium": "中景构图，主体腰部以上入画",
+    "close": "近景构图，聚焦主体面部或上半身细节",
+    "extreme-close": "大特写构图，聚焦局部细节（手、物件、表情），不露全脸",
+}
+
+
+def _build_video_prompt(p: dict) -> str:
+    """构造图生视频专用的提示词（FR-06 核心修复）。
+
+    背景（2026-10-23 根因定位）：旧实现只取 panels.json 的 `prompt`（静态生图描述），
+    把 `motion`（运镜）、`action`（动作）、`shot_size`（景别）三个视频专用字段全丢了。
+    结果视频模型收到的是「静态画面 + 锚点标签前缀」，既不知道镜头怎么动、也不知道
+    这一格演什么 —— 这是「视频产品效果不好」的首要根因。
+
+    本函数把这三个字段翻译成视频模型能执行的运镜/动作/构图指令，并剥离锚点标签
+    （锚点标签是给机器定位定妆图的路标，不是画面内容，不能进视频 prompt）。
+    """
+    # 1. 剥离锚点标签（CHENMO_ANCHOR: 前缀是给生图阶段定位参考图用的，不是画面内容）
+    raw = str(p.get("prompt") or p.get("image_prompt") or "").strip()
+    body = _strip_anchor_tags(raw) if raw else ""
+
+    # 2. 运镜指令（motion 字段，C5 阶段要求必填）
+    motion = str(p.get("motion") or p.get("camera") or "").strip().lower()
+    motion_dir = _MOTION_DIRECTIVE.get(motion, "")
+
+    # 3. 动作指令（action 字段，C5 阶段要求「一格只演一个动作」）
+    action = str(p.get("action") or "").strip()
+
+    # 4. 景别指令（shot_size 字段）
+    shot = str(p.get("shot_size") or "").strip().lower()
+    shot_dir = _SHOT_SIZE_DIRECTIVE.get(shot, "")
+
+    parts: list[str] = []
+    if body:
+        parts.append(body)
+    if shot_dir:
+        parts.append(f"镜头构图：{shot_dir}")
+    if action:
+        parts.append(f"本镜头动作：{action}")
+    if motion_dir:
+        parts.append(f"镜头运动：{motion_dir}")
+
+    base = "；".join(parts) if parts else "让画面产生自然的镜头运动，保持人物与画风一致"
+    return base
 
 
 async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> dict:
@@ -932,9 +1122,9 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
             chained_flags[key] = bool(clip.get("chained"))
             return
 
-        base_prompt = str(
-            p.get("prompt") or p.get("image_prompt") or p.get("scene") or ""
-        ).strip() or "让画面产生自然的镜头运动，保持人物与画风一致"
+        # 视频专用提示词：消费 motion/action/shot_size 字段 + 剥离锚点标签。
+        # 旧实现只用静态生图的 prompt，把运镜/动作/景别全丢了（根因修复，见 _build_video_prompt）。
+        base_prompt = _build_video_prompt(p)
 
         # 链式尾帧：本格片段必须收在下一格的开场画面上
         last_frame: str | None = None
@@ -1429,6 +1619,15 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         if not img.get("path") or not ctx.storage.exists(ctx.run_id, img["path"]):
             skipped.append(f"第 {key} 格无分镜图")
             continue
+        # 占位图不进成片（2026-10-23）：SVG 占位卡是「生图失败/审核拦截」的降级产物，
+        # 把它塞进 final.mp4 会让观众开头第一眼看到「占位图·未接生图」——
+        # 对"第一次就出成品"的北极星指标是硬伤。宁可删格、也要如实留痕，
+        # 不渲染任何占位卡（宁缺毋假 + 禁止静默降级）。
+        if img.get("is_placeholder"):
+            skipped.append(
+                f"第 {key} 格是占位图（{img.get('fallback_reason') or '未接生图'}），已从成片剔除"
+            )
+            continue
         try:
             dur = float(
                 p.get("duration_seconds") or p.get("durationInSeconds") or p.get("duration") or 3.0
@@ -1554,6 +1753,41 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         })
         cursor[pk] = offset + clip_dur + GAP
 
+    # ---- BGM：读 voice 阶段的 bgm.json（机器可读设计），合成氛围垫底音 ----
+    # 背景：三个真实 Run 的成片 bgm 全是 null，voice.md 里设计的 BGM/音效点位表
+    # 从未被合进成片（compose 链路里没有"读 BGM 设计 + 铺音轨"的代码）。
+    # 这里补上：读 bgm.json → 合成氛围 BGM（无素材库时用程序化合成兜底）→ 铺进 spec.bgm。
+    # 诚实原则：合成的是「程序化氛围底噪」，不是授权曲目，degraded 里如实说明。
+    bgm_spec: dict | None = None
+    bgm_note = ""
+    bgm_cfg = _read_json_file(ctx, "bgm.json") or {}
+    if isinstance(bgm_cfg, dict) and bgm_cfg.get("enabled", True):
+        # 总时长估算：最后一格结尾 + 片尾卡
+        try:
+            total_dur = max(
+                (starts.get(k, 0.0) + panel_dur.get(k, 0.0)) for k in panel_dur
+            ) + 2.4
+        except ValueError:
+            total_dur = 12 * 5.0
+        mood = str(bgm_cfg.get("mood") or "suspense").strip().lower()
+        strength = float(bgm_cfg.get("strength") or 0.3)
+        try:
+            from ..media.bgm import synthesize_bgm
+
+            bgm_rel = "audio/bgm.m4a"
+            bgm_abs = ctx.storage.abs_path(ctx.run_id, bgm_rel)
+            meta = synthesize_bgm(bgm_abs, duration_seconds=total_dur, mood=mood, strength=strength)
+            # 体积兜底：氛围 BGM 音量压到 0.25~0.4，别盖过配音
+            bgm_spec = {"src": bgm_rel, "volume": min(0.4, max(0.22, strength * 0.5))}
+            bgm_note = (
+                f"已合成程序化氛围 BGM（{meta['mood']}，{meta['duration_seconds']}s，"
+                f"{meta['size'] / 1024:.0f}KB，非授权曲目、仅作垫底）"
+            )
+        except Exception as exc:  # noqa: BLE001
+            bgm_note = f"BGM 合成失败，本片无 BGM（{exc}）"
+    elif isinstance(bgm_cfg, dict) and not bgm_cfg.get("enabled", True):
+        bgm_note = "bgm.json 声明了 enabled=false（本集刻意无 BGM，可能是反转点静音设计）"
+
     spec = {
         "title": title,
         "fps": 30,
@@ -1563,13 +1797,15 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         "intro": {"durationInSeconds": intro_dur, "title": title, "subtitle": "动态漫 · Longspan 合成"},
         "panels": spec_panels,
         "audio": spec_audio,
-        "bgm": None,
+        "bgm": bgm_spec,
         "showWatermark": True,
         "outro": {"durationInSeconds": 2.4, "text": "第一集 · 完", "hint": "由 Longspan 合成"},
     }
 
     out = await _render_impl(ctx.run_id, ctx.storage.run_workspace(ctx.run_id), spec)
     degraded = list(out.get("degraded") or [])
+    if bgm_note:
+        degraded.append(bgm_note)
     degraded.extend(f"{s}（已从成片中剔除，未用假素材顶替）" for s in skipped)
     if audio_missing:
         degraded.append(

@@ -99,9 +99,32 @@ def extract_anchors(characters_md: str) -> dict[str, str]:
     for m in _ANCHOR_EQ_RE.finditer(text):
         _add(m.group(1), m.group(2))
 
-    # 形态 A（冒号）
+    # 形态 A（冒号），支持「标签行 + 多行锚点原文」。
+    # 模型写长锚点时经常换行（第一行放年龄/发型，续行放服装/配饰），单行正则只抓到
+    # 第一行、丢后半段 → 指纹变短 → 与分镜 prompt 对不上。这里向后收集续行：
+    # 从标签行开始，把紧接其后的非空、非标签、非标题、非角色名行都并入锚点原文，
+    # 直到遇到下一个 `XXX_ANCHOR` 标签、`#` 标题或空行分隔为止。
     for m in _ANCHOR_COLON_RE.finditer(text):
-        _add(m.group(1), m.group(2))
+        start = m.end()  # 标签行结束位置
+        val = m.group(2)
+        # 向后收集续行：逐行读，遇到分隔符停止
+        rest = text[start:].lstrip("\n")
+        continuation: list[str] = []
+        for line in rest.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                break  # 空行 = 锚点段落结束
+            if re.match(r"^#{1,6}\s", stripped):  # 标题
+                break
+            if re.search(r"\b[A-Za-z0-9_\-]+_ANCHOR\b", stripped):  # 下一个标签
+                break
+            if re.match(r"^角色[一二三四五六七八九十]?\s*[：:]", stripped):  # 下一个角色名行
+                break
+            continuation.append(stripped)
+        if continuation:
+            val = (val + " " + " ".join(continuation)).strip()
+        _add(m.group(1), val)
+
 
     # 形态 C：无标签前缀的裸代码块，跟在「一致性锚点」标题后（最后兜底）
     if not anchors:
@@ -125,9 +148,33 @@ def extract_anchors(characters_md: str) -> dict[str, str]:
     return anchors
 
 
-# --------------------------------------------------------------------------- #
-# panels.json 锚点校验
-# --------------------------------------------------------------------------- #
+# 角色名标题（## 角色一：阿杰 / ### 角色：陆子昂 …）→ 中文角色名。
+# characters.md 里角色名写在标题里，锚点原文写在下方代码块里，二者没有机器可读的
+# 显式关联 —— 只能靠「标题顺序 ↔ 锚点编号顺序」对齐。这是框架的一个已知弱点，
+# 但顺序在 C4 prompt 约束下是稳定的（角色按出场/重要性依次编号）。
+_ROLE_HEADING_RE = re.compile(r"^#{1,4}\s*角色[一二三四五六七八九十]?\s*[：:]\s*(.+?)(?:[（(]|$)")
+
+
+def extract_role_names(characters_md: str) -> list[str]:
+    """从 characters.md 提取角色中文名（按出现顺序）。
+
+    返回如 ["阿杰", "陆子昂", "小杨"]。仅做**顺序对齐**用途：
+    与 extract_anchors 返回的 anchor_1/2/3 按顺序一一对应，用于「分镜 action
+    里出现中文角色名时」的确定性角色定位兜底（见 _find_reference_art）。
+    顺序错位会导致定位错误，因此只有当角色数与锚点数一致时才敢用（见调用方）。
+    """
+    names: list[str] = []
+    for line in (characters_md or "").splitlines():
+        m = _ROLE_HEADING_RE.search(line)
+        if m:
+            name = m.group(1).strip()
+            # 只取短名（角色名），排除长描述性标题
+            if name and len(name) <= 12:
+                names.append(name)
+    return names
+
+
+
 
 # 一个 prompt 里若出现这些「无角色」标记，视为纯场景格，不强制含锚点。
 # 但默认策略是：**能判定含角色就必须含锚点**，判定不了才放过。
@@ -385,8 +432,21 @@ def validate_shot_budget(
                 low = act.lower()
                 hit = next((m for m in _MULTI_ACTION_MARKERS if m in low), "")
                 if hit:
+                    # 措辞很关键：骨架已经把格数钉死（格号/场景/景别都由系统给定），
+                    # 让模型"拆成两格"是让它去做一件会破坏结构的事 —— 实测它干脆不改，
+                    # 下一轮继续犯（04/05 两集连着复现）。
+                    # 更要紧的是**把原句和改法一起给出来**：只说"含多个动作"，
+                    # 模型还得自己回头找是哪一句、怎么改，于是每轮漏掉两条（实测 3 轮才收敛）。
+                    idx = low.find(hit)
+                    head = act[:idx].strip(" ，,、")
+                    tail = act[idx + len(hit):].strip(" ，,、")
+                    suggestion = (
+                        f"改成「{head}」或「{tail}」" if (head and tail) else "只保留一个动作"
+                    )
                     failures.append(
-                        f"格 {no} 的 action 含多个动作（命中「{hit}」）：一格只演一个动作，拆成两格"
+                        f"格 {no} 的 action「{act[:60]}」含多个动作（命中「{hit}」）："
+                        f"一格只演一个动作 —— 保留一个动作，删掉另一个（或压成一个连贯动作）；"
+                        f"{suggestion}；格数由骨架固定，不要新增/拆格"
                     )
 
         motion = _panel_motion(p)

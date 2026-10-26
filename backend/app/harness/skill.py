@@ -63,6 +63,12 @@ class StageDef:
     # 两条去向：① 渲染进提示词，让模型知道预算；② 由 consistency_checks 的校验器强制执行。
     # 这是「价值在约束与留痕」的最直接落点：约束一旦只写在提示词里，就只是建议。
     directing: dict = field(default_factory=dict)
+    # 阶段级**结构骨架**（2026-10-23 起）：格号/场景号/景别这类"能机器保证"的结构，
+    # 由系统按 spec 生成并回填，不再让模型照提示词自己发明。
+    # 例：{kind: panel_grid, spec: spec.json, target: panels.json}
+    #   ① build+render 把骨架表渲染进提示词；② apply 在模型交卷后回填并记录偏离。
+    # 与 directing 的分工：directing 管"预算/标准"（要模型知道），skeleton 管"结构"（模型不必决定）。
+    skeleton: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict) -> "StageDef":
@@ -87,6 +93,7 @@ class StageDef:
             actions=[dict(a) for a in (raw.get("actions", []) or [])],
             consistency_checks=[dict(c) for c in (raw.get("consistency_checks", []) or [])],
             directing=dict(raw.get("directing", {}) or {}),
+            skeleton=dict(raw.get("skeleton", {}) or {}),
         )
 
     def to_dict(self) -> dict:
@@ -107,6 +114,7 @@ class StageDef:
             "actions": self.actions,
             "consistency_checks": self.consistency_checks,
             "directing": self.directing,
+            "skeleton": self.skeleton,
         }
 
 
