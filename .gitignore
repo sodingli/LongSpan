@@ -37,3 +37,6 @@ dist/
 # ---- 本地工具目录（IDE / Agent 会话数据等，不入代码库）----
 .workbuddy/
 backend/media/remotion/build/
+
+# ---- 验证临时产物（分镜/定妆图截图，不入版本库）----
+docs/验证产物-第五轮/
