@@ -70,6 +70,16 @@ _ALLOWED_DURATIONS = {
 }
 _VIDEO_PROVIDERS = {"jdcloud", "dashscope"}
 
+# 同一网关上的不同模型族参数集不一样：mode(std/pro) 是 Seedance 专有，
+# Vidu 首尾帧协议没有这个字段（官方文档只有 duration/resolution/watermark/audio/is_rec）。
+# 按族开关，避免"把一个模型族的参数塞给另一个族"这种看起来无害、实则可能被拒的写法。
+_NO_MODE_MODEL_PREFIXES = ("vidu",)
+
+
+def _model_has_mode(model: str) -> bool:
+    low = (model or "").strip().lower()
+    return not any(low.startswith(p) for p in _NO_MODE_MODEL_PREFIXES)
+
 
 class VideoConfigError(ValueError):
     """配置或参数不合法 —— 这类错误在提交前就该暴露，不花一分钱。"""
@@ -231,6 +241,7 @@ def _build_jdcloud(
     mode_val = (mode or settings.video_mode or "std").strip().lower()
     if mode_val not in {"std", "pro"}:
         raise VideoConfigError("mode 只能是 std（标准）或 pro（专家）")
+    chosen = (model or settings.video_model).strip()
 
     content: list[dict] = [{"type": "text", "text": prompt}]
     if first_frame:
@@ -248,8 +259,9 @@ def _build_jdcloud(
                 "画面主体与首帧保持一致，不要照搬参考视频里的人物身份。"
             )
 
-    chosen = (model or settings.video_model).strip()
-    params: dict = {"mode": mode_val, "duration": dur}
+    params: dict = {"duration": dur}
+    if _model_has_mode(chosen):
+        params["mode"] = mode_val
     if settings.video_resolution:
         params["resolution"] = settings.video_resolution
     if settings.video_watermark is not None:
