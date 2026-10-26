@@ -3,6 +3,7 @@ import type {
   CanvasFrame,
   CanvasModels,
   CanvasPanel,
+  CharacterSummary,
   FileContent,
   FrameRole,
   MediaConfigState,
@@ -36,6 +37,23 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // ---- 角色资产库 ----
+  characters: () => req<{ characters: CharacterSummary[]; total: number }>('/characters'),
+  character: (id: string) => req<CharacterSummary>(`/characters/${id}`),
+  characterArtUrl: (id: string) => `${BASE}/characters/${id}/art`,
+  scanCharacters: () =>
+    req<{ registered: number; existing: number; runs: number; missing_art: number }>('/characters/scan', {
+      method: 'POST',
+    }),
+  updateCharacter: (id: string, body: Record<string, any>) =>
+    req<CharacterSummary>(`/characters/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteCharacter: (id: string) => req<{ deleted: string }>(`/characters/${id}`, { method: 'DELETE' }),
+  /** 把角色写进某一集（未开跑或已跑完都可以） */
+  applyCharacters: (runId: string, characterIds: string[]) =>
+    req<{ run_id: string; materialized: string[] }>(`/characters/apply/${runId}`, {
+      method: 'POST',
+      body: JSON.stringify({ character_ids: characterIds }),
+    }),
   meta: () => req<{ llm_mode: string; model: string; channels: Record<string, any>; quota: Record<string, number> }>('/meta'),
   skills: () => req<{ skills: SkillSummary[] }>('/skills'),
   skill: (id: string) => req<SkillDetail>(`/skills/${id}`),

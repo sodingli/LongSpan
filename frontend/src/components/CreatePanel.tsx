@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { SkillDetail } from '../lib/types'
+import { api } from '../lib/api'
+import type { CharacterSummary, SkillDetail } from '../lib/types'
 
 interface Props {
   skill: SkillDetail
@@ -10,6 +11,16 @@ interface Props {
 export default function CreatePanel({ skill, busy, onCreate }: Props) {
   const [brief, setBrief] = useState<Record<string, any>>({})
   const [channel, setChannel] = useState<'fast' | 'slow'>('fast')
+  // 复用角色：选中的角色会以「同一张定妆图」写进本集，而不是重新生成一张尽量像的
+  const [cast, setCast] = useState<CharacterSummary[]>([])
+  const [picked, setPicked] = useState<string[]>([])
+
+  useEffect(() => {
+    api
+      .characters()
+      .then((d) => setCast(d.characters.filter((c) => c.has_art)))
+      .catch(() => setCast([]))
+  }, [])
 
   // 表单全部预填默认值 —— 用户不填任何东西也能直接开始
   useEffect(() => {
@@ -20,6 +31,8 @@ export default function CreatePanel({ skill, busy, onCreate }: Props) {
 
   const fastStages = skill.stages.filter((s) => s.fast_channel)
   const gates = (channel === 'fast' ? fastStages : skill.stages).filter((s) => s.human_approval_default)
+  const withCast = (b: Record<string, any>) =>
+    picked.length ? { ...b, reuse_characters: picked } : b
 
   return (
     <div className="h-full overflow-y-auto">
@@ -49,7 +62,7 @@ export default function CreatePanel({ skill, busy, onCreate }: Props) {
               <button
                 key={p.id}
                 disabled={busy}
-                onClick={() => onCreate({ ...brief, ...p.brief }, p.id, channel)}
+                onClick={() => onCreate(withCast({ ...brief, ...p.brief }), p.id, channel)}
                 className="group text-left rounded-xl border border-[#1e2839] bg-[#0f1420] p-3.5 hover:border-[#4f6bff]/50 hover:bg-[#121826] transition-all disabled:opacity-40"
               >
                 <div className="text-[12.5px] font-medium text-[#c9d5ea] group-hover:text-white transition-colors">
@@ -65,6 +78,51 @@ export default function CreatePanel({ skill, busy, onCreate }: Props) {
             ))}
           </div>
         </section>
+
+        {/* 复用角色（系列化的入口） */}
+        {cast.length > 0 && (
+          <section className="mt-8">
+            <div className="flex items-baseline gap-2 mb-3">
+              <h2 className="text-[13.5px] font-medium">沿用已有角色</h2>
+              <span className="text-[11px] text-[#5f6d87]">
+                选中的人会用库里那张定妆图，不重新生成 —— 跨集不会换脸
+              </span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {cast.slice(0, 12).map((c) => {
+                const on = picked.includes(c.id)
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() =>
+                      setPicked((prev) => (on ? prev.filter((i) => i !== c.id) : [...prev, c.id]))
+                    }
+                    className={`flex items-center gap-2 rounded-lg border pl-1 pr-2.5 py-1 transition-all ${
+                      on
+                        ? 'border-[#4f6bff]/70 bg-[#4f6bff]/10'
+                        : 'border-[#1e2839] bg-[#0f1420] hover:border-[#2a3750]'
+                    }`}
+                  >
+                    <img
+                      src={api.characterArtUrl(c.id)}
+                      alt={c.name}
+                      className="w-7 h-9 rounded object-cover shrink-0"
+                    />
+                    <span className="text-[11.5px] text-[#c9d5ea]">{c.name}</span>
+                    <span className={`text-[10px] ${on ? 'text-[#8ba3ff]' : 'text-[#4a566e]'}`}>
+                      {on ? '已选' : '出场 ' + c.appearances.length}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+            {picked.length > 0 && (
+              <div className="text-[10.5px] text-[#6f7d99] mt-2">
+                已锁定 {picked.length} 个角色：交卷后系统会把角色卡回填为库版，模型改写不生效。
+              </div>
+            )}
+          </section>
+        )}
 
         {/* 通道 */}
         <section className="mt-8">
@@ -137,7 +195,7 @@ export default function CreatePanel({ skill, busy, onCreate }: Props) {
 
           <button
             disabled={busy}
-            onClick={() => onCreate({ ...brief }, null, channel)}
+            onClick={() => onCreate(withCast({ ...brief }), null, channel)}
             className="mt-5 w-full rounded-xl bg-[#4f6bff] hover:bg-[#5f79ff] disabled:opacity-50 text-white text-[13px] font-medium py-3 transition-colors"
           >
             {busy ? '正在创建…' : `开始生成${channel === 'fast' ? ' · 3 分钟草稿' : ' · 精修'}`}

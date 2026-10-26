@@ -395,3 +395,34 @@ P2 自动后检（观察期，只告警不阻断）
 **附带发现（进 P1）**：该网关还有 vidu/kling 的 reference2image 与 start-end2video、
 wan3.0-video-prime 等视频模型 —— W3 评估视频通道升级时优先实测 vidu start-end2video
 （原生首尾帧协议，可能比现在的"图生视频+首尾帧"更贴合链式方案）。
+
+### W3 实测结论：ViduQ2-Turbo 原生首尾帧可用（2026-10-23）
+
+一次真实付费实测（`task-pifj2d6pc535ijc`），参数全部按京东云官方文档填：
+`POST /v1/task/submit`，`model=ViduQ2-Turbo`，content 数组 `text` + 两个
+`image_url`（`role` 分别 `first_frame` / `last_frame`），`parameters={duration:5,
+resolution:"720p", watermark:false}`。素材用 2942b7ea 的 panel-01 → panel-02（相邻两格，
+A-B 链式方案的真实用法）。
+
+| 观测项 | 结果 |
+| --- | --- |
+| 提交 → 出片 | 30 秒（远快于 Seedance 的分钟级排队） |
+| 输出规格 | h264 / 720×1280（9:16，与首帧同比例，无需二次裁切）/ 5.1s / 4.98MB / 无音轨 |
+| 首帧贴合 | 与 panel-01 一致（含原图里烧死的字幕与 EP.01 角标——见下方注意事项） |
+| 尾帧贴合 | 与 panel-02 几乎像素级一致，没有"漂到尾帧附近"的糊化 |
+| 中间帧一致性 | 人物（白发、蓝布褂）跨帧连续，手部动作自然，无变形/换脸 |
+| 运镜 | 按提示词做了从全景到近景的推近，景别跳变没有爆形 |
+
+**账号可用性**：`ViduQ2-Turbo` / `ViduQ2-Pro` 可用；基础版 `ViduQ2` 返回
+`400 model is not supported`（提交即拒、未建任务、不计费）。该网关 `/v1/models`
+只返 404，无法拉列表 —— 模型名只能按官方文档逐个验，且 400 拒稿是免费的、受理才是计费的。
+
+**接入改动**（`app/media/video.py`）：Vidu 族没有 `mode`(std/pro) 参数，硬塞是拿
+Seedance 的请求体去套另一族。新增 `_model_has_mode()` 能力位：Vidu 模型不发 `mode`，
+resolution 用文档写法小写 `720p`，由 `LONGSPAN_VIDEO_MODELS_JSON` 的 `params` 覆盖。
+画布下拉已可选 ViduQ2-Turbo / ViduQ2-Pro。
+
+**注意事项（下次别踩）**：实测用的 panel-01 里带着渲染期烧进画面的字幕与「EP.01」角标，
+首帧原样带进了视频 —— 说明**送进视频模型的分镜图必须是"干净图"，不能是成片抽帧**。
+链式生成要接这一步，得在取帧时选 `panels/` 原始图而不是渲染后帧。
+

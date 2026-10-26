@@ -12,7 +12,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .db import SessionLocal, init_db
-from .api import canvas, edit, events, runs, settings as settings_api, skills, suggest
+from .api import (
+    canvas,
+    characters as characters_api,
+    edit,
+    events,
+    runs,
+    settings as settings_api,
+    skills,
+    suggest,
+)
 from .harness.runner import recover_orphaned_runs
 from .harness.skill import registry
 from .llm import llm_status
@@ -62,6 +71,7 @@ app.include_router(settings_api.router)
 app.include_router(canvas.router)
 app.include_router(edit.router)
 app.include_router(suggest.router)
+app.include_router(characters_api.router)
 
 
 @app.get("/api/health")

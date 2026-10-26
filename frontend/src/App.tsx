@@ -12,6 +12,7 @@ import DirectoryTable from './components/DirectoryTable'
 import DecisionPanel from './components/DecisionPanel'
 import EventStream from './components/EventStream'
 import FileViewer from './components/FileViewer'
+import CharacterLibrary from './components/CharacterLibrary'
 import ModelConfig from './components/ModelConfig'
 import { STATUS_TEXT, fmtAgo, statusTone } from './lib/format'
 
@@ -35,6 +36,8 @@ export default function App() {
   const [viewerPath, setViewerPath] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [modelOpen, setModelOpen] = useState(false)
+  // 工作台级视图：角色库不属于任何一次任务，所以单独一个视角，不塞进任务详情
+  const [castView, setCastView] = useState(false)
 
   const refreshTimer = useRef<number | null>(null)
 
@@ -202,14 +205,25 @@ export default function App() {
         meta={meta}
         onSelectRun={(id) => {
           setActiveSkill(null)
+          setCastView(false)
           setCurrentRunId(id)
         }}
-        onPickSkill={pickSkill}
+        onPickSkill={(id) => {
+          setCastView(false)
+          void pickSkill(id)
+        }}
         onNewTask={() => {
+          setCastView(false)
           setCurrentRunId(null)
           if (skills.length) void pickSkill(activeSkill?.id ?? skills[0].id)
         }}
         onOpenModelConfig={() => setModelOpen(true)}
+        onOpenCast={() => {
+          setCurrentRunId(null)
+          setActiveSkill(null)
+          setCastView(true)
+        }}
+        castActive={castView}
       />
 
       {/* 中栏 */}
@@ -221,11 +235,13 @@ export default function App() {
           </div>
         )}
 
-        {!currentRunId && activeSkill && (
+        {castView && <CharacterLibrary />}
+
+        {!castView && !currentRunId && activeSkill && (
           <CreatePanel skill={activeSkill} busy={busy} onCreate={createRun} />
         )}
 
-        {!currentRunId && !activeSkill && (
+        {!castView && !currentRunId && !activeSkill && (
           <div className="h-full flex items-center justify-center text-[13px] text-[#5f6d87]">
             选一个技能开始
           </div>

@@ -459,3 +459,24 @@ export interface RunTree {
   groups_by_dir: TreeGroup[]
   files: TreeFile[]
 }
+
+/**
+ * 角色资产：属于工作台，不属于某一集。
+ * 复用 = 同一张定妆图（确定性一致），不是「重新生成一张尽量像的」。
+ */
+export interface CharacterSummary {
+  id: string
+  name: string
+  slug: string
+  anchor: string
+  style: string
+  skill_id: string
+  art_rel: string
+  source_run_id: string
+  usage_count: number
+  appearances: string[]
+  has_art: boolean
+  meta: Record<string, any>
+  created_at: string | null
+  updated_at: string | null
+}

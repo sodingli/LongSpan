@@ -11,10 +11,13 @@ interface Props {
   onPickSkill: (id: string) => void
   onNewTask: () => void
   onOpenModelConfig: () => void
+  onOpenCast: () => void
+  castActive: boolean
 }
 
 export default function Sidebar({
   skills, runs, currentRunId, activeSkillId, meta, onSelectRun, onPickSkill, onNewTask, onOpenModelConfig,
+  onOpenCast, castActive,
 }: Props) {
   return (
     <aside className="w-[276px] shrink-0 h-full flex flex-col border-r border-[#1e2839] bg-[#0b0f17]">
@@ -32,6 +35,22 @@ export default function Sidebar({
       </div>
 
       <div className="flex-1 overflow-y-auto">
+        {/* 资产（工作台级，不属于任何一次任务） */}
+        <div className="px-3 pt-3">
+          <button
+            onClick={onOpenCast}
+            className={`w-full flex items-center gap-2 rounded-lg px-2.5 py-2 border transition-all ${
+              castActive
+                ? 'border-[#4f6bff]/50 bg-[#4f6bff]/10'
+                : 'border-[#1e2839] bg-[#0f1420] hover:border-[#2a3750] hover:bg-[#121826]'
+            }`}
+          >
+            <span className="w-4 h-4 rounded shrink-0 bg-gradient-to-br from-[#4f6bff] to-[#8b5cf6] opacity-80" />
+            <span className="text-[12.5px] font-medium">角色库</span>
+            <span className="ml-auto text-[10px] text-[#5f6d87]">跨集复用</span>
+          </button>
+        </div>
+
         {/* 技能 */}
         <div className="px-3 pt-4">
           <div className="flex items-center justify-between px-1 mb-2">
