@@ -234,6 +234,14 @@ stages:
         forbid_adjacent_same_shot: true   # 相邻格不得同景别
         one_action_per_panel: true    # 一格只演一个动作
         require_motion: true          # 每格必须声明镜头运动（静止也要写 static）
+    # 结构骨架（2026-10-23）：格数 / scene_id / shot_size 由系统按 spec 生成并回填。
+    # 为什么不再靠 prompt：实测四集连测，分镜一次通过率 0/4，违约在「换场 ABA /
+    # 景别节奏 / 清单缺 action·scene_id」之间轮换 —— 这些是结构，不该由模型决定。
+    # 回填只动这三列；action / prompt / 字幕 / motion 仍是创作内容。
+    skeleton:
+      kind: panel_grid
+      spec: spec.json        # 格数来源（grid_count）
+      target: panels.json    # 回填目标
     demo_file: fixtures/05_storyboard.md
     # 阶段动作：模型交出 panels.json 后，由 Harness 确定性执行。
     # 快通道只出前 3 格样片（草稿诚实性：草稿只给样片，精修通道才铺满）。
@@ -273,7 +281,7 @@ stages:
     description: 台词分配音色、标注停顿与重音；BGM 与音效点位；精修通道合成配音音频
     prompt: prompts/06_voice.md
     tools_available: [write_artifact, record_decision]
-    produces: [voice.md, lines.json]
+    produces: [voice.md, lines.json, bgm.json]
     fast_channel: true
     checkpoint_required: true
     human_approval_default: false

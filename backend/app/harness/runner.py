@@ -38,6 +38,7 @@ from ..models import (
 )
 from ..store import storage
 from ..canvas_store import effective_image_config, effective_llm_model
+from . import skeleton as panel_skeleton
 from .agent import AgentRunner, build_system_prompt
 from .consistency import (
     extract_anchors,
@@ -246,6 +247,10 @@ class RunManager:
             # 预先建 Step 记录，前端一开始就能看到完整进度树
             self._prepare_steps(db, run, target)
 
+            # 角色资产库：把本集选定的既有角色先物化进工作区（定妆图 + 角色卡）。
+            # 必须在第一阶段之前 —— 后续阶段读的是工作区里的文件，晚一步就要重跑。
+            self._materialize_cast(db, run)
+
             # 续跑语义：已完成的阶段不重跑，其产物直接作为下游上下文。
             # 「草稿 → 继续优化」与断点续跑共用这一条路径（不另写一套逻辑）。
             done_ids = {
@@ -431,6 +436,25 @@ class RunManager:
                 + json.dumps(stage.directing, ensure_ascii=False, indent=2)
                 + "\n```"
             )
+        # 结构骨架（skeleton）：格数/景别由系统按 spec 生成并**交卷后回填**；
+        # 场景 scene_id 只作建议（渲染进表），交还模型决定，由 scene_reference/aba_rule 校验。
+        # 提示词里给一份按真实格数生成的表，是为了让模型在正确的结构上填内容；
+        # 但即使它无视这张表，景别也不会错 —— 回填在模型交卷后执行（见 _apply_skeleton）。
+        skel = self._build_skeleton(run, stage)
+        if skel:
+            stage_desc = (
+                f"{stage_desc}\n\n## 本阶段结构骨架（系统生成，与 spec 的实际格数一致）\n"
+                + panel_skeleton.render_table(skel)
+                + "\n\n这张表里的格号 / shot_size 会在你交卷后由系统统一回填；"
+                "偏离写法的会被改回来并记录。scene_id 是你决定的内容，不强制回填，"
+                "但要写进 scenes.json 并遵守换场 A-B-A。"
+            )
+        # 锁定角色（角色库存量复用）：先告诉模型"这些人已经定了"，再在交卷后回填。
+        # 只回填不告知，模型会写一套新人设，被替换后剧情与角色对不上；
+        # 只告知不回填，等于把契约降级成建议（实测模型会整份重写 characters.md）。
+        cast_desc = self._cast_prompt(run, stage)
+        if cast_desc:
+            stage_desc = f"{stage_desc}\n\n{cast_desc}"
         system = build_system_prompt(
             skill_md=skill.skill_md,
             stage_name=stage.name,
@@ -453,6 +477,10 @@ class RunManager:
         run.tokens_used += result.tokens
         run.cost_usd += result.cost_usd
         db.commit()
+
+        # ③' 结构回填：模型交卷后、动作执行前，把能机器保证的结构字段改回骨架。
+        #     顺序很关键 —— 生图/视频读的就是 panels.json，回填必须发生在动作之前。
+        self._apply_skeleton(db, run, stage, skel)
 
         # ③ 阶段动作：模型交完结构化清单后，由工具做确定性执行（生图 / 配音 / 渲染）。
         #    这是「数据驱动执行」的落点 —— runner 只知道「读哪份清单、调哪个工具」，
@@ -488,8 +516,18 @@ class RunManager:
                      stage_id=stage.id, payload={"failures": failures, "attempt": step.attempt})
             step.status = StepStatus.PENDING
             db.commit()
-            return await self._run_stage(db, run, skill, stage, quota,
-                                         feedback="上一轮未通过验收：" + "；".join(failures))
+            feedback = "上一轮未通过验收：" + "；".join(failures)
+            if consistency_failures:
+                # 定点修补：整份重写会打地鼠 —— 修好被点名的格，又在没被点名的格上
+                # 引入同类违约（实测：第 2 轮修好格 5/11，格 8/10/12 又出现"然后"）。
+                # 所以重做时把修补范围锁在被判违规的对象上，其余内容逐字保留。
+                feedback += (
+                    "\n\n本轮是【定点修补】，不是重写：只允许修改上述被点名的那几处"
+                    "（对应的格 / 字段），其余内容必须逐字保留上一轮的写法 ——"
+                    "不要重排格序、不要顺手改写没被点名的格。"
+                    "新引入的违约同样会判失败，且剩余重做次数有限。"
+                )
+            return await self._run_stage(db, run, skill, stage, quota, feedback=feedback)
 
         # ④.2 硬约束（consistency_checks）违约 + 重做次数用尽 → 硬失败。
         #      为什么不能"带病标完成"：结构违约会污染下游整条链（分镜结构错 →
@@ -512,6 +550,11 @@ class RunManager:
         new_files = sorted(set(storage.list_files(run.id)) - before_files)
         for rel in new_files:
             self._register_artifact(db, run, stage, rel)
+
+        # 角色锁定回填：本阶段产出了 characters.md，且本集锁定了角色库里的角色 →
+        # 把角色卡改回库版（模型倾向整份重写，光靠提示词约束是建议不是契约）。
+        if "characters.md" in file_map:
+            self._merge_locked_cast(db, run)
 
         # ⑥ 需要人工确认 → 开门禁并挂起
         decision: dict = {}
@@ -600,8 +643,51 @@ class RunManager:
                 failures.append(f"一致性校验类型未识别：{kind}（manifest 声明了 runner 不支持的类型）")
         return failures
 
+    def _build_skeleton(self, run: Run, stage: StageDef) -> dict:
+        """按 manifest 的 skeleton 声明生成骨架（数据驱动：runner 不知道"漫剧"）。"""
+        cfg = dict(stage.skeleton or {})
+        if not cfg:
+            return {}
+        kind = str(cfg.get("kind") or "panel_grid").strip()
+        if kind != "panel_grid":
+            logger.warning("骨架类型未识别：%s（阶段 %s），按未声明处理", kind, stage.id)
+            return {}
+        spec_rel = str(cfg.get("spec") or "spec.json").strip()
+        try:
+            spec = json.loads(storage.read_text(run.id, spec_rel))
+        except Exception:  # noqa: BLE001
+            # 读不到 spec 就退到默认 12 格：骨架宁可粗一点，也不能让阶段起不来
+            logger.info("阶段 %s 未读到 %s，骨架按默认 12 格生成", stage.id, spec_rel)
+            spec = {}
+        return panel_skeleton.build(spec)
+
+    def _apply_skeleton(self, db: Session, run: Run, stage: StageDef, skel: dict) -> None:
+        """模型交卷后回填结构字段。偏离不静默：写成 decision 事件，保留模型原值。"""
+        cfg = dict(stage.skeleton or {})
+        if not skel or not cfg:
+            return
+        target = str(cfg.get("target") or "panels.json").strip()
+        try:
+            payload = json.loads(storage.read_text(run.id, target))
+        except Exception:  # noqa: BLE001
+            return  # 清单没交或解析不了 —— 交给验收/校验器如实报，别在这里假装成功
+        patched, deviations, unfixable = panel_skeleton.apply(payload, skel)
+        if not deviations and not unfixable:
+            return
+        storage.write_json(run.id, target, patched)
+        head = f"结构骨架回填 {len(deviations)} 处"
+        if unfixable:
+            head += f"（{len(unfixable)} 处无法回填）"
+        bus.emit(db, run.id, EventType.DECISION_RECORDED,
+                 head + "：" + "；".join((deviations + unfixable)[:6])[:400],
+                 stage_id=stage.id,
+                 payload={"deviations": deviations, "unfixable": unfixable,
+                          "skeleton_panels": skel.get("panel_count")})
+        db.commit()
+
     def _check_shot_budget(self, run_id: str, check: dict, budget: dict) -> list[str]:
         """演出约束（PRD FR-01）：镜头预算的硬闸。
+
 
         读 panels.json，按 manifest 里的 directing.shot_budget 判定场景数/换场次数/
         景别节奏/单格单动作/运动白名单。判据全部来自数据，runner 不知道"漫剧"。
@@ -1009,10 +1095,147 @@ class RunManager:
         except Exception as exc:  # noqa: BLE001 —— 指标是留痕增强，绝不影响任务收尾
             bus.emit(db, run.id, EventType.AGENT_THOUGHT,
                      f"指标统计失败（不影响任务）：{exc}")
+
+        # 角色入库：本集铸造的角色进入资产库，下一集可直接复用（系列化的前提）。
+        # 失败/取消也登记 —— 已经画出来的定妆图是真金白银生成的，不该随任务失败一起丢。
+        self._register_cast(db, run)
         bus.emit(db, run.id, EventType.RUN_FINISHED,
                  note or ("任务完成" if status == RunStatus.SUCCEEDED else "任务结束"),
                  payload={"status": status})
         self._emit_status(db, run)
+
+    # ---------------- 角色资产库（跨集复用） ----------------
+    def _cast_prompt(self, run: Run, stage: StageDef) -> str:
+        """把「已锁定角色」渲染进相关阶段的提示词。
+
+        两个阶段需要它，目的不同：
+          - 产出 characters.md 的阶段：别重写人设（写了也会被回填）；
+          - 产出 panels.json 的阶段：**必须逐字复用锚点原文** —— 这是参考图定位的
+            唯一确定性依据（指纹匹配）。fast 通道没有角色阶段，靠这一段才能用上
+            角色库：否则模型在分镜里自创一套锚点，库里的定妆图永远匹配不上。
+        """
+        if not self._cast_ids(run):
+            return ""
+        produces = set(stage.produces or [])
+        wants_char = "characters.md" in produces
+        wants_panels = "panels.json" in produces
+        if not (wants_char or wants_panels):
+            return ""
+        try:
+            md = storage.read_text(run.id, "characters.md") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+        from ..characters import split_cards
+
+        cards = split_cards(md)
+        if not cards:
+            return ""
+        names = "、".join(c["name"] for c in cards)
+
+        if wants_char:
+            return (
+                "## 已锁定角色（来自角色库，禁止改写）\n"
+                f"本集以下角色已经定稿：{names}。其角色卡与定妆图已在 `characters.md` 与 "
+                "`characters/` 目录下。\n"
+                "- 每个锁定角色的「一致性锚点」必须**逐字保留**，不得改写、缩写或换同义词；\n"
+                "- 可以补充本集新增的配角，但不得给已锁定角色换人设、换发型、换服装；\n"
+                "- 某角色本集不出现就不写他的戏，但**不要删掉他的角色卡**。\n"
+                "（系统会在你交卷后把锁定角色卡回填为库版：改写不会生效，只会被记录。）"
+            )
+
+        # 分镜阶段：给出锚点原文，要求每格逐字复用（否则参考图定位失效）
+        lines = [
+            "## 已锁定角色（来自角色库）",
+            f"本集使用以下既定角色：{names}。每一格的 `prompt` **必须以对应角色的锚点原文开头**"
+            "（逐字复制，不要改写、不要翻译、不要缩写），否则该格拿不到定妆图做参考，"
+            "人物会长成另一个人。",
+            "",
+        ]
+        for c in cards[:4]:
+            # 不截断：锚点尾巴上的 `NOT a photograph, NOT photorealistic` 是唯一的
+            # 反写实条款。曾按 320 字符截断，正好把它切掉 —— 模型于是把"深皱纹、
+            # 深肤色"渲染成半写实（实测第二集画风比第一集写实一个档）。
+            lines.append(f"- {c['name']}：`{c['anchor']}`")
+        return "\n".join(lines)
+
+    def _cast_ids(self, run: Run) -> list[str]:
+        """本集选定的既有角色 id（brief.reuse_characters）。"""
+        raw = (run.brief or {}).get("reuse_characters") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return [str(x) for x in raw if x]
+
+    def _materialize_cast(self, db: Session, run: Run) -> None:
+        """把角色库里的角色写进本集工作区：定妆图 + 角色卡 + key 索引。
+
+        关键取舍：复用是**同一张定妆图**，不是「重新生成一张尽量像的」。所以这里
+        直接复制资产文件，下游四级查找链路一行不改就能吃到，一致性是确定的。
+        """
+        ids = self._cast_ids(run)
+        if not ids:
+            return
+        from ..characters import materialize
+
+        try:
+            out = materialize(db, storage, run.id, ids)
+        except Exception as exc:  # noqa: BLE001 —— 角色复用失败不该让整集跑不了
+            bus.emit(db, run.id, EventType.AGENT_THOUGHT,
+                     f"角色库复用失败（本集继续，角色将重新生成）：{exc}")
+            return
+        names = out.get("materialized") or []
+        if names:
+            bus.emit(
+                db, run.id, EventType.DECISION_RECORDED,
+                f"角色已锁定：{'、'.join(names)}（定妆图复用角色库，不重新铸造）",
+                payload={"actor": "system", "what": "复用角色库角色",
+                         "why": "跨集一致性：同一张定妆图 > 重新生成再赌一次",
+                         "characters": names, "keys": out.get("keys")},
+            )
+
+    def _merge_locked_cast(self, db: Session, run: Run) -> None:
+        """characters.md 产出后，把锁定角色回填成库版（模型整份重写时尤其必要）。"""
+        ids = self._cast_ids(run)
+        if not ids:
+            return
+        from ..characters import merge_locked
+
+        try:
+            out = merge_locked(db, storage, run.id, ids)
+        except Exception as exc:  # noqa: BLE001
+            bus.emit(db, run.id, EventType.AGENT_THOUGHT,
+                     f"角色卡回填失败（继续执行）：{exc}")
+            return
+        drift = out.get("drift") or []
+        if drift:
+            bus.emit(
+                db, run.id, EventType.DECISION_RECORDED,
+                "角色卡已按库版回填：" + "；".join(drift)[:240],
+                payload={"actor": "system", "what": "锁定角色卡回填", "why": "禁止跨集改人设",
+                         "drift": drift},
+            )
+
+    def _register_cast(self, db: Session, run: Run) -> None:
+        """本集结束把角色登记进库（幂等）。已有的不覆盖锚点与图，只记出场。"""
+        from ..characters import scan_run
+
+        try:
+            out = scan_run(
+                db, storage, run.id,
+                skill_id=run.skill_id,
+                style=str((run.brief or {}).get("style") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            bus.emit(db, run.id, EventType.AGENT_THOUGHT,
+                     f"角色入库失败（不影响本集产物）：{exc}")
+            return
+        new = out.get("registered") or []
+        if new:
+            bus.emit(
+                db, run.id, EventType.DECISION_RECORDED,
+                f"角色已入库：{'、'.join(new)}（下一集可直接复用）",
+                payload={"actor": "system", "what": "角色资产入库", "why": "系列复用",
+                         "characters": new},
+            )
 
     def _mark_stage_failed(
         self,
