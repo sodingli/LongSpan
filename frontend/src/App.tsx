@@ -227,9 +227,9 @@ export default function App() {
       />
 
       {/* 中栏 */}
-      <main className="flex-1 min-w-0 h-full overflow-y-auto bg-[#070a11]">
+      <main className="flex-1 min-w-0 h-full overflow-y-auto bg-page">
         {error && (
-          <div className="mx-8 mt-6 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-[12px] text-rose-200">
+          <div className="mx-8 mt-6 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-[12px] text-err">
             {error}
             <button onClick={() => setError(null)} className="ml-3 underline opacity-70">关闭</button>
           </div>
@@ -242,7 +242,7 @@ export default function App() {
         )}
 
         {!castView && !currentRunId && !activeSkill && (
-          <div className="h-full flex items-center justify-center text-[13px] text-[#5f6d87]">
+          <div className="h-full flex items-center justify-center text-[13px] text-ink-6">
             选一个技能开始
           </div>
         )}
@@ -257,7 +257,7 @@ export default function App() {
                   <span className={`text-[10.5px] px-2 py-[3px] rounded-full border ${tone?.bg} ${tone?.text} shrink-0`}>
                     {STATUS_TEXT[run.status]}
                   </span>
-                  <span className="text-[10.5px] px-2 py-[3px] rounded-full bg-[#1a2233] text-[#7c8aa5] shrink-0">
+                  <span className="text-[10.5px] px-2 py-[3px] rounded-full bg-raised text-ink-5 shrink-0">
                     {run.channel === 'fast'
                       ? '3 分钟草稿'
                       : run.origin_channel === 'fast'
@@ -265,7 +265,7 @@ export default function App() {
                         : '精修通道'}
                   </span>
                 </div>
-                <div className="text-[11.5px] text-[#5f6d87] mt-1.5">
+                <div className="text-[11.5px] text-ink-6 mt-1.5">
                   {run.skill_name} · {fmtAgo(run.created_at)} · {run.tokens_used} tokens · ${run.cost_usd.toFixed(4)}
                 </div>
               </div>
@@ -273,7 +273,7 @@ export default function App() {
               <div className="flex gap-2 shrink-0">
                 <a
                   href={api.downloadUrl(run.id)}
-                  className="text-[11.5px] px-3 py-2 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] transition-colors"
+                  className="text-[11.5px] px-3 py-2 rounded-lg bg-raised hover:bg-hover text-ink-2 transition-colors"
                 >
                   下载全部
                 </a>
@@ -281,7 +281,7 @@ export default function App() {
                   <button
                     disabled={busy}
                     onClick={resumeRun}
-                    className="text-[11.5px] px-3 py-2 rounded-lg bg-orange-500/15 hover:bg-orange-500/25 text-orange-200 transition-colors disabled:opacity-40"
+                    className="text-[11.5px] px-3 py-2 rounded-lg bg-orange-500/15 hover:bg-orange-500/25 text-orange transition-colors disabled:opacity-40"
                   >
                     续跑
                   </button>
@@ -289,7 +289,7 @@ export default function App() {
                 {['running', 'awaiting_gate', 'pending'].includes(run.status) && (
                   <button
                     onClick={cancelRun}
-                    className="text-[11.5px] px-3 py-2 rounded-lg bg-[#1a2233] hover:bg-[#3a1f28] text-[#c9d5ea] hover:text-rose-300 transition-colors"
+                    className="text-[11.5px] px-3 py-2 rounded-lg bg-raised hover:bg-err/20 text-ink-2 hover:text-err transition-colors"
                   >
                     停止
                   </button>
@@ -299,7 +299,7 @@ export default function App() {
 
             {/* 进度条 */}
             <div className="mt-5">
-              <div className="flex items-center justify-between text-[11px] text-[#7c8aa5] mb-1.5">
+              <div className="flex items-center justify-between text-[11px] text-ink-5 mb-1.5">
                 <span>
                   {run.steps.find((s) => s.status === 'in_progress')?.stage_name ??
                     (() => {
@@ -310,7 +310,7 @@ export default function App() {
                 </span>
                 <span>{Math.round(run.progress * 100)}%</span>
               </div>
-              <div className="h-1.5 rounded-full bg-[#151d2b] overflow-hidden">
+              <div className="h-1.5 rounded-full bg-raised overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-500 ${
                     run.status === 'failed'
@@ -319,7 +319,7 @@ export default function App() {
                         ? 'bg-orange-500'
                         : run.status === 'succeeded'
                           ? 'bg-emerald-500'
-                          : 'bg-[#4f6bff]'
+                          : 'bg-accent'
                   }`}
                   style={{ width: `${Math.max(run.progress * 100, run.status === 'running' ? 3 : 0)}%` }}
                 />
@@ -330,7 +330,7 @@ export default function App() {
             <div className="mt-7">
               <div className="flex items-baseline gap-2.5 mb-3.5">
                 <h2 className="text-[13.5px] font-medium">编排画布</h2>
-                <span className="text-[10.5px] text-[#5f6d87]">点节点看该阶段的产出、验收与动作</span>
+                <span className="text-[10.5px] text-ink-6">点节点看该阶段的产出、验收与动作</span>
               </div>
               <RunCanvas
                 runId={run.id}
@@ -361,7 +361,7 @@ export default function App() {
             )}
 
             {run.error && run.status !== 'interrupted' && (
-              <div className="mt-6 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-[12px] text-rose-200">
+              <div className="mt-6 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-[12px] text-err">
                 {run.error}
               </div>
             )}
@@ -373,7 +373,7 @@ export default function App() {
                   <span className="text-[13px] leading-5">⏸</span>
                   <div className="flex-1 min-w-0">
                     <div className="text-[12.5px] text-orange-100 font-medium">任务执行中被中断</div>
-                    <div className="text-[11.5px] text-orange-200/85 mt-1 leading-5">
+                    <div className="text-[11.5px] text-orange/85 mt-1 leading-5">
                       {run.error || '后端进程重启，正在执行的阶段被打断。'}
                       <br />
                       已完成 {run.steps.filter((s) => s.status === 'completed').length} 个阶段的产物已保留，
@@ -401,7 +401,7 @@ export default function App() {
             <div className="mt-8">
               <div className="flex items-baseline gap-2.5 mb-3.5">
                 <h2 className="text-[13.5px] font-medium">任务目录表</h2>
-                <span className="text-[10.5px] text-[#5f6d87]">
+                <span className="text-[10.5px] text-ink-6">
                   全部产物分层清单，标出阶段与来源，可导出成 INDEX.md
                 </span>
               </div>
@@ -424,7 +424,7 @@ export default function App() {
         )}
 
         {currentRunId && !run && (
-          <div className="h-full flex items-center justify-center text-[13px] text-[#5f6d87]">加载中…</div>
+          <div className="h-full flex items-center justify-center text-[13px] text-ink-6">加载中…</div>
         )}
       </main>
 

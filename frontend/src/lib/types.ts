@@ -161,11 +161,26 @@ export interface CanvasVideo {
   note?: string
 }
 
+export interface CharacterArtState {
+  /** 锚点标签的小写形式（定妆图文件名就是它），如 chenmo */
+  role: string
+  /** 展示名，如「陈默」 */
+  name: string
+  art_path: string
+  has_art: boolean
+  /** 用户改过的定妆图提示词（空 = 用 characters.md 里的锚点原文） */
+  prompt: string
+}
+
 export interface CanvasCharacters {
   text: string
   has_origin: boolean
   origin_text: string
   roles: string[]
+  /** 机器可读的角色标识（锚点标签小写），与 roles 同序 */
+  role_tags?: string[]
+  /** 展示名 -> 定妆图状态（有没有图、路径、改过的提示词） */
+  art?: Record<string, CharacterArtState>
 }
 
 export interface CanvasVideoConfig {

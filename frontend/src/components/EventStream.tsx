@@ -36,16 +36,16 @@ export default function EventStream({ events, streamState }: Props) {
   })
 
   return (
-    <div className="w-[360px] shrink-0 h-full flex flex-col border-l border-[#1e2839] bg-[#0b0f17]">
-      <div className="px-4 py-3 border-b border-[#1e2839] flex items-center gap-2">
+    <div className="w-[360px] shrink-0 h-full flex flex-col border-l border-line bg-deep">
+      <div className="px-4 py-3 border-b border-line flex items-center gap-2">
         <span className="text-[12.5px] font-medium">实时过程</span>
-        <div className="flex items-center gap-0.5 ml-1 rounded-lg bg-[#0f1420] p-0.5">
+        <div className="flex items-center gap-0.5 ml-1 rounded-lg bg-panel p-0.5">
           {([['story', '脉络'], ['all', '全部']] as const).map(([k, label]) => (
             <button
               key={k}
               onClick={() => setFilter(k)}
               className={`text-[10.5px] px-2 py-[3px] rounded-md transition-colors ${
-                filter === k ? 'bg-[#1a2233] text-[#c9d5ea]' : 'text-[#5f6d87] hover:text-[#8b98b4]'
+                filter === k ? 'bg-raised text-ink-2' : 'text-ink-6 hover:text-ink-4'
               }`}
             >
               {label}
@@ -56,7 +56,7 @@ export default function EventStream({ events, streamState }: Props) {
           <span className={`w-1.5 h-1.5 rounded-full ${
             streamState === 'open' ? 'bg-emerald-400' : streamState === 'connecting' ? 'bg-amber-400' : 'bg-slate-600'
           }`} />
-          <span className="text-[10px] text-[#5f6d87]">
+          <span className="text-[10px] text-ink-6">
             {streamState === 'open' ? '已连接' : streamState === 'connecting' ? '重连中' : '未连接'}
           </span>
         </span>
@@ -64,7 +64,7 @@ export default function EventStream({ events, streamState }: Props) {
 
       <div ref={boxRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
         {visible.length === 0 && (
-          <div className="text-[11.5px] text-[#5f6d87] leading-relaxed pt-2">
+          <div className="text-[11.5px] text-ink-6 leading-relaxed pt-2">
             任务开始后，这里会实时显示它在做什么。
           </div>
         )}
@@ -79,13 +79,13 @@ export default function EventStream({ events, streamState }: Props) {
               <span className={`text-[10px] ${st.color} shrink-0 mt-[3px] w-3 text-center`}>{st.icon}</span>
               <div className="flex-1 min-w-0">
                 <div className="flex items-baseline gap-2">
-                  <span className="text-[9.5px] text-[#4a566e] font-mono shrink-0">{fmtTime(e.at)}</span>
+                  <span className="text-[9.5px] text-ink-7 font-mono shrink-0">{fmtTime(e.at)}</span>
                   {!isMessage && (
                     <span className={`text-[11.5px] ${st.color} leading-relaxed break-words`}>{e.message}</span>
                   )}
                 </div>
                 {isMessage && (
-                  <div className="text-[11.5px] text-[#b9c6dc] leading-relaxed whitespace-pre-wrap mt-0.5 break-words">
+                  <div className="text-[11.5px] text-ink-3 leading-relaxed whitespace-pre-wrap mt-0.5 break-words">
                     {text}
                   </div>
                 )}
@@ -97,7 +97,7 @@ export default function EventStream({ events, streamState }: Props) {
         {!pinned && (
           <button
             onClick={() => setPinned(true)}
-            className="sticky bottom-0 w-full text-[11px] py-1.5 rounded-lg bg-[#4f6bff]/20 text-[#8ba3ff] hover:bg-[#4f6bff]/30 transition-colors"
+            className="sticky bottom-0 w-full text-[11px] py-1.5 rounded-lg bg-accent/20 text-accent-2 hover:bg-accent/30 transition-colors"
           >
             回到最新 ↓
           </button>

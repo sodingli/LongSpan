@@ -31,7 +31,7 @@ export default function ArtifactPanel({ runId, artifacts, files, onOpenFile }: P
         {merged.length > 0 && (
           <a
             href={api.downloadUrl(runId)}
-            className="ml-auto text-[11px] px-2.5 py-1 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] transition-colors"
+            className="ml-auto text-[11px] px-2.5 py-1 rounded-lg bg-raised hover:bg-hover text-ink-2 transition-colors"
           >
             打包下载 zip
           </a>
@@ -39,19 +39,19 @@ export default function ArtifactPanel({ runId, artifacts, files, onOpenFile }: P
       </div>
 
       {merged.length === 0 && (
-        <div className="text-[11.5px] text-[#5f6d87] px-1 py-3">还没有产物，跑起来就会出现。</div>
+        <div className="text-[11.5px] text-ink-6 px-1 py-3">还没有产物，跑起来就会出现。</div>
       )}
 
       {/* 成片：竖屏播放器（这是用户真正想要的那个东西，放最上面） */}
       {videos.map((v) => (
-        <div key={v.rel_path} className="mb-3 rounded-xl border border-[#1e2839] bg-[#0d1320] p-3">
+        <div key={v.rel_path} className="mb-3 rounded-xl border border-line bg-deep p-3">
           <div className="flex items-center gap-2 mb-2">
-            <span className="text-[11px] px-1.5 py-[2px] rounded bg-emerald-500/15 text-emerald-300">成片</span>
-            <span className="text-[11px] text-[#c9d5ea] font-mono truncate">{v.rel_path}</span>
+            <span className="text-[11px] px-1.5 py-[2px] rounded bg-emerald-500/15 text-ok">成片</span>
+            <span className="text-[11px] text-ink-2 font-mono truncate">{v.rel_path}</span>
             <a
               href={api.fileUrl(runId, v.rel_path)}
               download
-              className="ml-auto text-[11px] px-2 py-0.5 rounded-md bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] transition-colors shrink-0"
+              className="ml-auto text-[11px] px-2 py-0.5 rounded-md bg-raised hover:bg-hover text-ink-2 transition-colors shrink-0"
             >
               下载
             </a>
@@ -62,7 +62,7 @@ export default function ArtifactPanel({ runId, artifacts, files, onOpenFile }: P
               controls
               playsInline
               preload="metadata"
-              className="max-h-[52vh] rounded-lg border border-[#1e2839] bg-black"
+              className="max-h-[52vh] rounded-lg border border-line bg-black"
             />
           </div>
         </div>
@@ -70,12 +70,12 @@ export default function ArtifactPanel({ runId, artifacts, files, onOpenFile }: P
 
       {/* 配音音轨 */}
       {audios.length > 0 && (
-        <div className="mb-3 rounded-xl border border-[#1e2839] bg-[#0d1320] p-3">
-          <div className="text-[11px] text-[#7c8aa5] mb-2">配音 · {audios.length} 段</div>
+        <div className="mb-3 rounded-xl border border-line bg-deep p-3">
+          <div className="text-[11px] text-ink-5 mb-2">配音 · {audios.length} 段</div>
           <div className="flex flex-col gap-1.5 max-h-[180px] overflow-auto">
             {audios.map((a) => (
               <div key={a.rel_path} className="flex items-center gap-2">
-                <span className="text-[10.5px] font-mono text-[#7c8aa5] w-[104px] shrink-0 truncate">
+                <span className="text-[10.5px] font-mono text-ink-5 w-[104px] shrink-0 truncate">
                   {a.rel_path.split('/').pop()}
                 </span>
                 <audio src={api.fileUrl(runId, a.rel_path)} controls className="h-7 flex-1" />
@@ -92,10 +92,10 @@ export default function ArtifactPanel({ runId, artifacts, files, onOpenFile }: P
             <button
               key={m.rel_path}
               onClick={() => onOpenFile(m.rel_path)}
-              className="group relative rounded-lg overflow-hidden border border-[#1e2839] hover:border-[#4f6bff]/60 bg-[#0d1320] aspect-[9/16] transition-colors"
+              className="group relative rounded-lg overflow-hidden border border-line hover:border-accent/60 bg-deep aspect-[9/16] transition-colors"
             >
               <img src={api.fileUrl(runId, m.rel_path)} alt={m.rel_path} className="w-full h-full object-cover" />
-              <div className="absolute inset-x-0 bottom-0 px-1.5 py-1 bg-black/70 text-[9.5px] text-[#c9d5ea] font-mono truncate opacity-0 group-hover:opacity-100 transition-opacity">
+              <div className="absolute inset-x-0 bottom-0 px-1.5 py-1 bg-black/70 text-[9.5px] text-white/90 font-mono truncate opacity-0 group-hover:opacity-100 transition-opacity">
                 {m.rel_path.split('/').pop()}
               </div>
             </button>

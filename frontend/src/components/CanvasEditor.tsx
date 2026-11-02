@@ -28,9 +28,9 @@ interface Props {
 }
 
 const SOURCE_LABEL: Record<string, { text: string; cls: string }> = {
-  model: { text: '模型生成', cls: 'bg-emerald-500/12 text-emerald-300' },
-  upload: { text: '人工上传', cls: 'bg-violet-500/15 text-violet-300' },
-  placeholder: { text: '占位图', cls: 'bg-amber-500/15 text-amber-300' },
+  model: { text: '模型生成', cls: 'bg-emerald-500/12 text-ok' },
+  upload: { text: '人工上传', cls: 'bg-violet-500/15 text-info' },
+  placeholder: { text: '占位图', cls: 'bg-amber-500/15 text-warn' },
 }
 
 const ROLE_LABEL: Record<FrameRole, string> = { first: '首帧', mid: '中间帧', last: '尾帧' }
@@ -66,6 +66,8 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
   const [busy, setBusy] = useState<string | null>(null)
   const [drafts, setDrafts] = useState<Record<number, Partial<CanvasPanel>>>({})
   const [charsDraft, setCharsDraft] = useState<string | null>(null)
+  /** 单角色定妆图提示词草稿：role -> 提示词（空串 = 用锚点原文） */
+  const [charArtDraft, setCharArtDraft] = useState<Record<string, string>>({})
   const [selected, setSelected] = useState<number | null>(null)
   const [videoDur, setVideoDur] = useState(5)
   const [videoMode, setVideoMode] = useState('std')
@@ -225,6 +227,25 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
     try {
       await api.saveCharacters(runId, charsDraft)
       flash('角色卡与一致性锚点已保存 —— 下一轮生图会用新锚点')
+      await load()
+      onChanged()
+    } catch (e: any) {
+      setErr(e.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const regenCharacterArt = async (role: string, prompt: string) => {
+    setBusy(`art-${role}`)
+    setErr(null)
+    try {
+      const res = await api.regenerateCharacterArt(runId, role, { prompt })
+      flash(
+        res.ok
+          ? `「${role}」定妆图已重生成 —— 之后画的镜头会用这张脸`
+          : `「${role}」定妆图生成降级：${res.degraded?.[0] ?? '未知原因'}`,
+      )
       await load()
       onChanged()
     } catch (e: any) {
@@ -450,7 +471,7 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
   ]
 
   return (
-    <div className="border-t border-[#1e2839] bg-[#080b12]">
+    <div className="border-t border-line bg-deep">
       {/* 工具条 */}
       <div className="flex items-center gap-1.5 px-4 pt-3 flex-wrap">
         {TABS.map((t) => (
@@ -458,13 +479,13 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
             key={t.id}
             onClick={() => setTab(t.id)}
             className={`text-[11.5px] px-2.5 py-1.5 rounded-lg transition-colors ${
-              tab === t.id ? 'bg-[#1a2233] text-[#dbe4f5]' : 'text-[#6f7d99] hover:text-[#a8b6d1]'
+              tab === t.id ? 'bg-raised text-ink-2' : 'text-ink-5 hover:text-ink-3'
             }`}
           >
             {t.label}
           </button>
         ))}
-        <span className="ml-auto text-[10.5px] text-[#4c5975]">
+        <span className="ml-auto text-[10.5px] text-ink-7">
           {loading ? '加载中…' : data ? `已留痕：改词 ${data.edits.panels ?? 0} · 重画 ${data.edits.regenerate ?? 0} · 上传 ${data.edits.upload ?? 0}` : ''}
         </span>
       </div>
@@ -472,12 +493,12 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
       {(err || msg) && (
         <div className="px-4 pt-2.5">
           {err && (
-            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-[11px] text-rose-200">
+            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-[11px] text-err">
               {err}
             </div>
           )}
           {msg && (
-            <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-3 py-1.5 text-[11px] text-emerald-200">
+            <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-3 py-1.5 text-[11px] text-ok">
               {msg}
             </div>
           )}
@@ -488,17 +509,17 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
         {/* ---------------- 分镜提示词 ---------------- */}
         {tab === 'panels' &&
           (panels.length === 0 ? (
-            <div className="text-[11.5px] text-[#5f6d87] py-3">
+            <div className="text-[11.5px] text-ink-6 py-3">
               本任务还没有分镜清单（panels.json）。跑完「分镜绘制」阶段后即可在这里逐格微调。
             </div>
           ) : (
             <>
               <div className="flex items-center gap-2 mb-2.5 flex-wrap">
-                <span className="text-[11px] text-[#6f7d99]">
+                <span className="text-[11px] text-ink-5">
                   点缩略图选中某格 → 改画面描述 → 只重画这一格
                 </span>
                 {dirtyCount > 0 && (
-                  <span className="text-[10.5px] px-1.5 py-[2px] rounded bg-orange-500/15 text-orange-300">
+                  <span className="text-[10.5px] px-1.5 py-[2px] rounded bg-orange-500/15 text-orange">
                     {dirtyCount} 格待保存
                   </span>
                 )}
@@ -507,7 +528,7 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                     disabled={busy != null}
                     onClick={() => void generateAllVideos()}
                     title="为还没有视频片段的镜头批量提交视频生成（按次计费，会先确认）"
-                    className="ml-auto text-[11.5px] px-3 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 border border-emerald-500/30 transition-colors disabled:opacity-40"
+                    className="ml-auto text-[11.5px] px-3 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-ok border border-emerald-500/30 transition-colors disabled:opacity-40"
                   >
                     {busy === 'video-all' ? '提交中…' : '全部镜头生成视频'}
                   </button>
@@ -515,7 +536,7 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                 <button
                   disabled={busy != null || dirtyCount === 0}
                   onClick={() => saveDrafts()}
-                  className={`${data?.video.ready && panels.length > 0 ? '' : 'ml-auto'} text-[11.5px] px-3 py-1.5 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] transition-colors disabled:opacity-40`}
+                  className={`${data?.video.ready && panels.length > 0 ? '' : 'ml-auto'} text-[11.5px] px-3 py-1.5 rounded-lg bg-raised hover:bg-hover text-ink-2 transition-colors disabled:opacity-40`}
                 >
                   保存全部改动
                 </button>
@@ -531,18 +552,18 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                       key={p.index}
                       onClick={() => setSelected(p.index)}
                       className={`text-left rounded-lg overflow-hidden border transition-all ${
-                        selected === p.index ? 'border-[#4f6bff] ring-1 ring-[#4f6bff]/50' : 'border-[#1e2839] hover:border-[#3a4a6b]'
+                        selected === p.index ? 'border-accent ring-1 ring-accent/50' : 'border-line hover:border-line-2'
                       }`}
                     >
-                      <div className="relative bg-[#0f1420] aspect-[9/16] overflow-hidden">
+                      <div className="relative bg-panel aspect-[9/16] overflow-hidden">
                         {p.image ? (
                           <img src={api.fileUrl(runId, p.image)} alt={`第 ${p.index} 格`} className="w-full h-full object-cover" />
                         ) : (
-                          <div className="w-full h-full flex items-center justify-center text-[10.5px] text-[#4c5975]">
+                          <div className="w-full h-full flex items-center justify-center text-[10.5px] text-ink-7">
                             未出图
                           </div>
                         )}
-                        <span className="absolute top-1.5 left-1.5 text-[9.5px] px-1.5 py-[2px] rounded bg-black/65 text-[#dbe4f5]">
+                        <span className="absolute top-1.5 left-1.5 text-[9.5px] px-1.5 py-[2px] rounded bg-black/65 text-white/90">
                           格 {p.index}
                         </span>
                         {isDirty && (
@@ -555,21 +576,21 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                         <div className="flex items-center gap-1 flex-wrap">
                           <span className={`text-[9.5px] px-1.5 py-[1px] rounded ${src.cls}`}>{src.text}</span>
                           {p.frame_count > 1 && (
-                            <span className="text-[9px] px-1 py-[1px] rounded bg-sky-500/15 text-sky-300">
+                            <span className="text-[9px] px-1 py-[1px] rounded bg-sky-500/15 text-sky">
                               {p.frame_count} 帧
                             </span>
                           )}
                           {p.video_status === 'ready' && (
-                            <span className="text-[9px] px-1 py-[1px] rounded bg-emerald-500/20 text-emerald-300">视频</span>
+                            <span className="text-[9px] px-1 py-[1px] rounded bg-emerald-500/20 text-ok">视频</span>
                           )}
                           {p.video_status === 'running' && (
-                            <span className="text-[9px] px-1 py-[1px] rounded bg-[#4f6bff]/25 text-[#a9baff]">生成中</span>
+                            <span className="text-[9px] px-1 py-[1px] rounded bg-accent/25 text-accent-2">生成中</span>
                           )}
                           {p.video_status === 'failed' && (
-                            <span className="text-[9px] px-1 py-[1px] rounded bg-rose-500/20 text-rose-300">视频失败</span>
+                            <span className="text-[9px] px-1 py-[1px] rounded bg-rose-500/20 text-err">视频失败</span>
                           )}
                         </div>
-                        <div className="text-[10px] text-[#6f7d99] mt-1 line-clamp-1">{p.scene || `格 ${p.index}`}</div>
+                        <div className="text-[10px] text-ink-5 mt-1 line-clamp-1">{p.scene || `格 ${p.index}`}</div>
                       </div>
                     </button>
                   )
@@ -578,21 +599,21 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
 
               {/* 单格编辑区 */}
               {merged && (
-                <div className="mt-3 rounded-lg border border-[#1e2839] bg-[#0b0f17] p-3">
+                <div className="mt-3 rounded-lg border border-line bg-deep p-3">
                   <div className="flex items-center gap-2 mb-2 flex-wrap">
-                    <span className="text-[12px] font-medium text-[#dbe4f5]">第 {merged.index} 格</span>
-                    {merged.speaker && <span className="text-[10.5px] text-[#8b98b4]">{merged.speaker}</span>}
-                    <span className="text-[10.5px] text-[#5f6d87]">
+                    <span className="text-[12px] font-medium text-ink-2">第 {merged.index} 格</span>
+                    {merged.speaker && <span className="text-[10.5px] text-ink-4">{merged.speaker}</span>}
+                    <span className="text-[10.5px] text-ink-6">
                       {merged.image_provider} {merged.image_bytes ? `· ${fmtSize(merged.image_bytes)}` : ''}
                     </span>
                   </div>
 
-                  <label className="block text-[10.5px] text-[#5f6d87] mb-1">画面描述（提示词）</label>
+                  <label className="block text-[10.5px] text-ink-6 mb-1">画面描述（提示词）</label>
                   <textarea
                     value={merged.prompt ?? ''}
                     onChange={(e) => patchDraft(merged.index, { prompt: e.target.value })}
                     rows={5}
-                    className="w-full text-[11.5px] leading-relaxed bg-[#0f1420] border border-[#26324a] rounded-lg px-2.5 py-2 text-[#dbe4f5] outline-none focus:border-[#4f6bff]/60 resize-y"
+                    className="w-full text-[11.5px] leading-relaxed bg-panel border border-line-2 rounded-lg px-2.5 py-2 text-ink-2 outline-none focus:border-accent/60 resize-y"
                   />
 
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mt-2">
@@ -627,10 +648,10 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                   </div>
 
                   {/* ---------------- 多帧：首 / 中 / 尾 ---------------- */}
-                  <div className="mt-3 rounded-lg border border-[#1e2839] bg-[#0a0e16] p-2.5">
+                  <div className="mt-3 rounded-lg border border-line bg-deep p-2.5">
                     <div className="flex items-center gap-2 mb-2 flex-wrap">
-                      <span className="text-[11px] text-[#8b98b4]">多帧画面</span>
-                      <span className="text-[10px] text-[#4c5975]">
+                      <span className="text-[11px] text-ink-4">多帧画面</span>
+                      <span className="text-[10px] text-ink-7">
                         挂多张时成片按「首→中→尾」交叉过渡；只挂首帧就是单图 + 运镜
                       </span>
                     </div>
@@ -641,8 +662,8 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                           const f = merged.frames?.[role] ?? null
                           const key = `frame-${merged!.index}-${role}`
                           return (
-                            <div key={role} className="rounded-lg border border-[#1e2839] bg-[#0f1420] overflow-hidden">
-                              <div className="relative aspect-[9/16] bg-[#080b12]">
+                            <div key={role} className="rounded-lg border border-line bg-panel overflow-hidden">
+                              <div className="relative aspect-[9/16] bg-deep">
                                 {f ? (
                                   <img
                                     src={api.fileUrl(runId, f.path)}
@@ -650,11 +671,11 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                                     className="w-full h-full object-cover"
                                   />
                                 ) : (
-                                  <div className="w-full h-full flex items-center justify-center text-[10px] text-[#3f4a60]">
+                                  <div className="w-full h-full flex items-center justify-center text-[10px] text-ink-7">
                                     未设置
                                   </div>
                                 )}
-                                <span className="absolute top-1 left-1 text-[9px] px-1 py-[1px] rounded bg-black/70 text-[#c9d5ea]">
+                                <span className="absolute top-1 left-1 text-[9px] px-1 py-[1px] rounded bg-black/70 text-white/90">
                                   {fr.label}
                                 </span>
                                 {f?.source === 'upload' && (
@@ -668,11 +689,11 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                                   <button
                                     disabled={busy != null}
                                     onClick={() => regenFrame(merged!.index, role)}
-                                    className="text-[9.5px] px-1.5 py-[3px] rounded bg-[#4f6bff]/20 hover:bg-[#4f6bff]/30 text-[#a9baff] disabled:opacity-40"
+                                    className="text-[9.5px] px-1.5 py-[3px] rounded bg-accent/20 hover:bg-accent/30 text-accent-2 disabled:opacity-40"
                                   >
                                     {busy === key ? '…' : '生成'}
                                   </button>
-                                  <label className="text-[9.5px] px-1.5 py-[3px] rounded bg-violet-500/15 hover:bg-violet-500/25 text-violet-300 cursor-pointer">
+                                  <label className="text-[9.5px] px-1.5 py-[3px] rounded bg-violet-500/15 hover:bg-violet-500/25 text-info cursor-pointer">
                                     上传
                                     <input
                                       type="file"
@@ -689,13 +710,13 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                                     <button
                                       disabled={busy != null}
                                       onClick={() => removeFrame(merged!.index, role)}
-                                      className="text-[9.5px] px-1.5 py-[3px] rounded text-[#6f7d99] hover:text-rose-300 disabled:opacity-40"
+                                      className="text-[9.5px] px-1.5 py-[3px] rounded text-ink-5 hover:text-err disabled:opacity-40"
                                     >
                                       清除
                                     </button>
                                   )}
                                 </div>
-                                <div className="text-[8.5px] text-[#3f4a60] mt-1 leading-tight">{ROLE_HINT[role]}</div>
+                                <div className="text-[8.5px] text-ink-7 mt-1 leading-tight">{ROLE_HINT[role]}</div>
                               </div>
                             </div>
                           )
@@ -705,27 +726,27 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                   </div>
 
                   {/* ---------------- 视频片段 ---------------- */}
-                  <div className="mt-2.5 rounded-lg border border-[#1e2839] bg-[#0a0e16] p-2.5">
+                  <div className="mt-2.5 rounded-lg border border-line bg-deep p-2.5">
                     <div className="flex items-center gap-2 mb-2 flex-wrap">
-                      <span className="text-[11px] text-[#8b98b4]">视频片段</span>
-                      <span className="text-[10px] text-[#4c5975]">
+                      <span className="text-[11px] text-ink-4">视频片段</span>
+                      <span className="text-[10px] text-ink-7">
                         用首帧（+尾帧/参考视频）生成一段会动的镜头；生成后成片优先用它
                       </span>
                       {!data?.video.ready && (
-                        <span className="text-[9.5px] px-1.5 py-[1px] rounded bg-amber-500/15 text-amber-300">
+                        <span className="text-[9.5px] px-1.5 py-[1px] rounded bg-amber-500/15 text-warn">
                           未启用
                         </span>
                       )}
                     </div>
 
                     {merged.video?.status === 'running' && (
-                      <div className="rounded-lg border border-[#4f6bff]/40 bg-[#4f6bff]/10 px-2.5 py-1.5 text-[10.5px] text-[#a9baff] mb-2">
+                      <div className="rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1.5 text-[10.5px] text-accent-2 mb-2">
                         生成中…（{merged.video.duration ?? videoDur}s / {merged.video.mode ?? videoMode}）
                         几分钟后自动刷新，关掉页面也不丢
                       </div>
                     )}
                     {merged.video?.status === 'failed' && (
-                      <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5 text-[10.5px] text-rose-200 mb-2 break-words">
+                      <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5 text-[10.5px] text-err mb-2 break-words">
                         生成失败：{merged.video.error?.slice(0, 240)}
                         <button
                           onClick={() => generateVideo(merged!.index)}
@@ -740,14 +761,14 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                         <video
                           src={api.fileUrl(runId, merged.video.path)}
                           controls
-                          className="w-full max-h-[260px] rounded-lg border border-[#1e2839] bg-black"
+                          className="w-full max-h-[260px] rounded-lg border border-line bg-black"
                         />
-                        <div className="text-[9.5px] text-[#4c5975] mt-1 break-all">
+                        <div className="text-[9.5px] text-ink-7 mt-1 break-all">
                           {merged.video.path} · {merged.video.duration}s · {merged.video.mode} ·{' '}
                           {merged.video.reference ? '含参考视频' : merged.video.frames?.length && merged.video.frames.length > 1 ? `多帧 ${merged.video.frames.length}` : '首帧'}
                         </div>
                         {merged.video.note && (
-                          <div className="text-[9.5px] text-amber-300/80 mt-1 break-words">
+                          <div className="text-[9.5px] text-warn/80 mt-1 break-words">
                             {merged.video.note}
                           </div>
                         )}
@@ -755,11 +776,11 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                     )}
 
                     <div className="flex items-center gap-1.5 flex-wrap">
-                      <label className="text-[10px] text-[#5f6d87]">模型</label>
+                      <label className="text-[10px] text-ink-6">模型</label>
                       <select
                         value={videoModel}
                         onChange={(e) => setVideoModel(e.target.value)}
-                        className="text-[10.5px] bg-[#0f1420] border border-[#26324a] rounded px-1.5 py-1 text-[#dbe4f5] outline-none max-w-[170px]"
+                        className="text-[10.5px] bg-panel border border-line-2 rounded px-1.5 py-1 text-ink-2 outline-none max-w-[170px]"
                       >
                         <option value="">默认（{data?.video.model || '未配置'}）</option>
                         {(data?.video.models ?? [])
@@ -770,11 +791,11 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                             </option>
                           ))}
                       </select>
-                      <label className="text-[10px] text-[#5f6d87]">时长</label>
+                      <label className="text-[10px] text-ink-6">时长</label>
                       <select
                         value={videoDur}
                         onChange={(e) => setVideoDur(Number(e.target.value))}
-                        className="text-[10.5px] bg-[#0f1420] border border-[#26324a] rounded px-1.5 py-1 text-[#dbe4f5] outline-none"
+                        className="text-[10.5px] bg-panel border border-line-2 rounded px-1.5 py-1 text-ink-2 outline-none"
                       >
                         {(data?.video.durations ?? [5, 10]).map((d) => (
                           <option key={d} value={d}>
@@ -782,11 +803,11 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                           </option>
                         ))}
                       </select>
-                      <label className="text-[10px] text-[#5f6d87]">模式</label>
+                      <label className="text-[10px] text-ink-6">模式</label>
                       <select
                         value={videoMode}
                         onChange={(e) => setVideoMode(e.target.value)}
-                        className="text-[10.5px] bg-[#0f1420] border border-[#26324a] rounded px-1.5 py-1 text-[#dbe4f5] outline-none"
+                        className="text-[10.5px] bg-panel border border-line-2 rounded px-1.5 py-1 text-ink-2 outline-none"
                       >
                         <option value="std">标准</option>
                         <option value="pro">专家</option>
@@ -801,11 +822,11 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                               ? '先生成或上传首帧'
                               : '按次计费，需要等几分钟'
                         }
-                        className="text-[10.5px] px-2.5 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 disabled:opacity-40"
+                        className="text-[10.5px] px-2.5 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-ok disabled:opacity-40"
                       >
                         {busy === `video-${merged.index}` ? '提交中…' : merged.video?.status === 'ready' ? '重新生成视频' : '生成视频'}
                       </button>
-                      <label className="text-[10.5px] px-2.5 py-1 rounded bg-violet-500/15 hover:bg-violet-500/25 text-violet-300 cursor-pointer">
+                      <label className="text-[10.5px] px-2.5 py-1 rounded bg-violet-500/15 hover:bg-violet-500/25 text-info cursor-pointer">
                         {merged.reference_video ? '换参考视频' : '上传参考视频'}
                         <input
                           type="file"
@@ -826,13 +847,13 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                         }}
                         placeholder="或粘贴公网视频 URL"
                         title="参考视频超过 6MB 时无法内联，请用公网地址"
-                        className="text-[10.5px] w-[150px] bg-[#0f1420] border border-[#26324a] rounded px-1.5 py-1 text-[#dbe4f5] outline-none placeholder:text-[#44506b]"
+                        className="text-[10.5px] w-[150px] bg-panel border border-line-2 rounded px-1.5 py-1 text-ink-2 outline-none placeholder:text-ink-7"
                       />
                       {refUrl.trim() && (
                         <button
                           onClick={() => setReferenceUrl(merged!.index, refUrl)}
                           disabled={busy != null}
-                          className="text-[10.5px] px-2 py-1 rounded bg-violet-500/20 hover:bg-violet-500/30 text-violet-200 disabled:opacity-40"
+                          className="text-[10.5px] px-2 py-1 rounded bg-violet-500/20 hover:bg-violet-500/30 text-info disabled:opacity-40"
                         >
                           用此 URL
                         </button>
@@ -841,28 +862,28 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                         <button
                           onClick={() => removeVideo(merged!.index)}
                           disabled={busy != null}
-                          className="text-[10.5px] px-2 py-1 rounded text-[#6f7d99] hover:text-rose-300 disabled:opacity-40"
+                          className="text-[10.5px] px-2 py-1 rounded text-ink-5 hover:text-err disabled:opacity-40"
                         >
                           移除片段
                         </button>
                       )}
                     </div>
                     {merged.reference_video && (
-                      <div className="text-[9.5px] text-[#4c5975] mt-1 break-all">
+                      <div className="text-[9.5px] text-ink-7 mt-1 break-all">
                         参考视频：{merged.reference_video}
                         <button
                           onClick={async () => {
                             await api.deleteReferenceVideo(runId, merged!.index)
                             await load()
                           }}
-                          className="ml-1.5 text-[#6f7d99] hover:text-rose-300"
+                          className="ml-1.5 text-ink-5 hover:text-err"
                         >
                           移除
                         </button>
                       </div>
                     )}
                     {!data?.video.ready && data?.video.reason && (
-                      <div className="text-[9.5px] text-[#4c5975] mt-1">{data.video.reason} —— 到「模型配置 → 视频」里启用</div>
+                      <div className="text-[9.5px] text-ink-7 mt-1">{data.video.reason} —— 到「模型配置 → 视频」里启用</div>
                     )}
                   </div>
 
@@ -870,25 +891,25 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                     <button
                       disabled={busy != null}
                       onClick={() => saveDrafts(merged.index)}
-                      className="text-[11.5px] px-3 py-1.5 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] transition-colors disabled:opacity-40"
+                      className="text-[11.5px] px-3 py-1.5 rounded-lg bg-raised hover:bg-hover text-ink-2 transition-colors disabled:opacity-40"
                     >
                       保存本格
                     </button>
                     <button
                       disabled={busy != null}
                       onClick={() => regenerate(merged.index)}
-                      className="text-[11.5px] px-3 py-1.5 rounded-lg bg-[#4f6bff]/20 hover:bg-[#4f6bff]/30 text-[#a9baff] transition-colors disabled:opacity-40"
+                      className="text-[11.5px] px-3 py-1.5 rounded-lg bg-accent/20 hover:bg-accent/30 text-accent-2 transition-colors disabled:opacity-40"
                     >
                       {busy === `regen-${merged.index}` ? '重画中…' : '只重画这一格'}
                     </button>
                     <button
                       disabled={busy != null}
                       onClick={() => askSuggestion(merged.index, sugNote)}
-                      className="text-[11.5px] px-3 py-1.5 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 transition-colors disabled:opacity-40"
+                      className="text-[11.5px] px-3 py-1.5 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 text-teal transition-colors disabled:opacity-40"
                     >
                       {busy === `sug-${merged.index}` ? '思考中…' : 'AI 建议'}
                     </button>
-                    <label className="text-[11.5px] px-3 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 text-violet-300 cursor-pointer transition-colors">
+                    <label className="text-[11.5px] px-3 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 text-info cursor-pointer transition-colors">
                       {busy === `upload-${merged.index}` ? '上传中…' : '上传图片替换'}
                       <input
                         type="file"
@@ -902,8 +923,8 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                       />
                     </label>
                     {ov.image_model && (
-                      <span className="text-[10.5px] text-[#5f6d87]">
-                        本阶段生图模型：<span className="font-mono text-[#8b98b4]">{ov.image_model}</span>
+                      <span className="text-[10.5px] text-ink-6">
+                        本阶段生图模型：<span className="font-mono text-ink-4">{ov.image_model}</span>
                       </span>
                     )}
                   </div>
@@ -912,18 +933,18 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                   {sug && sug.index === merged.index && (
                     <div className="mt-2.5 rounded-lg border border-teal-500/25 bg-teal-500/[0.04] p-3">
                       <div className="flex items-center gap-2 mb-1.5 flex-wrap">
-                        <span className="text-[11px] font-medium text-teal-300">AI 诊断</span>
-                        <span className="text-[9.5px] text-[#5f6d87]">{sug.model}</span>
+                        <span className="text-[11px] font-medium text-teal">AI 诊断</span>
+                        <span className="text-[9.5px] text-ink-6">{sug.model}</span>
                       </div>
-                      <p className="text-[11px] leading-relaxed text-[#c9d5ea]">{sug.diagnosis}</p>
+                      <p className="text-[11px] leading-relaxed text-ink-2">{sug.diagnosis}</p>
                       <div className="mt-2 space-y-1.5">
                         {Object.entries(sug.patch).map(([k, v]) => (
-                          <div key={k} className="rounded-md bg-[#0f1420] border border-[#1e2839] px-2.5 py-1.5">
-                            <div className="text-[10px] text-teal-300/80 mb-0.5">
+                          <div key={k} className="rounded-md bg-panel border border-line px-2.5 py-1.5">
+                            <div className="text-[10px] text-teal/80 mb-0.5">
                               {SUG_FIELD_LABEL[k] ?? k}
-                              {sug.why[k] && <span className="text-[#5f6d87]"> · {sug.why[k]}</span>}
+                              {sug.why[k] && <span className="text-ink-6"> · {sug.why[k]}</span>}
                             </div>
-                            <div className="text-[10.5px] leading-relaxed text-[#9fb0cc] line-clamp-4 break-all">{v}</div>
+                            <div className="text-[10.5px] leading-relaxed text-ink-3 line-clamp-4 break-all">{v}</div>
                           </div>
                         ))}
                       </div>
@@ -931,7 +952,7 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                         <button
                           disabled={busy != null}
                           onClick={applySuggestion}
-                          className="text-[11px] px-2.5 py-1 rounded-lg bg-teal-500/20 hover:bg-teal-500/30 text-teal-300 disabled:opacity-40"
+                          className="text-[11px] px-2.5 py-1 rounded-lg bg-teal-500/20 hover:bg-teal-500/30 text-teal disabled:opacity-40"
                         >
                           采纳（填进编辑框，不直接保存）
                         </button>
@@ -939,18 +960,18 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                           value={sugNote}
                           onChange={(e) => setSugNote(e.target.value)}
                           placeholder="告诉它你的要求，例如：表情更惊恐一点"
-                          className="flex-1 min-w-[180px] text-[10.5px] bg-[#0f1420] border border-[#26324a] rounded-lg px-2 py-1 text-[#dbe4f5] outline-none focus:border-teal-500/50"
+                          className="flex-1 min-w-[180px] text-[10.5px] bg-panel border border-line-2 rounded-lg px-2 py-1 text-ink-2 outline-none focus:border-teal-500/50"
                         />
                         <button
                           disabled={busy != null}
                           onClick={() => askSuggestion(merged.index, sugNote)}
-                          className="text-[11px] px-2.5 py-1 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] disabled:opacity-40"
+                          className="text-[11px] px-2.5 py-1 rounded-lg bg-raised hover:bg-hover text-ink-2 disabled:opacity-40"
                         >
                           {busy === `sug-${merged.index}` ? '…' : '按此要求重新建议'}
                         </button>
                         <button
                           onClick={() => setSug(null)}
-                          className="text-[11px] px-2 py-1 rounded-lg text-[#6f7d99] hover:text-rose-300"
+                          className="text-[11px] px-2 py-1 rounded-lg text-ink-5 hover:text-err"
                         >
                           忽略
                         </button>
@@ -965,41 +986,113 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
         {/* ---------------- 角色与锚点 ---------------- */}
         {tab === 'characters' &&
           (data && !data.characters.text ? (
-            <div className="text-[11.5px] text-[#5f6d87] py-3">
+            <div className="text-[11.5px] text-ink-6 py-3">
               本任务还没有角色卡（characters.md）。跑完「角色设计」阶段后即可在这里调锚点。
             </div>
           ) : (
             <div>
               <div className="flex items-center gap-2 mb-2 flex-wrap">
-                <span className="text-[11px] text-[#6f7d99]">
+                <span className="text-[11px] text-ink-5">
                   锚点是冻结字符串，会被原文粘进每一格生图描述 —— 改它等于改角色的长相
                 </span>
                 {data?.characters.roles.map((r) => (
-                  <span key={r} className="text-[10.5px] px-1.5 py-[2px] rounded bg-[#151d2b] text-[#8b98b4]">
+                  <span key={r} className="text-[10.5px] px-1.5 py-[2px] rounded bg-raised text-ink-4">
                     {r}
                   </span>
                 ))}
               </div>
+
+              {/* 单角色：改提示词 → 重新生成定妆图（不用重跑整个角色阶段） */}
+              {(data?.characters.roles.length ?? 0) > 0 && (
+                <div className="grid gap-2 mb-3">
+                  {data?.characters.roles.map((name) => {
+                    const info = data.characters.art?.[name]
+                    const role = info?.role ?? name.toLowerCase()
+                    const draft = charArtDraft[role] ?? info?.prompt ?? ''
+                    const working = busy === `art-${role}`
+                    return (
+                      <div key={name} className="rounded-lg border border-line-2 bg-panel px-2.5 py-2">
+                        <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                          <span className="text-[11.5px] text-ink-2 font-medium">{name}</span>
+                          <span className="text-[10px] px-1.5 py-[1px] rounded bg-raised text-ink-5">
+                            {role}
+                          </span>
+                          {info?.has_art ? (
+                            <a
+                              href={api.fileUrl(runId, info.art_path)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-[10.5px] text-accent-2 hover:underline"
+                            >
+                              查看定妆图
+                            </a>
+                          ) : (
+                            <span className="text-[10.5px] text-warn">还没有定妆图</span>
+                          )}
+                          {info?.prompt ? (
+                            <span className="text-[10px] text-ink-6">正在用你改过的提示词</span>
+                          ) : null}
+                        </div>
+                        <textarea
+                          value={draft}
+                          onChange={(e) =>
+                            setCharArtDraft((prev) => ({ ...prev, [role]: e.target.value }))
+                          }
+                          rows={3}
+                          spellCheck={false}
+                          placeholder="留空 = 用 characters.md 里的锚点原文。改这里只影响这个角色的定妆图"
+                          className="w-full text-[11px] leading-relaxed bg-deep border border-line-2 rounded-md px-2.5 py-2 text-ink-2 outline-none focus:border-accent/60 resize-y"
+                        />
+                        <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                          <button
+                            disabled={busy != null}
+                            onClick={() => regenCharacterArt(role, draft)}
+                            className="text-[11px] px-2.5 py-1 rounded-md bg-accent/20 hover:bg-accent/30 text-accent-2 transition-colors disabled:opacity-40"
+                          >
+                            {working ? '生成中…' : '重新生成定妆图'}
+                          </button>
+                          {info?.prompt ? (
+                            <button
+                              disabled={busy != null}
+                              onClick={() => {
+                                setCharArtDraft((prev) => ({ ...prev, [role]: '' }))
+                                regenCharacterArt(role, '')
+                              }}
+                              className="text-[11px] px-2.5 py-1 rounded-md bg-raised hover:bg-hover text-ink-3 transition-colors disabled:opacity-40"
+                              title="清除你改过的提示词，回到锚点原文并重画"
+                            >
+                              恢复锚点原文
+                            </button>
+                          ) : null}
+                          <span className="text-[10px] text-ink-6">
+                            重画只影响之后生成的镜头，已画好的格需要单独重画
+                          </span>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
               <textarea
                 value={charsDraft ?? data?.characters.text ?? ''}
                 onChange={(e) => setCharsDraft(e.target.value)}
                 rows={14}
                 spellCheck={false}
-                className="w-full text-[11.5px] leading-relaxed bg-[#0f1420] border border-[#26324a] rounded-lg px-3 py-2.5 text-[#dbe4f5] outline-none focus:border-[#4f6bff]/60 resize-y"
+                className="w-full text-[11.5px] leading-relaxed bg-panel border border-line-2 rounded-lg px-3 py-2.5 text-ink-2 outline-none focus:border-accent/60 resize-y"
                 style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)' }}
               />
               <div className="flex items-center gap-2 mt-2.5 flex-wrap">
                 <button
                   disabled={busy != null || charsDraft == null}
                   onClick={saveChars}
-                  className="text-[11.5px] px-3 py-1.5 rounded-lg bg-[#4f6bff]/20 hover:bg-[#4f6bff]/30 text-[#a9baff] transition-colors disabled:opacity-40"
+                  className="text-[11.5px] px-3 py-1.5 rounded-lg bg-accent/20 hover:bg-accent/30 text-accent-2 transition-colors disabled:opacity-40"
                 >
                   保存角色卡
                 </button>
                 <button
                   disabled={busy != null || !data?.characters.has_origin}
                   onClick={restoreChars}
-                  className="text-[11.5px] px-3 py-1.5 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] transition-colors disabled:opacity-40"
+                  className="text-[11.5px] px-3 py-1.5 rounded-lg bg-raised hover:bg-hover text-ink-2 transition-colors disabled:opacity-40"
                   title={data?.characters.has_origin ? '把模型原始版本载入编辑器' : '还没被改过，没有备份原件'}
                 >
                   载入模型原版
@@ -1007,13 +1100,13 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                 {charsDraft != null && (
                   <button
                     onClick={() => setCharsDraft(null)}
-                    className="text-[11.5px] px-3 py-1.5 rounded-lg text-[#6f7d99] hover:text-[#a8b6d1]"
+                    className="text-[11.5px] px-3 py-1.5 rounded-lg text-ink-5 hover:text-ink-3"
                   >
                     放弃改动
                   </button>
                 )}
                 {data?.characters.has_origin && (
-                  <span className="text-[10.5px] text-[#5f6d87]">模型原件已备份，随时可对照</span>
+                  <span className="text-[10.5px] text-ink-6">模型原件已备份，随时可对照</span>
                 )}
               </div>
             </div>
@@ -1025,7 +1118,7 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
         {/* ---------------- 本阶段模型 ---------------- */}
         {tab === 'models' && (
           <div>
-            <p className="text-[11px] text-[#6f7d99] mb-3 leading-relaxed">
+            <p className="text-[11px] text-ink-5 mb-3 leading-relaxed">
               给「{stageName}」单独指定模型。只影响这个任务、这一个阶段 —— 不改全局配置，也不影响别的任务。
               留空即回到全局默认。
             </p>
@@ -1063,9 +1156,9 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
               />
             </div>
 
-            <div className="mt-3 rounded-lg border border-[#1e2839] bg-[#0b0f17] px-3 py-2.5">
-              <div className="text-[10.5px] text-[#5f6d87] mb-1.5">给本阶段上传参考图（风格 / 角色参考）</div>
-              <label className="inline-block text-[11.5px] px-3 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 text-violet-300 cursor-pointer transition-colors">
+            <div className="mt-3 rounded-lg border border-line bg-deep px-3 py-2.5">
+              <div className="text-[10.5px] text-ink-6 mb-1.5">给本阶段上传参考图（风格 / 角色参考）</div>
+              <label className="inline-block text-[11.5px] px-3 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 text-info cursor-pointer transition-colors">
                 {busy === 'ref' ? '上传中…' : '选择图片'}
                 <input
                   type="file"
@@ -1092,7 +1185,7 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
                   }}
                 />
               </label>
-              <span className="ml-2 text-[10.5px] text-[#4c5975]">存在 refs/{stageId}/ 下，重跑该阶段时可供模型参考</span>
+              <span className="ml-2 text-[10.5px] text-ink-7">存在 refs/{stageId}/ 下，重跑该阶段时可供模型参考</span>
             </div>
           </div>
         )}
@@ -1104,12 +1197,12 @@ export default function CanvasEditor({ runId, stageId, stageName, produces, onCh
 // ------------------------------------------------------------------ 小组件
 
 const INPUT =
-  'w-full text-[11px] bg-[#0f1420] border border-[#26324a] rounded-md px-2 py-1.5 text-[#dbe4f5] outline-none focus:border-[#4f6bff]/60'
+  'w-full text-[11px] bg-panel border border-line-2 rounded-md px-2 py-1.5 text-ink-2 outline-none focus:border-accent/60'
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div>
-      <div className="text-[10px] text-[#5f6d87] mb-1">{label}</div>
+      <div className="text-[10px] text-ink-6 mb-1">{label}</div>
       {children}
     </div>
   )
@@ -1141,8 +1234,8 @@ function ModelSlot({
   }, [value])
 
   return (
-    <div className="rounded-lg border border-[#1e2839] bg-[#0b0f17] p-3">
-      <div className="text-[11px] text-[#8b98b4] mb-1.5">{label}</div>
+    <div className="rounded-lg border border-line bg-deep p-3">
+      <div className="text-[11px] text-ink-4 mb-1.5">{label}</div>
       <input
         value={draft}
         list={`opts-${label}`}
@@ -1159,8 +1252,8 @@ function ModelSlot({
           <option key={o} value={o} />
         ))}
       </datalist>
-      <div className="text-[10px] text-[#4c5975] mt-1.5">{fallbackHint}</div>
-      {note && <div className="text-[10px] text-[#4c5975] mt-0.5">{note}</div>}
+      <div className="text-[10px] text-ink-7 mt-1.5">{fallbackHint}</div>
+      {note && <div className="text-[10px] text-ink-7 mt-0.5">{note}</div>}
       <div className="flex gap-2 mt-2">
         <button
           disabled={disabled}
@@ -1168,7 +1261,7 @@ function ModelSlot({
             dirtyRef.current = false
             onSave(draft)
           }}
-          className="text-[11px] px-2.5 py-1 rounded-md bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] disabled:opacity-40"
+          className="text-[11px] px-2.5 py-1 rounded-md bg-raised hover:bg-hover text-ink-2 disabled:opacity-40"
         >
           应用
         </button>
@@ -1180,12 +1273,12 @@ function ModelSlot({
               setDraft('')
               onClear()
             }}
-            className="text-[11px] px-2.5 py-1 rounded-md text-[#6f7d99] hover:text-[#a8b6d1] disabled:opacity-40"
+            className="text-[11px] px-2.5 py-1 rounded-md text-ink-5 hover:text-ink-3 disabled:opacity-40"
           >
             恢复全局
           </button>
         )}
-        {value && <span className="text-[10px] text-emerald-300 self-center">已指定</span>}
+        {value && <span className="text-[10px] text-ok self-center">已指定</span>}
       </div>
     </div>
   )

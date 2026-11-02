@@ -157,29 +157,29 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
   }
 
   const inputCls =
-    'w-full rounded-lg bg-[#0f1420] border border-[#243049] px-3 py-2 text-[12.5px] text-[#dfe7f5] outline-none focus:border-[#4f6bff]/70 placeholder:text-[#4a5670]'
+    'w-full rounded-lg bg-panel border border-line-2 px-3 py-2 text-[12.5px] text-ink-2 outline-none focus:border-accent/70 placeholder:text-ink-7'
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
       {/* 遮罩 */}
       <div className="absolute inset-0 bg-black/55 backdrop-blur-[1px]" onClick={onClose} />
 
-      <div className="relative w-[520px] max-w-[94vw] h-full bg-[#0b0f17] border-l border-[#1e2839] flex flex-col slide-in-right">
+      <div className="relative w-[520px] max-w-[94vw] h-full bg-deep border-l border-line flex flex-col slide-in-right">
         {/* 头部 */}
-        <div className="px-5 py-4 border-b border-[#1e2839] flex items-start gap-3">
+        <div className="px-5 py-4 border-b border-line flex items-start gap-3">
           <div className="flex-1">
             <div className="text-[14.5px] font-semibold">模型配置</div>
-            <div className="text-[11px] text-[#7c8aa5] mt-1">
+            <div className="text-[11px] text-ink-5 mt-1">
               四类能力各自独立配置，互不影响。保存后立即生效，无需重启。
             </div>
           </div>
-          <button onClick={onClose} className="text-[#7c8aa5] hover:text-[#c9d5ea] text-[18px] leading-none px-1">
+          <button onClick={onClose} className="text-ink-5 hover:text-ink-2 text-[18px] leading-none px-1">
             ×
           </button>
         </div>
 
         {/* 四类能力页签 */}
-        <div className="px-5 pt-3 flex items-center gap-1.5 border-b border-[#1e2839] pb-3">
+        <div className="px-5 pt-3 flex items-center gap-1.5 border-b border-line pb-3">
           {TABS.map((t) => {
             const ready = t.id === 'text' ? status?.mode === 'real' : media?.kinds?.[t.id]?.ready.ready
             return (
@@ -188,19 +188,19 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
                 onClick={() => setTab(t.id)}
                 title={t.hint}
                 className={`relative text-[12px] px-3 py-1.5 rounded-lg transition-colors ${
-                  tab === t.id ? 'bg-[#1a2233] text-[#dbe4f5]' : 'text-[#6f7d99] hover:text-[#a8b6d1]'
+                  tab === t.id ? 'bg-raised text-ink-2' : 'text-ink-5 hover:text-ink-3'
                 }`}
               >
                 {t.label}
                 <span
                   className={`ml-1.5 inline-block w-1.5 h-1.5 rounded-full align-middle ${
-                    ready ? 'bg-emerald-400' : 'bg-[#3a465e]'
+                    ready ? 'bg-emerald-400' : 'bg-line-2'
                   }`}
                 />
               </button>
             )
           })}
-          <span className="ml-auto text-[10px] text-[#4c5975]">{TABS.find((t) => t.id === tab)?.hint}</span>
+          <span className="ml-auto text-[10px] text-ink-7">{TABS.find((t) => t.id === tab)?.hint}</span>
         </div>
 
         {tab !== 'text' && (
@@ -208,7 +208,7 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
             {media?.kinds?.[tab] ? (
               <MediaConfigSection kind={tab} state={media.kinds[tab]} onSaved={loadMedia} />
             ) : (
-              <div className="text-[12px] text-[#5f6d87]">读取配置中…</div>
+              <div className="text-[12px] text-ink-6">读取配置中…</div>
             )}
           </div>
         )}
@@ -221,8 +221,8 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
             <div
               className={`rounded-lg border px-3 py-2.5 text-[11.5px] ${
                 status.mode === 'real'
-                  ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
-                  : 'border-amber-500/35 bg-amber-500/10 text-amber-200'
+                  ? 'border-emerald-500/35 bg-emerald-500/10 text-ok'
+                  : 'border-amber-500/35 bg-amber-500/10 text-warn'
               }`}
             >
               {status.mode === 'real' ? (
@@ -243,18 +243,18 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
         )}
 
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
-          {loading && <div className="text-[12px] text-[#5f6d87]">读取配置中…</div>}
+          {loading && <div className="text-[12px] text-ink-6">读取配置中…</div>}
 
           {/* 服务商预设 */}
           <div>
-            <div className="text-[11px] text-[#7c8aa5] mb-2">服务商（一键填充地址与模型名）</div>
+            <div className="text-[11px] text-ink-5 mb-2">服务商（一键填充地址与模型名）</div>
             <div className="flex flex-wrap gap-1.5">
               {presets.map((p) => (
                 <button
                   key={p.id}
                   onClick={() => applyPreset(p)}
                   title={p.hint}
-                  className="text-[11.5px] px-2.5 py-1.5 rounded-lg border border-[#243049] bg-[#0f1420] hover:border-[#4f6bff]/60 hover:text-[#c9d5ea] text-[#9fb0cc] transition-colors"
+                  className="text-[11.5px] px-2.5 py-1.5 rounded-lg border border-line-2 bg-panel hover:border-accent/60 hover:text-ink-2 text-ink-3 transition-colors"
                 >
                   {p.label}
                 </button>
@@ -264,7 +264,7 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
 
           {/* 接入方式 */}
           <div>
-            <div className="text-[11px] text-[#7c8aa5] mb-2">接入方式</div>
+            <div className="text-[11px] text-ink-5 mb-2">接入方式</div>
             <div className="grid grid-cols-3 gap-1.5">
               {ACCESS_MODES.map((m) => (
                 <button
@@ -273,22 +273,22 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
                   title={m.hint}
                   className={`rounded-lg border px-2 py-2 text-[11.5px] transition-colors ${
                     provider === m.id
-                      ? 'border-[#4f6bff]/60 bg-[#4f6bff]/12 text-[#c9d5ea]'
-                      : 'border-[#243049] bg-[#0f1420] text-[#8d9cb8] hover:border-[#2f3d5a]'
+                      ? 'border-accent/60 bg-accent/12 text-ink-2'
+                      : 'border-line-2 bg-panel text-ink-4 hover:border-line-2'
                   }`}
                 >
                   {m.label}
                 </button>
               ))}
             </div>
-            <div className="text-[10.5px] text-[#5f6d87] mt-1.5">
+            <div className="text-[10.5px] text-ink-6 mt-1.5">
               {ACCESS_MODES.find((m) => m.id === provider)?.hint}
             </div>
           </div>
 
           {/* 接口地址 */}
           <div>
-            <label className="text-[11px] text-[#7c8aa5] block mb-1.5">接口地址（Base URL）</label>
+            <label className="text-[11px] text-ink-5 block mb-1.5">接口地址（Base URL）</label>
             <input
               className={inputCls}
               value={baseUrl}
@@ -300,14 +300,14 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
               placeholder="https://api.deepseek.com/v1"
               spellCheck={false}
             />
-            <div className="text-[10.5px] text-[#5f6d87] mt-1">
+            <div className="text-[10.5px] text-ink-6 mt-1">
               填到 /v1 即可；直接粘贴 …/chat/completions 也行，后端会自动裁掉
             </div>
           </div>
 
           {/* API Key */}
           <div>
-            <label className="text-[11px] text-[#7c8aa5] block mb-1.5">API Key</label>
+            <label className="text-[11px] text-ink-5 block mb-1.5">API Key</label>
             <input
               className={inputCls}
               type="password"
@@ -322,7 +322,7 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
           {/* 模型名 */}
           <div className="grid grid-cols-[1fr_96px] gap-3">
             <div>
-              <label className="text-[11px] text-[#7c8aa5] block mb-1.5">模型名（Model）</label>
+              <label className="text-[11px] text-ink-5 block mb-1.5">模型名（Model）</label>
               <div className="flex gap-2">
                 <input
                   className={`${inputCls} flex-1 min-w-0`}
@@ -335,14 +335,14 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
                   onClick={doList}
                   disabled={listing}
                   title="向服务商拉取当前可用的模型名（模型名变动比文档快）"
-                  className="shrink-0 rounded-lg border border-[#243049] bg-[#0f1420] hover:border-[#4f6bff]/60 text-[11px] text-[#9fb0cc] hover:text-[#c9d5ea] px-2.5 disabled:opacity-50 transition-colors"
+                  className="shrink-0 rounded-lg border border-line-2 bg-panel hover:border-accent/60 text-[11px] text-ink-3 hover:text-ink-2 px-2.5 disabled:opacity-50 transition-colors"
                 >
                   {listing ? '…' : '拉取'}
                 </button>
               </div>
             </div>
             <div>
-              <label className="text-[11px] text-[#7c8aa5] block mb-1.5">温度</label>
+              <label className="text-[11px] text-ink-5 block mb-1.5">温度</label>
               <input
                 className={inputCls}
                 value={temperature}
@@ -355,7 +355,7 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
 
           {/* 备用模型链 */}
           <div>
-            <label className="text-[11px] text-[#7c8aa5] block mb-1.5">
+            <label className="text-[11px] text-ink-5 block mb-1.5">
               备用模型（主模型不可用时自动顶上，可选）
             </label>
             <input
@@ -365,9 +365,9 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
               placeholder="例如：DeepSeek-V4-Flash,deepseek-v4-pro"
               spellCheck={false}
             />
-            <div className="text-[10.5px] text-[#5f6d87] mt-1 leading-relaxed">
+            <div className="text-[10.5px] text-ink-6 mt-1 leading-relaxed">
               逗号分隔，按顺序尝试。只写模型名 = 同一个接口；写成{' '}
-              <code className="text-[#8d9cb8]">模型名@https://别的地址/v1</code> 就能连接口一起换。
+              <code className="text-ink-4">模型名@https://别的地址/v1</code> 就能连接口一起换。
               <br />
               配它是有必要的：中转站会给某个模型名恒返 503，换个同系列的名字往往就通了，
               否则整轮长任务白跑。
@@ -376,16 +376,16 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
 
           {/* 拉取到的模型列表 */}
           {listError && (
-            <div className="text-[10.5px] text-rose-300 -mt-3 break-words">拉取模型列表失败：{listError}</div>
+            <div className="text-[10.5px] text-err -mt-3 break-words">拉取模型列表失败：{listError}</div>
           )}
           {modelList && (
             <div className="-mt-3">
-              <div className="text-[10.5px] text-[#5f6d87] mb-1.5">
+              <div className="text-[10.5px] text-ink-6 mb-1.5">
                 服务商当前可用 {modelList.length} 个模型，点一个填入：
               </div>
-              <div className="max-h-[150px] overflow-y-auto rounded-lg border border-[#243049] bg-[#0f1420] p-2 flex flex-wrap gap-1.5">
+              <div className="max-h-[150px] overflow-y-auto rounded-lg border border-line-2 bg-panel p-2 flex flex-wrap gap-1.5">
                 {modelList.length === 0 && (
-                  <span className="text-[10.5px] text-[#5f6d87]">服务商没有返回任何模型</span>
+                  <span className="text-[10.5px] text-ink-6">服务商没有返回任何模型</span>
                 )}
                 {modelList.map((m) => (
                   <span key={m} className="inline-flex items-stretch">
@@ -396,8 +396,8 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
                       }}
                       className={`text-[10.5px] px-2 py-1 rounded-l-md border border-r-0 transition-colors ${
                         model === m
-                          ? 'border-[#4f6bff]/60 bg-[#4f6bff]/15 text-[#c9d5ea]'
-                          : 'border-[#243049] hover:border-[#4f6bff]/50 text-[#9fb0cc] hover:text-[#c9d5ea]'
+                          ? 'border-accent/60 bg-accent/15 text-ink-2'
+                          : 'border-line-2 hover:border-accent/50 text-ink-3 hover:text-ink-2'
                       }`}
                     >
                       {m}
@@ -405,7 +405,7 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
                     <button
                       onClick={() => addFallback(m)}
                       title="加入备用模型链"
-                      className="text-[10.5px] px-1.5 py-1 rounded-r-md border border-[#243049] text-[#5f6d87] hover:text-[#9fb0cc] hover:border-[#4f6bff]/50 transition-colors"
+                      className="text-[10.5px] px-1.5 py-1 rounded-r-md border border-line-2 text-ink-6 hover:text-ink-3 hover:border-accent/50 transition-colors"
                     >
                       +备用
                     </button>
@@ -420,8 +420,8 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
             <div
               className={`rounded-lg border px-3 py-2.5 text-[11.5px] whitespace-pre-wrap break-words ${
                 testResult.ok
-                  ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
-                  : 'border-rose-500/40 bg-rose-500/10 text-rose-200'
+                  ? 'border-emerald-500/35 bg-emerald-500/10 text-ok'
+                  : 'border-rose-500/40 bg-rose-500/10 text-err'
               }`}
             >
               {testResult.ok ? (
@@ -455,37 +455,37 @@ export default function ModelConfig({ open, onClose, onSaved }: Props) {
           )}
 
           {savedMsg && (
-            <div className="rounded-lg border border-[#4f6bff]/40 bg-[#4f6bff]/10 text-[11.5px] text-[#c9d5ea] px-3 py-2.5">
+            <div className="rounded-lg border border-accent/40 bg-accent/10 text-[11.5px] text-ink-2 px-3 py-2.5">
               {savedMsg}
             </div>
           )}
 
           {error && (
-            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 text-[11.5px] text-rose-200 px-3 py-2.5">
+            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 text-[11.5px] text-err px-3 py-2.5">
               {error}
             </div>
           )}
         </div>
 
         {/* 底部操作 */}
-        <div className="px-5 py-4 border-t border-[#1e2839]">
+        <div className="px-5 py-4 border-t border-line">
           <div className="flex gap-2">
             <button
               onClick={doTest}
               disabled={testing || saving}
-              className="flex-1 rounded-lg border border-[#243049] bg-[#0f1420] hover:border-[#4f6bff]/60 text-[12.5px] text-[#c9d5ea] py-2.5 disabled:opacity-50 transition-colors"
+              className="flex-1 rounded-lg border border-line-2 bg-panel hover:border-accent/60 text-[12.5px] text-ink-2 py-2.5 disabled:opacity-50 transition-colors"
             >
               {testing ? '测试中…' : '测试连接'}
             </button>
             <button
               onClick={doSave}
               disabled={saving || testing}
-              className="flex-1 rounded-lg bg-[#4f6bff] hover:bg-[#3f5aee] text-[12.5px] font-medium text-white py-2.5 disabled:opacity-50 transition-colors"
+              className="flex-1 rounded-lg bg-accent hover:bg-accent-3 text-[12.5px] font-medium text-white py-2.5 disabled:opacity-50 transition-colors"
             >
               {saving ? '保存中…' : '保存并启用'}
             </button>
           </div>
-          <div className="text-[10.5px] text-[#5f6d87] mt-2.5 break-all">
+          <div className="text-[10.5px] text-ink-6 mt-2.5 break-all">
             配置写入 {envFile || 'backend/.env'}
             {envExists ? '（已存在，将更新对应行）' : '（首次保存时创建）'}，重启后依然有效。
           </div>

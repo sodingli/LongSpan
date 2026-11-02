@@ -132,6 +132,23 @@ export const api = {
       body: JSON.stringify({ text }),
     }),
   charactersOrigin: (runId: string) => req<{ text: string }>(`/runs/${runId}/characters/origin`),
+  /** 单角色重生成定妆图：prompt 传空字符串 = 清除覆盖、回到锚点原文 */
+  regenerateCharacterArt: (
+    runId: string,
+    role: string,
+    body: { prompt?: string; image_model?: string; image_service?: string },
+  ) =>
+    req<{
+      ok: boolean
+      role: string
+      art_path: string
+      prompt: string
+      degraded: string[]
+      note: string
+    }>(`/runs/${runId}/characters/${encodeURIComponent(role)}/regenerate`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   setStageOverride: (runId: string, stageId: string, body: Record<string, string>) =>
     req<{ stage_id: string; override: Record<string, string>; changed: string[] }>(
       `/runs/${runId}/stages/${stageId}/overrides`,

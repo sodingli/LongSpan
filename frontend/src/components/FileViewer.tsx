@@ -146,30 +146,30 @@ export default function FileViewer({ runId, relPath, onClose, onChanged }: Props
       onClick={requestClose}
     >
       <div
-        className="bg-[#0f1420] border border-[#1e2839] rounded-2xl w-full max-w-[980px] max-h-full flex flex-col overflow-hidden shadow-2xl"
+        className="bg-panel border border-line rounded-2xl w-full max-w-[980px] max-h-full flex flex-col overflow-hidden shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 头部 */}
-        <div className="px-5 py-3.5 border-b border-[#1e2839] flex items-center gap-2 flex-wrap">
-          <span className="text-[13px] font-mono text-[#c9d5ea] truncate">{relPath}</span>
+        <div className="px-5 py-3.5 border-b border-line flex items-center gap-2 flex-wrap">
+          <span className="text-[13px] font-mono text-ink-2 truncate">{relPath}</span>
           {locked && (
-            <span className="text-[9.5px] px-1.5 py-[1px] rounded bg-amber-500/15 text-amber-300 shrink-0">
+            <span className="text-[9.5px] px-1.5 py-[1px] rounded bg-amber-500/15 text-warn shrink-0">
               系统文件 · 只读
             </span>
           )}
           {canEdit && meta?.has_origin && (
-            <span className="text-[9.5px] px-1.5 py-[1px] rounded bg-violet-500/15 text-violet-300 shrink-0">
+            <span className="text-[9.5px] px-1.5 py-[1px] rounded bg-violet-500/15 text-info shrink-0">
               人工改过
             </span>
           )}
 
           <div className="ml-auto flex items-center gap-2 shrink-0">
             {canEdit && (
-              <div className="flex rounded-lg overflow-hidden border border-[#26324a]">
+              <div className="flex rounded-lg overflow-hidden border border-line-2">
                 <button
                   onClick={() => setEditing(false)}
                   className={`text-[11px] px-2.5 py-1 transition-colors ${
-                    editing ? 'text-[#7c8aa5] hover:text-[#c9d5ea]' : 'bg-[#1d2738] text-[#dbe4f5]'
+                    editing ? 'text-ink-5 hover:text-ink-2' : 'bg-raised text-ink-2'
                   }`}
                 >
                   预览
@@ -177,7 +177,7 @@ export default function FileViewer({ runId, relPath, onClose, onChanged }: Props
                 <button
                   onClick={() => setEditing(true)}
                   className={`text-[11px] px-2.5 py-1 transition-colors ${
-                    editing ? 'bg-[#1d2738] text-[#dbe4f5]' : 'text-[#7c8aa5] hover:text-[#c9d5ea]'
+                    editing ? 'bg-raised text-ink-2' : 'text-ink-5 hover:text-ink-2'
                   }`}
                 >
                   编辑
@@ -187,13 +187,13 @@ export default function FileViewer({ runId, relPath, onClose, onChanged }: Props
             <a
               href={api.fileUrl(runId, relPath)}
               download
-              className="text-[11px] px-2.5 py-1 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] transition-colors"
+              className="text-[11px] px-2.5 py-1 rounded-lg bg-raised hover:bg-hover text-ink-2 transition-colors"
             >
               下载
             </a>
             <button
               onClick={requestClose}
-              className="w-7 h-7 rounded-lg hover:bg-[#1a2233] text-[#7c8aa5] hover:text-white transition-colors"
+              className="w-7 h-7 rounded-lg hover:bg-raised text-ink-5 hover:text-white transition-colors"
             >
               ✕
             </button>
@@ -203,12 +203,12 @@ export default function FileViewer({ runId, relPath, onClose, onChanged }: Props
         {(err || msg) && (
           <div className="px-5 pt-3 space-y-1.5">
             {err && (
-              <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-[11px] text-rose-200">
+              <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-[11px] text-err">
                 {err}
               </div>
             )}
             {msg && (
-              <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-3 py-1.5 text-[11px] text-emerald-200">
+              <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-3 py-1.5 text-[11px] text-ok">
                 {msg}
               </div>
             )}
@@ -218,28 +218,28 @@ export default function FileViewer({ runId, relPath, onClose, onChanged }: Props
         {/* 内容 */}
         <div className="flex-1 overflow-auto min-h-0">
           {loading ? (
-            <div className="p-8 text-[12px] text-[#5f6d87]">读取中…</div>
+            <div className="p-8 text-[12px] text-ink-6">读取中…</div>
           ) : isImage ? (
-            <div className="p-6 flex justify-center bg-[#080b12]">
+            <div className="p-6 flex justify-center bg-deep">
               <img
                 src={api.fileUrl(runId, relPath)}
                 alt={relPath}
-                className="max-h-[70vh] rounded-xl border border-[#1e2839]"
+                className="max-h-[70vh] rounded-xl border border-line"
               />
             </div>
           ) : isVideo ? (
-            <div className="p-6 flex justify-center bg-[#080b12]">
+            <div className="p-6 flex justify-center bg-deep">
               <video
                 src={api.fileUrl(runId, relPath)}
                 controls
                 autoPlay
                 playsInline
-                className="max-h-[70vh] rounded-xl border border-[#1e2839] bg-black"
+                className="max-h-[70vh] rounded-xl border border-line bg-black"
               />
             </div>
           ) : isAudio ? (
-            <div className="p-8 flex flex-col items-center gap-4 bg-[#080b12]">
-              <div className="text-[12px] text-[#7c8aa5] font-mono">{relPath.split('/').pop()}</div>
+            <div className="p-8 flex flex-col items-center gap-4 bg-deep">
+              <div className="text-[12px] text-ink-5 font-mono">{relPath.split('/').pop()}</div>
               <audio src={api.fileUrl(runId, relPath)} controls className="w-full max-w-[560px]" />
             </div>
           ) : editing && canEdit ? (
@@ -249,21 +249,21 @@ export default function FileViewer({ runId, relPath, onClose, onChanged }: Props
                 onChange={(e) => setContent(e.target.value)}
                 spellCheck={false}
                 autoFocus
-                className="w-full h-[58vh] text-[12.5px] leading-relaxed bg-[#0b0f17] border border-[#26324a] rounded-lg px-3.5 py-3 text-[#dbe4f5] outline-none focus:border-[#4f6bff]/60 resize-none"
+                className="w-full h-[58vh] text-[12.5px] leading-relaxed bg-deep border border-line-2 rounded-lg px-3.5 py-3 text-ink-2 outline-none focus:border-accent/60 resize-none"
                 style={{ fontFamily: 'var(--font-mono, ui-monospace, monospace)' }}
               />
               <div className="flex items-center gap-2 mt-2.5 flex-wrap">
                 <button
                   onClick={submit}
                   disabled={busy || !dirty}
-                  className="text-[12px] px-3.5 py-1.5 rounded-lg bg-[#4f6bff] hover:bg-[#3f5ae8] text-white font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+                  className="text-[12px] px-3.5 py-1.5 rounded-lg bg-accent hover:bg-accent-3 text-white font-medium disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   {busy ? '提交中…' : '提交保存'}
                 </button>
                 <button
                   onClick={() => setContent(original)}
                   disabled={busy || !dirty}
-                  className="text-[11.5px] px-3 py-1.5 rounded-lg text-[#6f7d99] hover:text-[#a8b6d1] disabled:opacity-40"
+                  className="text-[11.5px] px-3 py-1.5 rounded-lg text-ink-5 hover:text-ink-3 disabled:opacity-40"
                 >
                   放弃改动
                 </button>
@@ -271,28 +271,28 @@ export default function FileViewer({ runId, relPath, onClose, onChanged }: Props
                   <button
                     onClick={restore}
                     disabled={busy}
-                    className="text-[11.5px] px-3 py-1.5 rounded-lg bg-[#1a2233] hover:bg-[#24304a] text-[#c9d5ea] disabled:opacity-40"
+                    className="text-[11.5px] px-3 py-1.5 rounded-lg bg-raised hover:bg-hover text-ink-2 disabled:opacity-40"
                   >
                     还原模型原件
                   </button>
                 )}
-                {dirty && <span className="text-[10.5px] text-orange-300">有未提交改动</span>}
-                <span className="ml-auto text-[10px] text-[#4c5975]">
+                {dirty && <span className="text-[10.5px] text-orange">有未提交改动</span>}
+                <span className="ml-auto text-[10px] text-ink-7">
                   ⌘/Ctrl + S 提交{isJson ? ' · 保存时会校验 JSON 语法' : ''}
                 </span>
               </div>
             </div>
           ) : isMarkdown ? (
             <div
-              className="md-body px-6 py-5 text-[13px] text-[#c9d5ea]"
+              className="md-body px-6 py-5 text-[13px] text-ink-2"
               dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
             />
           ) : isJson ? (
-            <pre className="px-6 py-5 text-[12px] text-[#9fb0cc] font-mono whitespace-pre-wrap break-words leading-relaxed">
+            <pre className="px-6 py-5 text-[12px] text-ink-3 font-mono whitespace-pre-wrap break-words leading-relaxed">
               {prettyJson(content)}
             </pre>
           ) : (
-            <pre className="px-6 py-5 text-[12px] text-[#9fb0cc] font-mono whitespace-pre-wrap break-words leading-relaxed">
+            <pre className="px-6 py-5 text-[12px] text-ink-3 font-mono whitespace-pre-wrap break-words leading-relaxed">
               {content}
             </pre>
           )}

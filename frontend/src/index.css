@@ -1,16 +1,141 @@
 @import "tailwindcss";
 
-@theme {
-  --color-ink-950: #070a11;
-  --color-ink-900: #0b0f17;
-  --color-ink-850: #0f1420;
-  --color-ink-800: #121826;
-  --color-ink-700: #1a2233;
-  --color-ink-600: #253048;
-  --color-line: #1e2839;
-  --color-muted: #7c8aa5;
-  --color-accent: #4f6bff;
-  --color-accent-soft: #3b52c9;
+/*
+ * 主题体系：所有颜色走 CSS 变量，工具类由 @theme inline 映射。
+ * - 默认跟随系统：:root 为浅色（清爽白），prefers-color-scheme: dark 时切深色
+ * - 手动切换：html[data-theme="light"|"dark"] 强制覆盖，auto = 无属性
+ */
+@theme inline {
+  --color-page: var(--c-page);
+  --color-panel: var(--c-panel);
+  --color-panel-2: var(--c-panel-2);
+  --color-deep: var(--c-deep);
+  --color-raised: var(--c-raised);
+  --color-hover: var(--c-hover);
+  --color-line: var(--c-line);
+  --color-line-2: var(--c-line-2);
+  --color-ink: var(--c-ink);
+  --color-ink-2: var(--c-ink-2);
+  --color-ink-3: var(--c-ink-3);
+  --color-ink-4: var(--c-ink-4);
+  --color-ink-5: var(--c-ink-5);
+  --color-ink-6: var(--c-ink-6);
+  --color-ink-7: var(--c-ink-7);
+  --color-accent: var(--c-accent);
+  --color-accent-2: var(--c-accent-2);
+  --color-accent-3: var(--c-accent-3);
+  --color-ok: var(--c-ok);
+  --color-warn: var(--c-warn);
+  --color-err: var(--c-err);
+  --color-info: var(--c-info);
+  --color-run: var(--c-run);
+  --color-teal: var(--c-teal);
+  --color-sky: var(--c-sky);
+  --color-cyan: var(--c-cyan);
+  --color-orange: var(--c-orange);
+}
+
+/* ---- 浅色（默认）：清爽白底 + 冷灰蓝 + 高对比主色 ---- */
+:root {
+  color-scheme: light;
+  --c-page: #f3f5fa;
+  --c-panel: #ffffff;
+  --c-panel-2: #f6f8fc;
+  --c-deep: #eef1f8;
+  --c-raised: #e8edf6;
+  --c-hover: #dfe5f1;
+  --c-line: #e2e7f1;
+  --c-line-2: #c9d2e4;
+  --c-ink: #121b30;
+  --c-ink-2: #2f3d5c;
+  --c-ink-3: #4d5c7c;
+  --c-ink-4: #67748f;
+  --c-ink-5: #71809b;
+  --c-ink-6: #8794b0;
+  --c-ink-7: #9daac2;
+  --c-accent: #3d55f5;
+  --c-accent-2: #2f49e0;
+  --c-accent-3: #3346d9;
+  --c-ok: #047857;
+  --c-warn: #b45309;
+  --c-err: #e11d48;
+  --c-info: #6d28d9;
+  --c-run: #1d4ed8;
+  --c-teal: #0f766e;
+  --c-sky: #0369a1;
+  --c-cyan: #0e7490;
+  --c-orange: #c2410c;
+  --c-scroll: #c4cde0;
+  --c-scroll-hover: #adbad4;
+}
+
+/* ---- 深色：沿用原配色 ---- */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --c-page: #070a11;
+    --c-panel: #0f1420;
+    --c-panel-2: #121826;
+    --c-deep: #0b0f17;
+    --c-raised: #1a2233;
+    --c-hover: #24304a;
+    --c-line: #1e2839;
+    --c-line-2: #2a3750;
+    --c-ink: #e6edf8;
+    --c-ink-2: #c9d5ea;
+    --c-ink-3: #9fb0cc;
+    --c-ink-4: #8b98b4;
+    --c-ink-5: #7c8aa5;
+    --c-ink-6: #5f6d87;
+    --c-ink-7: #4c5975;
+    --c-accent: #4f6bff;
+    --c-accent-2: #8ba3ff;
+    --c-accent-3: #3f5ae8;
+    --c-ok: #6ee7b7;
+    --c-warn: #fcd34d;
+    --c-err: #fda4af;
+    --c-info: #c4b5fd;
+    --c-run: #93c5fd;
+    --c-teal: #5eead4;
+    --c-sky: #7dd3fc;
+    --c-cyan: #67e8f9;
+    --c-orange: #fdba74;
+    --c-scroll: #23304a;
+    --c-scroll-hover: #31415f;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --c-page: #070a11;
+  --c-panel: #0f1420;
+  --c-panel-2: #121826;
+  --c-deep: #0b0f17;
+  --c-raised: #1a2233;
+  --c-hover: #24304a;
+  --c-line: #1e2839;
+  --c-line-2: #2a3750;
+  --c-ink: #e6edf8;
+  --c-ink-2: #c9d5ea;
+  --c-ink-3: #9fb0cc;
+  --c-ink-4: #8b98b4;
+  --c-ink-5: #7c8aa5;
+  --c-ink-6: #5f6d87;
+  --c-ink-7: #4c5975;
+  --c-accent: #4f6bff;
+  --c-accent-2: #8ba3ff;
+  --c-accent-3: #3f5ae8;
+  --c-ok: #6ee7b7;
+  --c-warn: #fcd34d;
+  --c-err: #fda4af;
+  --c-info: #c4b5fd;
+  --c-run: #93c5fd;
+  --c-teal: #5eead4;
+  --c-sky: #7dd3fc;
+  --c-cyan: #67e8f9;
+  --c-orange: #fdba74;
+  --c-scroll: #23304a;
+  --c-scroll-hover: #31415f;
 }
 
 html, body, #root {
@@ -19,8 +144,8 @@ html, body, #root {
 }
 
 body {
-  background: var(--color-ink-950);
-  color: #e6ecf7;
+  background: var(--c-page);
+  color: var(--c-ink-2);
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
@@ -29,8 +154,8 @@ body {
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #23304a; border-radius: 6px; }
-::-webkit-scrollbar-thumb:hover { background: #31415f; }
+::-webkit-scrollbar-thumb { background: var(--c-scroll); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: var(--c-scroll-hover); }
 
 @keyframes pulse-ring {
   0% { box-shadow: 0 0 0 0 rgba(79, 107, 255, 0.45); }
@@ -56,7 +181,7 @@ body {
   100% { background-position: 400px 0; }
 }
 .shimmer {
-  background: linear-gradient(90deg, #121826 0%, #1c2740 50%, #121826 100%);
+  background: linear-gradient(90deg, var(--c-panel-2) 0%, var(--c-hover) 50%, var(--c-panel-2) 100%);
   background-size: 800px 100%;
   animation: shimmer 1.6s infinite linear;
 }
@@ -74,15 +199,15 @@ body {
 
 .md-body h1, .md-body h2, .md-body h3 { font-weight: 600; margin: 14px 0 6px; }
 .md-body h1 { font-size: 17px; }
-.md-body h2 { font-size: 15px; color: #c3cfe6; }
-.md-body h3 { font-size: 14px; color: #a8b6d1; }
+.md-body h2 { font-size: 15px; color: var(--c-ink-2); }
+.md-body h3 { font-size: 14px; color: var(--c-ink-3); }
 .md-body p { margin: 7px 0; line-height: 1.75; }
 .md-body ul, .md-body ol { margin: 7px 0 7px 20px; line-height: 1.75; }
 .md-body li { margin: 3px 0; }
-.md-body code { background: #182032; padding: 1px 5px; border-radius: 4px; font-size: 12px; color: #9fc0ff; }
-.md-body pre { background: #0d1320; padding: 10px; border-radius: 8px; overflow: auto; font-size: 12px; border: 1px solid var(--color-line); }
-.md-body blockquote { border-left: 3px solid var(--color-accent-soft); padding-left: 10px; color: #97a5c0; margin: 8px 0; }
+.md-body code { background: var(--c-raised); padding: 1px 5px; border-radius: 4px; font-size: 12px; color: var(--c-accent-2); }
+.md-body pre { background: var(--c-deep); padding: 10px; border-radius: 8px; overflow: auto; font-size: 12px; border: 1px solid var(--c-line); }
+.md-body blockquote { border-left: 3px solid var(--c-accent); padding-left: 10px; color: var(--c-ink-4); margin: 8px 0; }
 .md-body table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12.5px; }
-.md-body th, .md-body td { border: 1px solid var(--color-line); padding: 5px 8px; text-align: left; }
-.md-body th { background: #141c2c; }
-.md-body strong { color: #fff; }
+.md-body th, .md-body td { border: 1px solid var(--c-line); padding: 5px 8px; text-align: left; }
+.md-body th { background: var(--c-panel-2); }
+.md-body strong { color: var(--c-ink); }

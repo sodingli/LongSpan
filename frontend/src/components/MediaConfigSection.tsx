@@ -109,7 +109,7 @@ const FIELDS: Record<Kind, FieldSpec[]> = {
 const KIND_TITLE: Record<Kind, string> = { image: '图片', tts: '语音', video: '视频' }
 
 const INPUT =
-  'w-full rounded-lg bg-[#0f1420] border border-[#243049] px-3 py-2 text-[12.5px] text-[#dfe7f5] outline-none focus:border-[#4f6bff]/70 placeholder:text-[#4a5670]'
+  'w-full rounded-lg bg-panel border border-line-2 px-3 py-2 text-[12.5px] text-ink-2 outline-none focus:border-accent/70 placeholder:text-ink-7'
 
 export default function MediaConfigSection({
   kind,
@@ -190,8 +190,8 @@ export default function MediaConfigSection({
       <div
         className={`rounded-lg border px-3 py-2.5 text-[11.5px] ${
           state.ready.ready
-            ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
-            : 'border-amber-500/35 bg-amber-500/10 text-amber-200'
+            ? 'border-emerald-500/35 bg-emerald-500/10 text-ok'
+            : 'border-amber-500/35 bg-amber-500/10 text-warn'
         }`}
       >
         <b>{KIND_TITLE[kind]}</b> · {state.ready.ready ? '已就绪' : '未就绪'}
@@ -201,7 +201,7 @@ export default function MediaConfigSection({
       <div className="grid grid-cols-2 gap-3">
         {fields.map((f) => (
           <div key={f.key} className={f.wide ? 'col-span-2' : 'col-span-2 sm:col-span-1'}>
-            <label className="text-[11px] text-[#7c8aa5] block mb-1.5">{f.label}</label>
+            <label className="text-[11px] text-ink-5 block mb-1.5">{f.label}</label>
 
             {f.type === 'select' ? (
               <select
@@ -220,8 +220,8 @@ export default function MediaConfigSection({
                 onClick={() => patch(f.key, !values[f.key])}
                 className={`text-[11.5px] px-3 py-1.5 rounded-lg border transition-colors ${
                   values[f.key]
-                    ? 'border-[#4f6bff]/60 bg-[#4f6bff]/15 text-[#c9d5ea]'
-                    : 'border-[#243049] bg-[#0f1420] text-[#8d9cb8]'
+                    ? 'border-accent/60 bg-accent/15 text-ink-2'
+                    : 'border-line-2 bg-panel text-ink-4'
                 }`}
               >
                 {values[f.key] ? '开启' : '关闭'}
@@ -252,13 +252,13 @@ export default function MediaConfigSection({
               />
             )}
 
-            {f.hint && <div className="text-[10px] text-[#4c5975] mt-1 leading-relaxed">{f.hint}</div>}
+            {f.hint && <div className="text-[10px] text-ink-7 mt-1 leading-relaxed">{f.hint}</div>}
           </div>
         ))}
       </div>
 
       {needConfirm && (
-        <div className="rounded-lg border border-orange-500/40 bg-orange-500/10 px-3 py-2.5 text-[11.5px] text-orange-200">
+        <div className="rounded-lg border border-orange-500/40 bg-orange-500/10 px-3 py-2.5 text-[11.5px] text-orange">
           测试会真实调用一次{kind === 'image' ? '生图' : kind === 'tts' ? '语音合成' : '视频接口'}（会产生费用）。
           {kind === 'video' ? '视频只做鉴权探测，不提交生成任务。' : ''}
           <button
@@ -274,8 +274,8 @@ export default function MediaConfigSection({
         <div
           className={`rounded-lg border px-3 py-2.5 text-[11.5px] break-words ${
             test.ok
-              ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
-              : 'border-rose-500/40 bg-rose-500/10 text-rose-200'
+              ? 'border-emerald-500/35 bg-emerald-500/10 text-ok'
+              : 'border-rose-500/40 bg-rose-500/10 text-err'
           }`}
         >
           {test.ok ? (
@@ -297,12 +297,12 @@ export default function MediaConfigSection({
       )}
 
       {msg && (
-        <div className="rounded-lg border border-[#4f6bff]/40 bg-[#4f6bff]/10 text-[11.5px] text-[#c9d5ea] px-3 py-2.5">
+        <div className="rounded-lg border border-accent/40 bg-accent/10 text-[11.5px] text-ink-2 px-3 py-2.5">
           {msg}
         </div>
       )}
       {err && (
-        <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 text-[11.5px] text-rose-200 px-3 py-2.5">
+        <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 text-[11.5px] text-err px-3 py-2.5">
           {err}
         </div>
       )}
@@ -311,19 +311,19 @@ export default function MediaConfigSection({
         <button
           onClick={() => runTest(false)}
           disabled={testing || saving}
-          className="flex-1 rounded-lg border border-[#243049] bg-[#0f1420] hover:border-[#4f6bff]/60 text-[12.5px] text-[#c9d5ea] py-2.5 disabled:opacity-50 transition-colors"
+          className="flex-1 rounded-lg border border-line-2 bg-panel hover:border-accent/60 text-[12.5px] text-ink-2 py-2.5 disabled:opacity-50 transition-colors"
         >
           {testing ? '测试中…' : '测试连接'}
         </button>
         <button
           onClick={save}
           disabled={saving || testing}
-          className="flex-1 rounded-lg bg-[#4f6bff] hover:bg-[#3f5aee] text-[12.5px] font-medium text-white py-2.5 disabled:opacity-50 transition-colors"
+          className="flex-1 rounded-lg bg-accent hover:bg-accent-3 text-[12.5px] font-medium text-white py-2.5 disabled:opacity-50 transition-colors"
         >
           {saving ? '保存中…' : '保存并启用'}
         </button>
       </div>
-      <div className="text-[10.5px] text-[#5f6d87] leading-relaxed">
+      <div className="text-[10.5px] text-ink-6 leading-relaxed">
         {state.ready.mode === 'off' ? '关闭状态下不会产生任何视频调用，成片仍会正常渲染（静态图 + 运镜）。' : ''}
         保存写入 backend/.env，重启后依然有效；已有任务不会被改写。
       </div>

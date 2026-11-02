@@ -9,13 +9,13 @@ interface Props {
 
 export default function StageTree({ steps, currentStageId, runStatus }: Props) {
   if (!steps.length) {
-    return <div className="text-[12px] text-[#5f6d87] px-1 py-4">阶段尚未初始化…</div>
+    return <div className="text-[12px] text-ink-6 px-1 py-4">阶段尚未初始化…</div>
   }
 
   return (
     <div className="relative">
       {/* 竖线 */}
-      <div className="absolute left-[13px] top-3 bottom-3 w-px bg-[#1e2839]" />
+      <div className="absolute left-[13px] top-3 bottom-3 w-px bg-line" />
 
       <div className="space-y-1">
         {steps.map((s) => {
@@ -30,14 +30,14 @@ export default function StageTree({ steps, currentStageId, runStatus }: Props) {
                 <div
                   className={`w-[27px] h-[27px] rounded-full border flex items-center justify-center text-[11px] transition-all ${
                     running
-                      ? 'border-[#4f6bff] bg-[#4f6bff]/20 text-[#8ba3ff] pulse-ring'
+                      ? 'border-accent bg-accent/20 text-accent-2 pulse-ring'
                       : s.status === 'completed'
-                      ? 'border-emerald-500/45 bg-emerald-500/12 text-emerald-300'
+                      ? 'border-emerald-500/45 bg-emerald-500/12 text-ok'
                       : s.status === 'failed'
-                      ? 'border-rose-500/45 bg-rose-500/12 text-rose-300'
+                      ? 'border-rose-500/45 bg-rose-500/12 text-err'
                       : isCurrent
-                      ? 'border-amber-500/45 bg-amber-500/12 text-amber-300'
-                      : 'border-[#26324a] bg-[#0f1420] text-[#5f6d87]'
+                      ? 'border-amber-500/45 bg-amber-500/12 text-warn'
+                      : 'border-line-2 bg-panel text-ink-6'
                   }`}
                 >
                   {s.status === 'completed' ? '✓' : s.status === 'failed' ? '✕' : s.index + 1}
@@ -50,21 +50,21 @@ export default function StageTree({ steps, currentStageId, runStatus }: Props) {
                   <span className={`text-[13px] font-medium ${isCurrent ? 'text-white' : tone.text}`}>
                     {s.stage_name}
                   </span>
-                  {running && <span className="text-[10.5px] text-[#4f6bff]">进行中…</span>}
+                  {running && <span className="text-[10.5px] text-accent">进行中…</span>}
                   {s.attempt > 1 && (
-                    <span className="text-[9.5px] px-1.5 py-[2px] rounded bg-orange-500/15 text-orange-300">
+                    <span className="text-[9.5px] px-1.5 py-[2px] rounded bg-orange-500/15 text-orange">
                       重做 {s.attempt - 1} 次
                     </span>
                   )}
                   {s.detail?.criteria_ok === false && (
-                    <span className="text-[9.5px] px-1.5 py-[2px] rounded bg-rose-500/15 text-rose-300">验收未过</span>
+                    <span className="text-[9.5px] px-1.5 py-[2px] rounded bg-rose-500/15 text-err">验收未过</span>
                   )}
                 </div>
 
                 {(s.detail?.files?.length ?? 0) > 0 && (
                   <div className="flex flex-wrap gap-1.5 mt-1.5">
                     {(s.detail.files as string[]).map((f: string) => (
-                      <span key={f} className="text-[10.5px] px-1.5 py-[2px] rounded bg-[#151d2b] text-[#8b98b4] font-mono">
+                      <span key={f} className="text-[10.5px] px-1.5 py-[2px] rounded bg-raised text-ink-4 font-mono">
                         {f}
                       </span>
                     ))}
@@ -72,7 +72,7 @@ export default function StageTree({ steps, currentStageId, runStatus }: Props) {
                 )}
 
                 {s.summary && (
-                  <div className="text-[11.5px] text-[#6f7d99] mt-1.5 leading-relaxed line-clamp-2">{s.summary}</div>
+                  <div className="text-[11.5px] text-ink-5 mt-1.5 leading-relaxed line-clamp-2">{s.summary}</div>
                 )}
               </div>
             </div>

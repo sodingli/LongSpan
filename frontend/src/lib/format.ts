@@ -15,19 +15,19 @@ export function statusTone(s: string): { text: string; bg: string; dot: string }
   switch (s) {
     case 'running':
     case 'in_progress':
-      return { text: 'text-blue-300', bg: 'bg-blue-500/12 border-blue-500/30', dot: 'bg-blue-400' }
+      return { text: 'text-run', bg: 'bg-blue-500/12 border-blue-500/30', dot: 'bg-blue-400' }
     case 'completed':
     case 'succeeded':
-      return { text: 'text-emerald-300', bg: 'bg-emerald-500/12 border-emerald-500/30', dot: 'bg-emerald-400' }
+      return { text: 'text-ok', bg: 'bg-emerald-500/12 border-emerald-500/30', dot: 'bg-emerald-400' }
     case 'awaiting_gate':
-      return { text: 'text-amber-300', bg: 'bg-amber-500/12 border-amber-500/35', dot: 'bg-amber-400' }
+      return { text: 'text-warn', bg: 'bg-amber-500/12 border-amber-500/35', dot: 'bg-amber-400' }
     case 'failed':
-      return { text: 'text-rose-300', bg: 'bg-rose-500/12 border-rose-500/30', dot: 'bg-rose-400' }
+      return { text: 'text-err', bg: 'bg-rose-500/12 border-rose-500/30', dot: 'bg-rose-400' }
     case 'interrupted':
       // 不是失败：产物都在，只是执行被打断，一步就能续上
-      return { text: 'text-orange-300', bg: 'bg-orange-500/12 border-orange-500/35', dot: 'bg-orange-400' }
+      return { text: 'text-orange', bg: 'bg-orange-500/12 border-orange-500/35', dot: 'bg-orange-400' }
     default:
-      return { text: 'text-slate-400', bg: 'bg-slate-500/10 border-slate-600/30', dot: 'bg-slate-500' }
+      return { text: 'text-ink-5', bg: 'bg-slate-500/10 border-slate-600/30', dot: 'bg-slate-500' }
   }
 }
 
@@ -71,19 +71,19 @@ export function fmtClock(sec: number): string {
 
 /** 事件类型 → 展示用图标与配色 */
 export function eventStyle(type: string): { icon: string; color: string } {
-  if (type.startsWith('gate')) return { icon: '◆', color: 'text-amber-300' }
-  if (type.startsWith('draft.ready')) return { icon: '◇', color: 'text-teal-300' }
-  if (type.startsWith('run.resumed')) return { icon: '↻', color: 'text-violet-300' }
-  if (type.startsWith('run.finished')) return { icon: '●', color: 'text-emerald-300' }
-  if (type.startsWith('run.error')) return { icon: '●', color: 'text-rose-300' }
-  if (type.startsWith('stage.completed')) return { icon: '✓', color: 'text-emerald-300' }
-  if (type.startsWith('stage.revision')) return { icon: '↻', color: 'text-orange-300' }
-  if (type.startsWith('stage')) return { icon: '▸', color: 'text-blue-300' }
-  if (type.startsWith('artifact')) return { icon: '▤', color: 'text-violet-300' }
-  if (type.startsWith('decision')) return { icon: '⚖', color: 'text-cyan-300' }
-  if (type.startsWith('tool')) return { icon: '⚙', color: 'text-slate-400' }
-  if (type.startsWith('agent.message')) return { icon: '💬', color: 'text-slate-200' }
-  if (type.startsWith('agent.thought')) return { icon: '…', color: 'text-slate-500' }
-  if (type.startsWith('quota')) return { icon: '▲', color: 'text-orange-300' }
-  return { icon: '·', color: 'text-slate-400' }
+  if (type.startsWith('gate')) return { icon: '◆', color: 'text-warn' }
+  if (type.startsWith('draft.ready')) return { icon: '◇', color: 'text-teal' }
+  if (type.startsWith('run.resumed')) return { icon: '↻', color: 'text-info' }
+  if (type.startsWith('run.finished')) return { icon: '●', color: 'text-ok' }
+  if (type.startsWith('run.error')) return { icon: '●', color: 'text-err' }
+  if (type.startsWith('stage.completed')) return { icon: '✓', color: 'text-ok' }
+  if (type.startsWith('stage.revision')) return { icon: '↻', color: 'text-orange' }
+  if (type.startsWith('stage')) return { icon: '▸', color: 'text-run' }
+  if (type.startsWith('artifact')) return { icon: '▤', color: 'text-info' }
+  if (type.startsWith('decision')) return { icon: '⚖', color: 'text-cyan' }
+  if (type.startsWith('tool')) return { icon: '⚙', color: 'text-ink-5' }
+  if (type.startsWith('agent.message')) return { icon: '💬', color: 'text-ink-3' }
+  if (type.startsWith('agent.thought')) return { icon: '…', color: 'text-ink-6' }
+  if (type.startsWith('quota')) return { icon: '▲', color: 'text-orange' }
+  return { icon: '·', color: 'text-ink-5' }
 }

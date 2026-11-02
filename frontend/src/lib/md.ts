@@ -87,7 +87,7 @@ export function renderMarkdown(src: string): string {
     // 分隔线
     if (/^\s*(---|\*\*\*)\s*$/.test(line)) {
       closeList()
-      out.push('<hr style="border:none;border-top:1px solid #1e2839;margin:14px 0" />')
+      out.push('<hr style="border:none;border-top:1px solid var(--c-line);margin:14px 0" />')
       i++
       continue
     }

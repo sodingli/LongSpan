@@ -7,6 +7,13 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // 首帧前应用已保存的主题，避免闪烁；auto = 不设属性，交给媒体查询
+      try {
+        var t = localStorage.getItem('longspan-theme')
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t)
+      } catch (e) {}
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
