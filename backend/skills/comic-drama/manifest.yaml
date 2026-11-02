@@ -104,7 +104,6 @@ orchestration:
   # 原则：草稿可以粗，但不可以不诚实。
   # -------------------------------------------------------------------------
   draft_gaps:
-    - "角色形象没有锁定：分镜里的角色是按文字锚点临时画的，跨格一致性未经验证"
     - "只出了前 3 格样片，不是全部分镜"
     - "配音只给了方案（音色分配、停顿与重音标注），没有合成音频"
     - "还没有 BGM 与音效点位"
@@ -153,6 +152,14 @@ stages:
       - 格数是否由"总时长 ÷ 每格时长"算出，而不是拍脑袋
       - 预算估算是否给了区间而非精确假数
     demo_file: fixtures/02_spec.json
+    # 数字契约（2026-10-29 用户要求）：「按照用户输入的时长来制定，这是后面所有阶段的
+    # 数字契约，不输入集数，就以用户输入的为准」。
+    # 为什么必须是机器校验：实测 constraints.json 里模型把用户填的 episodes=-18 判成
+    # "无效输入"、自行改成单集 —— 用户输入与模型判断的边界不清，规格就成了"模型觉得
+    # 合理"的规格。校验器逐项对账：总时长落在容差内、格数=总时长÷每格、集数=用户输入。
+    consistency_checks:
+      - kind: spec_duration
+        spec: spec.json
 
   # ---------------- C3 ★ 关卡 ----------------
   - id: script
@@ -183,7 +190,13 @@ stages:
     prompt: prompts/04_characters.md
     tools_available: [write_artifact, record_decision, placeholder_image]
     produces: [characters.md]
-    fast_channel: false
+    # 快通道也跑（2026-10-29 用户拍板）：**角色必须在分镜之前定下来**。
+    # 旧配置把它标成精修专属，于是快通道的实际顺序是
+    #   C3 剧本 → C5 分镜 → C6 配音 …升级… → C4 角色设计
+    # 分镜都画完了才回头定角色，定妆图只能"事后对脸"——实测那一轮 scenes.json 里
+    # 留下了"上游 characters.md 未产出，本阶段拿不到冻结锚点"的降级记录，
+    # 8 格分镜全部画在临时描述上。顺序错不是省钱，是把后面每一格都画在错的锚点上。
+    fast_channel: true
     checkpoint_required: true
     human_approval_default: true          # ← 形象关卡：形象定了才好铺量
     success_criteria:
@@ -208,7 +221,11 @@ stages:
     produces: [storyboard.md, panels.json, scenes.json]
     fast_channel: true
     checkpoint_required: true
-    human_approval_default: false
+    # 样片门禁（2026-10-29 用户要求）：「先出样片，样片出来需要用户可编辑，
+    # 可以点击重新生成」。快通道本来就只出前 3 格（actions.fast_limit），
+    # 但没有门禁时它会一路跑到配音结束，用户看到样片时已经没法低成本纠偏。
+    # 加门禁 = 每集多停一次，换来「先看 3 格再铺量」这个最小可信路径真正生效。
+    human_approval_default: true
     success_criteria:
       - 文件 storyboard.md 存在且非空
       - 至少 600 字
@@ -251,16 +268,15 @@ stages:
         fast_limit: 3
     # 一致性硬校验（FR-02）：分镜格必须复用角色锚点原文，否则判失败重做。
     # 「什么算一致」是漫剧的知识，写在这里（数据），runner 只读声明调校验器。
-    # slow_only: 快通道（草稿）下角色设计阶段未跑、characters.md 不存在，
-    # 跳过校验（草稿诚实性：一致性是精修通道的承诺，见 draft_gaps）。
+    # 2026-10-29：角色设计已进快通道，characters.md 在分镜之前就落盘了，
+    # 所以这条校验不再设 slow_only —— 草稿的分镜同样必须复用锚点原文，
+    # 否则"先画后定角色"的错位会以另一种形式回来。
     #
-    # shot_budget / scene_reference 不设 slow_only：它们是结构约束，
-    # 与"角色有没有锁定"无关，草稿同样必须遵守 —— 否则草稿的分镜结构也是废的。
+    # 四条校验对快慢通道一视同仁：分镜结构错，草稿也没法看。
     consistency_checks:
       - kind: panel_anchor_consistency
         plan: panels.json
         anchors: characters.md
-        slow_only: true
       - kind: shot_budget
         plan: panels.json
       - kind: scene_reference
@@ -271,6 +287,25 @@ stages:
       # （分镜结构错，草稿也没法看），所以不设 slow_only。
       - kind: framing_consistency
         plan: panels.json
+      # 格序契约（2026-10-29 实测事故）：成片的格序必须等于剧本的格序。
+      # 事故：剧本是「修车 1-8 → 点单 9 → 回店 10-12」，分镜为了满足场景预算
+      # （≤3 场景 / A-B-A / 主场景 ≥50%），把「点单」搬到第 4-5 格、修车推到 6-9 格，
+      # 并在 storyboard.md 里主动交代了这次重排。渲染侧完全无辜（时间轴 1→12 严格单调，
+      # 12 段视频首帧与各自分镜图一一对应）—— 错的是分镜搬动了剧情节拍。
+      # 场景预算只能靠「换视距 / 合并场景 / 回 C2 调整」满足，不能靠重排剧情。
+      - kind: story_order
+        plan: panels.json
+        script: script.md
+      # 画风契约（2026-11-02 实测事故）：成片 0:24（格 5/6 分界）起画风从厚涂写实
+      # 突变为日系平涂，人物脸也跟着变。C5 的 panels.json 是对的（12 格全部以
+      # style_anchor 原文开头），坏在生图层改写了规格锚、又前置了硬编码平涂条款，
+      # 与规格锚里的 `no flat cel-shading` 直接对冲 —— 近景格听 anime 条款，
+      # 全景格听厚涂条款，于是逐格随机漂移。
+      # 这条校验把「每格 prompt 必须以 style_anchor 原文开头、且不得另写一套被规格锚
+      # 否定的画风词」变成机器契约：上游一漂就在生图前打回，不烧钱。
+      - kind: style_anchor_consistency
+        plan: panels.json
+        spec: spec.json
 
   # ---------------- C6 ----------------
   # 快通道包含它：配音「方案」是纯文本产出、很便宜，

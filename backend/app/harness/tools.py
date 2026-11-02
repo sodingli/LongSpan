@@ -20,7 +20,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..config import settings
+
 logger = logging.getLogger("longspan.tools")
+
+# 进程级熔断：一旦确认「当前视频模型不吃尾帧」，本进程后续格直接走单首帧。
+# 2026-10-28 实测事故：京东云 Doubao-Seedance-2.5 带 last_frame 一律 HTTP 500
+# （"任务信息落库失败"），8 格里 7 格带尾帧 → 每格 3 次重试全打在同一堵墙上，
+# 21 次提交全部失败、7 格退回静态运镜，整集没有一段真视频。
+# 用可变容器而不是 global，避免在闭包里写 global 声明。
+# 按模型名记账：换了视频模型（例如换成支持尾帧的那档）要重新试，不能一棍子打死。
+_LAST_FRAME_STATE: dict[str, set[str]] = {"broken_models": set()}
+
+
+def _last_frame_unsupported() -> bool:
+    model = str(getattr(settings, "video_model", "") or "").strip()
+    return model in _LAST_FRAME_STATE["broken_models"]
+
+# 判定「这次失败是尾帧不兼容」而不是随机抖动：网关的 500 文案是固定的
+_LAST_FRAME_HINTS = ("last_frame", "尾帧", "任务信息落库失败")
+
+
+def _looks_like_last_frame_reject(exc: BaseException) -> bool:
+    s = str(exc)
+    return any(h in s for h in _LAST_FRAME_HINTS)
 
 # 成品二进制后缀：一律只允许工具产出，禁止模型用 write_artifact 写文本顶替。
 BINARY_DELIVERABLE_EXT = {
@@ -330,6 +353,53 @@ def _item_index(item: dict, fallback: int) -> str:
         return str(fallback)
 
 
+def _prompt_fingerprint(*parts: str) -> str:
+    """提示词指纹：判断"这张图还是不是当前分镜的那张图"的确定性依据。
+
+    为什么需要它（2026-10-30 实测）：分镜阶段重跑后，第 4~9 格的提示词全变了，
+    但 `media/images.json` 只按格号记账 —— 旧实现看到"格 4 有图"就复用，
+    重跑等于没跑，成片还是旧画面。幂等的前提是"输入没变"，不是"文件在"。
+    """
+    import hashlib
+
+    h = hashlib.sha1()
+    for part in parts:
+        h.update(str(part or "").encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def _order_panels(panels: list, notes: list[str] | None = None) -> list[dict]:
+    """按格号稳定排序：成片顺序的唯一权威是**格号**，不是数组下标。
+
+    血泪实例（2026-10-29，用户报"成片顺序和剧本对不上"）：
+    排查先确认了渲染侧无辜（时间轴严格 1→12 单调、12 段视频首帧与各自分镜图
+    SSIM 0.85+ 一一对应），真因是分镜重排了剧情节拍。但排查过程中暴露了一个
+    **潜在**的同类故障：时间轴、链式首尾帧、字幕对位全都按 `enumerate(panels)`
+    的数组顺序走 —— 一旦 panels.json 的数组顺序与 `index` 不一致（模型重写、
+    人工编辑、骨架回填都可能造成），成片顺序就会跟着数组乱掉，而且**没有任何报错**。
+
+    所以这里统一收口：排序稳定（同格号保持原相对次序），真的发生重排时留痕，
+    不静默。非 dict 项直接丢弃（调用方本来也只会 skip 它们）。
+    """
+    keyed: list[tuple[int, int, dict]] = []
+    for pos, p in enumerate(panels):
+        if not isinstance(p, dict):
+            continue
+        try:
+            no = int(_item_index(p, pos + 1))
+        except (TypeError, ValueError):
+            no = pos + 1
+        keyed.append((no, pos, p))
+    ordered = [p for _no, _pos, p in sorted(keyed, key=lambda x: (x[0], x[1]))]
+    if notes is not None and ordered != [p for p in panels if isinstance(p, dict)]:
+        notes.append(
+            "panels.json 的数组顺序与格号不一致，已按格号升序重排后再排时间轴"
+            "（成片顺序以格号为准）"
+        )
+    return ordered
+
+
 def _line_key(item: dict, ordinal: int) -> str:
     """**句级身份** —— 音轨索引、配音文件、时间轴对齐都以它为准。
 
@@ -340,7 +410,12 @@ def _line_key(item: dict, ordinal: int) -> str:
     **6 句台词全程静音、却照样有字幕**（成片看起来"正常"，听感却缺词）。
     格号与句号是两种身份，必须分开取。
     """
-    v = item.get("index", item.get("line_no", item.get("lineNo", item.get("no", item.get("id")))))
+    # `index` **不能**当句号用：C6 提示词明确规定 lines.json 的 `index` 是
+    # 「这句台词所属的格号」。2026-10-30 实测事故：同一格有 2 句台词时，
+    # 两句算出同一个键 → 第 2 句被判成"重复"直接丢弃（11 句只剩 8 条音轨），
+    # 而且音轨还会错配到别的格 —— 成片里"字幕有字、声音念的是别人的词"。
+    # 句号只认显式字段，没有就用数组序号（序号天然唯一，且与台词顺序一致）。
+    v = item.get("line_no", item.get("lineNo", item.get("no", item.get("id"))))
     try:
         return str(int(v))
     except (TypeError, ValueError):
@@ -397,6 +472,26 @@ def _plan_items(plan: Any, key: str) -> tuple[list, str | None]:
 #   能机器保证的事，绝不写成提示词约定 —— 这是 MRD §0.2 的直接执行。
 # --------------------------------------------------------------------------- #
 SCENE_CARDS_REL = "scenes.json"
+
+
+SPEC_REL = "spec.json"
+
+
+def _spec_style_anchor(ctx: ToolContext) -> str | None:
+    """读 C2 在 spec.json 里冻结的**规格风格锚**（style_anchor）。
+
+    2026-10-29 用户要求：「生图提示词缺少风格锚，要严格按照 spec.json 里的风格来确定」。
+    风格锚以前硬编码在 media/image.py —— 等于生图阶段自己说了算：用户把画风改成
+    「日系清新」，生图仍然按国漫赛璐璐补锚，成片和规格对不上。
+    现在以 spec.json 为准，硬编码条款只做兜底（spec 没写 style_anchor 时）。
+    读不到 spec 不阻断生产：C2 没产出风格锚是上游问题，由一致性校验去报。
+    """
+    for rel in (SPEC_REL, "production_spec.json"):
+        doc = _read_json_file(ctx, rel)
+        if isinstance(doc, dict):
+            anchor = str(doc.get("style_anchor") or "").strip()
+            return anchor or None
+    return None
 
 
 def _read_scene_map(ctx: ToolContext) -> dict[str, dict]:
@@ -484,15 +579,17 @@ def _character_art_rel(role: str) -> str:
     return f"characters/{safe or 'unknown'}.jpg"
 
 
-# 定妆图的固定风格强化条款（comic 技能下注入，2026-10-22）。
-# 定妆图是全片 subject_reference 的源头：源头半写实，逐格参考只会把写实带进每一格。
-# 与 image.ensure_style_anchor 的通用锚互补 —— 那层是「缺了才补」的校验，
-# 这层是定妆场景下**无条件**注入的强约束（老人/皱纹/深肤色等描述写实拉力强，必须压住）。
+# 定妆图的固定**构图**条款（comic 技能下注入）。
+#
+# 2026-11-02 修正（用户反馈「成片 0:24 之后风格变了、人物也不一样了」）：
+# 这里**不许写画种**（平涂 / 线稿 / 厚涂 / 赛璐璐…）。定妆图是全片 subject_reference
+# 的源头，它的画风必须和分镜一致 —— 而画风只由 spec.json 的 style_anchor 决定。
+# 旧值写死 "Flat 2D anime character design, thick clean outlines, flat cel shading..."，
+# 与「厚涂写实」规格直接对冲：分镜提示词是厚涂、参考图是平涂，模型在近景/特写格
+# 会跟着参考图走 —— 成片从第 6 格（近景开始）起整体变日系平涂，正是 0:24 的断点。
 CHARACTER_ART_STYLE = (
-    "Flat 2D anime character design, thick clean outlines, uniform flat cel shading, "
-    "simplified anime face with large expressive eyes, no realistic skin texture, no pores, "
-    "no watercolor rendering, no painterly brushwork, no photorealistic face, "
-    "stylized 2D illustration only"
+    "Character design reference sheet, front-facing bust portrait of this single character, "
+    "neutral clean background, centered composition, consistent style, no text, no logo"
 )
 
 
@@ -510,13 +607,20 @@ def _read_character_art(storage: Any, run_id: str, role: str) -> str | None:
     return None
 
 
-def _find_reference_art(
+def _find_reference_arts(
     ctx: Any, prompt: str, action: str | None = None
-) -> tuple[str | None, str | None, list[str]]:
-    """为某一格找到参考图（定妆图）。返回 (绝对路径 | None, 角色标识 | None, 降级说明)。
+) -> tuple[list[str], list[str], list[str]]:
+    """为某一格找到参考图（定妆图）**列表**。返回 (绝对路径列表, 角色标识列表, 降级说明)。
+
+    2026-11-02 修正（用户反馈「人物跟之前不一样了」）：旧实现只返回 1 张参考图
+    （京东云 subject_reference 只支持单张的历史限制），12 格里有 8 格是双人同框，
+    配角永远拿不到定妆图 → 每格重画一张脸。现在按「本格出场角色」返回多张：
+    能多吃几张的通道（openai-compat /images/edits、dashscope-mm）就全送，
+    吃不下的通道如实留痕（见 image._request_via_channel）。
 
     四级查找（2026-10-21 起真实验证教训逐级补齐）：
-    1. 按锚点标签猜文件名（LINYUANZHOU → characters/linyuanzhou.jpg）；
+    1. 按锚点标签猜文件名（LINYUANZHOU → characters/linyuanzhou.jpg）——
+       标签是 C5 约定的「本格用了哪些角色」，同框格的**全部**标签都要收；
     2. **指纹确定性匹配**：锚点前 80 字符作为完整子串出现在 prompt 里 → 确定性定位，
        不依赖标签、也不会跨角色误判（2026-10-23 换脸根因修复）；
     2b. 逐子句探针匹配（指纹未命中的退路，带区分度阈值防跨角色误判）；
@@ -535,23 +639,33 @@ def _find_reference_art(
 
     if is_empty_shot(prompt):
         notes.append("本格判定为空镜，已跳过人物参考图")
-        return None, None, notes
+        return [], [], notes
 
-    # 第 1 级：标签 → 文件名
-    for tag in tags:
-        art = _read_character_art(ctx.storage, ctx.run_id, tag)
-        if art:
-            return art, tag, notes
-
-    # 第 2 级：内容匹配（锚点原文出现在 prompt 里 → 找到对应 anchor_N 定妆图）。
-    # 注意：**不依赖标签** —— 真实验证发现模型可能完全不写标签、直接把锚点原文
-    # 抄进 prompt 开头，此时内容匹配是唯一的定位手段。
     chars_md = ""
     try:
         if ctx.storage.exists(ctx.run_id, "characters.md"):
             chars_md = ctx.storage.read_text(ctx.run_id, "characters.md") or ""
     except Exception:  # noqa: BLE001
         chars_md = ""
+
+    # 本格出场角色（按确定性优先级收集，去重保序）
+    picked: list[str] = []
+    missing_art: list[str] = []
+
+    def _add(role: str) -> None:
+        key = (role or "").strip()
+        if not key or key in picked:
+            return
+        if _read_character_art(ctx.storage, ctx.run_id, key):
+            picked.append(key)
+        elif key not in missing_art:
+            missing_art.append(key)
+
+    # 第 1 级：标签 → 文件名（同框格的全部标签都收）
+    for tag in tags:
+        _add(tag)
+
+    anchors: dict[str, str] = {}
     if chars_md:
         from .consistency import _anchor_substring, extract_anchors
 
@@ -576,55 +690,54 @@ def _find_reference_art(
             fp = _anchor_substring(val)
             if fp and fp in seg:
                 fp_hits.append((key, len(fp)))
-        if fp_hits:
-            # 多个角色同格时取指纹最长（信息量最大）的那个；其余角色由 prompt
-            # 里各自的标签在第 1 级/内容里另行定位。
-            key, fplen = max(fp_hits, key=lambda t: t[1])
-            art = _read_character_art(ctx.storage, ctx.run_id, key)
-            if art:
-                notes.append(
-                    f"参考图按锚点指纹确定性匹配（{fplen} 字符逐字命中）定位到 {key}"
-                )
-                return art, key, notes
+        # 同框格会有多个角色的指纹同时命中 —— 全部收下（按命中长度降序，
+        # 主导角色排第一，供一致性抽检与留痕使用）。
+        before = list(picked)
+        for key, _fplen in sorted(fp_hits, key=lambda t: t[1], reverse=True):
+            _add(key)
+        newly = [k for k in picked if k not in before]
+        if newly:
+            notes.append(
+                "参考图按锚点指纹确定性匹配：" + "、".join(newly)
+            )
 
         # ── 2b. 逐子句探针匹配（指纹没命中时的退路，加区分度阈值防跨角色误判）──
         # 旧逻辑只按「最高分」选角色，当两个角色的锚点共享通用词时（马甲/头盔/
-        # 蓝色…）会被错误地选到相似度略高的那个。这里要求最高分必须**显著高于
-        # 次高分**（区分度 ≥1.5× 或领先 ≥40 字符），否则判「角色混淆」——
+        # 蓝色…）会被错误地选到相似度略高的那个。这里要求最高分必须**显著高于**
+        # 次高分（区分度 ≥1.5× 或领先 ≥40 字符），否则判「角色混淆」——
         # 宁可走第 3 级兜底 + 告警，也绝不把参考图传错人（传错人 = 确定性换脸）。
-        best_key, best_score, second_score = None, 0.0, 0.0
-        for key, val in anchors.items():
-            if not val:
-                continue
-            chunks = [c.strip() for c in val.split(",") if c.strip()]
-            hits, hit_len = 0, 0
-            for c in chunks:
-                if len(c) >= 6 and c in seg:
-                    hits += 1
-                    hit_len += len(c)
-            score = float(hit_len) if hits >= 2 else 0.0
-            if score > best_score:
-                second_score = best_score
-                best_key, best_score = key, score
-            elif score > second_score:
-                second_score = score
-        if best_key and best_score >= 20:
-            # 区分度阈值：最高分须显著领先次高分，否则角色混淆、宁可放弃
-            ambiguous = second_score > 0 and (
-                best_score < second_score * 1.5 and (best_score - second_score) < 40
-            )
-            if ambiguous:
-                notes.append(
-                    f"参考图定位歧义：最高分 {best_key}({best_score:.0f}) 与次高分"
-                    f"({second_score:.0f}) 区分度不足，可能跨角色误判，本格不盲目带参考图"
+        if not fp_hits:
+            best_key, best_score, second_score = None, 0.0, 0.0
+            for key, val in anchors.items():
+                if not val:
+                    continue
+                chunks = [c.strip() for c in val.split(",") if c.strip()]
+                hits, hit_len = 0, 0
+                for c in chunks:
+                    if len(c) >= 6 and c in seg:
+                        hits += 1
+                        hit_len += len(c)
+                score = float(hit_len) if hits >= 2 else 0.0
+                if score > best_score:
+                    second_score = best_score
+                    best_key, best_score = key, score
+                elif score > second_score:
+                    second_score = score
+            if best_key and best_score >= 20:
+                # 区分度阈值：最高分须显著领先次高分，否则角色混淆、宁可放弃
+                ambiguous = second_score > 0 and (
+                    best_score < second_score * 1.5 and (best_score - second_score) < 40
                 )
-            else:
-                art = _read_character_art(ctx.storage, ctx.run_id, best_key)
-                if art:
+                if ambiguous:
+                    notes.append(
+                        f"参考图定位歧义：最高分 {best_key}({best_score:.0f}) 与次高分"
+                        f"({second_score:.0f}) 区分度不足，可能跨角色误判，本格不盲目带参考图"
+                    )
+                else:
+                    _add(best_key)
                     notes.append(
                         f"参考图按锚点内容匹配（命中长度 {best_score:.0f} 字符）定位到 {best_key}"
                     )
-                    return art, best_key, notes
 
     # 第 3 级：action 角色名确定性匹配（2026-10-23 新增）。
     # prompt 完全没复用锚点原文时（指纹/逐子句都命中不了），用分镜 action 里的
@@ -632,7 +745,7 @@ def _find_reference_art(
     # （如「陆子昂站在评审台前」），角色名与 characters.md 标题顺序对齐 anchor_N。
     # 只有当「角色名数 == 锚点数」且 action 里唯一命中一个角色名时才敢用 ——
     # 顺序错位或命中多个角色名（同框格）都判不可靠，宁可放弃也不猜。
-    if action and chars_md:
+    if not picked and action and chars_md and anchors:
         from .consistency import extract_role_names
 
         role_names = extract_role_names(chars_md)
@@ -641,12 +754,10 @@ def _find_reference_art(
             hits = [i for i, name in enumerate(role_names) if name and name in action]
             if len(hits) == 1:
                 key = anchor_keys[hits[0]]
-                art = _read_character_art(ctx.storage, ctx.run_id, key)
-                if art:
-                    notes.append(
-                        f"参考图按 action 角色名「{role_names[hits[0]]}」确定性定位到 {key}"
-                    )
-                    return art, key, notes
+                _add(key)
+                notes.append(
+                    f"参考图按 action 角色名「{role_names[hits[0]]}」确定性定位到 {key}"
+                )
 
     # 第 4 级：兜底 —— 定妆图仅一张时盲兜底；多张时宁可放弃也不传错人。
     # 关键修复（2026-10-23，两段）：
@@ -657,31 +768,51 @@ def _find_reference_art(
     #       危害远大于「不带参考图」（纯文生图至少不会画成另一个人）。所以：
     #       定妆图 == 1 张时才盲兜底；>= 2 张时若定位失败就**不带参考图 + 告警**，
     #       把「谁是谁」的决断留给确定性手段（指纹/标签），绝不靠猜。
-    try:
-        files = ctx.storage.list_files(ctx.run_id)
-    except Exception:  # noqa: BLE001
-        files = []
-    arts = sorted(f for f in files if f.startswith("characters/") and f.endswith((".jpg", ".png")))
-    if len(arts) == 1:
-        why = f"按标签（{','.join(tags)}）" if tags else "未识别到角色标签"
-        role_clean = re.sub(r"^characters/|\.(jpg|jpeg|png|webp)$", "", arts[0])
+    if not picked:
+        try:
+            files = ctx.storage.list_files(ctx.run_id)
+        except Exception:  # noqa: BLE001
+            files = []
+        arts = sorted(f for f in files if f.startswith("characters/") and f.endswith((".jpg", ".png")))
+        if len(arts) == 1:
+            why = f"按标签（{','.join(tags)}）" if tags else "未识别到角色标签"
+            role_clean = re.sub(r"^characters/|\.(jpg|jpeg|png|webp)$", "", arts[0])
+            notes.append(
+                f"参考图{why}或内容匹配均未定位，全片仅一张定妆图，兜底使用 {arts[0]}"
+            )
+            return [str(ctx.storage.abs_path(ctx.run_id, arts[0]))], [role_clean], notes
+        if len(arts) > 1:
+            notes.append(
+                f"参考图定位失败：本格含人物，但 {len(arts)} 张定妆图里无法确定性定位角色"
+                "（无标签、锚点指纹未命中），为避免传错人导致确定性换脸，本格不带参考图，"
+                "交由一致性抽检兜底告警"
+            )
+            return [], [], notes
         notes.append(
-            f"参考图{why}或内容匹配均未定位，全片仅一张定妆图，兜底使用 {arts[0]}"
+            f"{'识别到角色标签（' + ','.join(tags) + '）但' if tags else ''}没有任何定妆图可用，本格未带参考图"
         )
-        return str(ctx.storage.abs_path(ctx.run_id, arts[0])), role_clean, notes
-    if len(arts) > 1:
+        return [], [], notes
+
+    if missing_art:
         notes.append(
-            f"参考图定位失败：本格含人物，但 {len(arts)} 张定妆图里无法确定性定位角色"
-            "（无标签、锚点指纹未命中），为避免传错人导致确定性换脸，本格不带参考图，"
-            "交由一致性抽检兜底告警"
+            "本格出场角色中 "
+            + "、".join(missing_art)
+            + " 还没有定妆图，这些角色本格无参考图（先跑 C4 角色设计）"
         )
-        return None, None, notes
+    refs = [p for p in (_read_character_art(ctx.storage, ctx.run_id, r) for r in picked) if p]
+    return refs, picked, notes
 
-    notes.append(
-        f"{'识别到角色标签（' + ','.join(tags) + '）但' if tags else ''}没有任何定妆图可用，本格未带参考图"
-    )
-    return None, None, notes
 
+def _find_reference_art(
+    ctx: Any, prompt: str, action: str | None = None
+) -> tuple[str | None, str | None, list[str]]:
+    """单参考图兼容包装（画布单帧重生成等只想要一张的调用方）。
+
+    新代码请用 _find_reference_arts —— 同框格必须把每个出场角色的定妆图都送进去，
+    只送一张 = 配角每格重画一张脸。
+    """
+    refs, roles, notes = _find_reference_arts(ctx, prompt, action)
+    return (refs[0] if refs else None), (roles[0] if roles else None), notes
 
 async def _inspect_and_maybe_redraw(
     ctx: ToolContext,
@@ -691,6 +822,7 @@ async def _inspect_and_maybe_redraw(
     ratio: str,
     model_ov: str | None,
     service_ov: str | None,
+    subject_refs: list[str] | None = None,
 ) -> dict:
     """生图后的多模态自检：检出构图残缺（如"无头半身"）→ 补取景声明重画一次。
 
@@ -705,7 +837,6 @@ async def _inspect_and_maybe_redraw(
 
     返回 {"out": 最终采用的结果, "detail": 视觉判定留痕, "notes": 降级说明}。
     """
-    from ..config import settings
     from ..media.image import generate_image
     from ..media.vision_check import inspect_image, patch_framing_prompt
 
@@ -752,9 +883,12 @@ async def _inspect_and_maybe_redraw(
         notes.append(f"第 {key} 格被否的原图留档失败（不影响重画）")
 
     notes.append(f"第 {key} 格已补取景声明重画一次")
+    # 重画必须带上同一批参考图（2026-11-02 修）：旧实现漏传 subject_reference，
+    # 视觉自检触发的重画等于换了一张脸重画 —— 越"修"越不像。
     out2 = await generate_image(
         ctx.storage, ctx.run_id, patched, out["path"], ratio,
         model_override=model_ov, service_override=service_ov,
+        subject_reference=subject_refs or None,
     )
     out2["index"] = out.get("index", key)
     out2["vision_retry"] = {"prompt_patched": True, "first_issue": issue}
@@ -818,14 +952,19 @@ async def _generate_images(
             "expected": '{"panels":[{"index":1,"prompt":"画面提示词","ratio":"9:16"}]}',
             "hint": "上游必须先产出 panels.json；缺它说明本阶段未完成，应由验收标准判失败并重做。",
         }
+    # 成片顺序以格号为准（数组顺序可能被重写/编辑打乱，见 _order_panels）
+    order_notes: list[str] = []
+    panels = _order_panels(panels, order_notes)
     if fast_limit and ctx.extra.get("channel") == "fast":
         panels = panels[: int(fast_limit)]
 
     index: dict[str, dict] = _read_json_file(ctx, IMAGE_INDEX_REL) or {}
     scene_map = _read_scene_map(ctx)
+    # 规格风格锚（spec.json）：全片画风的唯一来源，逐格强制原文复用。
+    spec_style_anchor = _spec_style_anchor(ctx)
     created: list[str] = []
     reused: list[str] = []
-    degraded: list[str] = []
+    degraded: list[str] = list(order_notes)
     if shape_note:
         degraded.append(f"panels.json {shape_note}")
 
@@ -842,47 +981,22 @@ async def _generate_images(
             p.get("prompt") or p.get("image_prompt") or p.get("scene") or p.get("description") or ""
         ).strip()
         ratio = str(p.get("ratio") or "9:16")
-        prev = index.get(key) or {}
-        if prev.get("path") and ctx.storage.exists(ctx.run_id, prev["path"]):
-            reused.append(prev["path"])
-            # 历史图补检：视觉自检是 2026-10-22 才有的，之前的图从没被"看过"，
-            # 复用它们等于把没验过的画面继续带进成片。这里只判定不重画 ——
-            # 重画属于"改产物"，由人工或整阶段重跑决定（不替用户做决定）。
-            if not prev.get("vision") and not prev.get("is_placeholder"):
-                from ..media.vision_check import inspect_image
-                from .consistency import _FRAMING_DECL_RE
-
-                try:
-                    v = await inspect_image(
-                        ctx.storage.abs_path(ctx.run_id, prev["path"]),
-                        allow_headless=bool(_FRAMING_DECL_RE.search(prompt or "")),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    v = {"checked": False, "ok": True, "reason": f"补检异常：{exc}"}
-                if v.get("checked"):
-                    prev = {**prev, "vision": v}
-                    index[key] = prev
-                    if not v.get("ok"):
-                        degraded.append(
-                            f"第 {key} 格历史分镜图视觉自检未通过：{v.get('issue')}"
-                            "（未重画，请人工确认是否重跑该格）"
-                        )
-                else:
-                    degraded.append(
-                        f"第 {key} 格历史分镜图未做视觉自检：{str(v.get('reason') or '')[:140]}"
-                    )
-            continue
         if not prompt:
             degraded.append(f"第 {key} 格缺少画面提示词，已跳过（不算完成）")
             continue
 
+        # ---- 提示词准备（纯函数，不调模型）----
+        # 必须放在复用判定**之前**：复用判据要拿「实际会送进模型的提示词」算指纹。
+        # 2026-10-30 实测：分镜重写后第 4~9 格的提示词全变了，旧实现只按格号判
+        # "这格已经有图了"就复用 —— 重跑出来的成片还是旧画面，等于没修。
+        #
         # 人物一致性（FR-04）：识别该格用到的角色锚点标签，映射定妆图做参考图。
-        # 四级查找（标签 → 指纹确定性匹配 → action 角色名 → 单图兜底），见 _find_reference_art。
-        # 京东云 subject_reference 当前只支持 1 张参考图 → 多角色格取第一个命中的角色。
+        # 四级查找（标签 → 指纹确定性匹配 → action 角色名 → 单图兜底），见 _find_reference_arts。
+        # 2026-11-02：同框格返回**全部**出场角色的定妆图（旧实现只取第一个命中的角色，
+        # 双人同框格里配角永远没有参考图 → 每格重画一张脸）。
         # action 字段（中文角色名）是「prompt 完全没复用锚点」时的最后确定性兜底。
         panel_action = str(p.get("action") or p.get("beat") or "").strip()
-        subject_ref, ref_role, ref_notes = _find_reference_art(ctx, prompt, panel_action)
-        degraded.extend(ref_notes)
+        subject_refs, ref_roles, ref_notes = _find_reference_arts(ctx, prompt, panel_action)
         # 锚点标签是机器路标，不是画面内容 —— 送生图前剥掉，避免污染生成结果
         clean_prompt = _strip_anchor_tags(prompt) or prompt
 
@@ -890,45 +1004,95 @@ async def _generate_images(
         # 声明，否则模型按"画面要有人"的默认倾向补出陌生人（实测：空镜"小船驶向
         # 雾中"画出蓝发少女，成片结尾凭空多一个人）。声明由工具确定性注入 ——
         # 这件事不能指望模型自觉写（MRD §7.4 原则 4）。
-        # **必须在风格锚之前**：风格锚会给提示词补 "anime face with large expressive
-        # eyes"，一句话就把空镜判定打回"有人物"，守卫从此失效（实测踩到）。
+        # **必须在风格锚之前**：风格锚会补角色/画风条款，一句话就可能把空镜判定
+        # 打回"有人物"，守卫从此失效（实测踩到）。
         clean_prompt, empty_note = _apply_empty_shot_guard(clean_prompt)
-        if empty_note:
-            degraded.append(f"第 {key} 格：{empty_note}")
 
         # 风格锚校验（FR-04 补充）：漫剧类技能的生图提示词缺「反写实 / 角色风格化」
         # 条款就在开头补齐并留痕 —— 模型漏写不等于允许写实漂移（2026-10-20 实测教训）。
         style_note = None
         if str(ctx.extra.get("skill_id") or "") in COMIC_STYLE_SKILLS:
-            clean_prompt, style_note = ensure_style_anchor(clean_prompt)
-            if style_note:
-                degraded.append(f"第 {key} 格：{style_note}")
+            clean_prompt, style_note = ensure_style_anchor(clean_prompt, spec_style_anchor)
 
         # 场景锚点：确定性注入（PRD FR-02）。不注入 = 每格重新描述背景 = 世界漂移。
         clean_prompt, scene_note = _apply_scene_anchor(p, clean_prompt, scene_map, key)
+
+        # 指纹 = 实际送进模型的提示词 + 参考图角色。任一变化，这张图就不再代表当前分镜。
+        want_fp = _prompt_fingerprint(clean_prompt, "+".join(ref_roles))
+
+        prev = index.get(key) or {}
+        if prev.get("path") and ctx.storage.exists(ctx.run_id, prev["path"]):
+            have_fp = str(prev.get("prompt_fingerprint") or "")
+            if not have_fp:
+                # 历史图（本机制上线前生成）没有指纹：无法证明与当前分镜一致。
+                # 宁可重画一次，也不能把"可能已经对不上"的画面继续带进成片。
+                degraded.append(
+                    f"第 {key} 格的历史分镜图没有提示词指纹，无法确认与当前分镜一致，已重新生成"
+                )
+            elif have_fp != want_fp:
+                degraded.append(f"第 {key} 格的提示词已变更，旧图不再复用，重新生成")
+            else:
+                reused.append(prev["path"])
+                # 历史图补检：视觉自检是 2026-10-22 才有的，之前的图从没被"看过"，
+                # 复用它们等于把没验过的画面继续带进成片。这里只判定不重画 ——
+                # 重画属于"改产物"，由人工或整阶段重跑决定（不替用户做决定）。
+                if not prev.get("vision") and not prev.get("is_placeholder"):
+                    from ..media.vision_check import inspect_image
+                    from .consistency import _FRAMING_DECL_RE
+
+                    try:
+                        v = await inspect_image(
+                            ctx.storage.abs_path(ctx.run_id, prev["path"]),
+                            allow_headless=bool(_FRAMING_DECL_RE.search(prompt or "")),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        v = {"checked": False, "ok": True, "reason": f"补检异常：{exc}"}
+                    if v.get("checked"):
+                        prev = {**prev, "vision": v}
+                        index[key] = prev
+                        if not v.get("ok"):
+                            degraded.append(
+                                f"第 {key} 格历史分镜图视觉自检未通过：{v.get('issue')}"
+                                "（未重画，请人工确认是否重跑该格）"
+                            )
+                    else:
+                        degraded.append(
+                            f"第 {key} 格历史分镜图未做视觉自检：{str(v.get('reason') or '')[:140]}"
+                        )
+                continue
+
+        degraded.extend(ref_notes)
+        if empty_note:
+            degraded.append(f"第 {key} 格：{empty_note}")
+        if style_note:
+            degraded.append(f"第 {key} 格：{style_note}")
         if scene_note:
             degraded.append(scene_note)
 
         out = await generate_image(
             ctx.storage, ctx.run_id, clean_prompt, f"panels/panel-{i:02d}.svg", ratio,
             model_override=model_ov, service_override=service_ov,
-            subject_reference=subject_ref,
+            subject_reference=subject_refs or None,
         )
         out["index"] = key
+        # 指纹随图落盘：下次复用前先比对，提示词变了就不复用（见上）。
+        out["prompt_fingerprint"] = want_fp
         # 留痕：记录**实际送进模型**的提示词（含自动补齐的风格锚 + 场景锚，
         # 以及审核拦截后的软化版本）。generate_image 已写入它时不覆盖 ——
         # 软化后的 prompt 才是"这格为什么长这样"的真相；没有它就只能靠猜。
         out.setdefault("prompt_used", clean_prompt[:1200])
         if scene_note:
             out["scene_note"] = scene_note
-        if ref_role:
-            out["subject_reference_role"] = ref_role
+        if ref_roles:
+            # 单角色字段保留（历史产物/前端兼容），多角色另存一份列表
+            out["subject_reference_role"] = ref_roles[0]
+            out["subject_reference_roles"] = list(ref_roles)
 
         # 多模态后检（唯一会「看图」的一层）：文本校验防不了"画没画对"。
         # 检出构图残缺（实测：无头半身）→ 补取景声明重画一次；检查本身失败不阻断。
         original_out = out
         vision = await _inspect_and_maybe_redraw(
-            ctx, out, clean_prompt, key, ratio, model_ov, service_ov
+            ctx, out, clean_prompt, key, ratio, model_ov, service_ov, subject_refs
         )
         out = vision["out"]
         degraded.extend(vision["notes"])
@@ -939,7 +1103,8 @@ async def _generate_images(
         # 不查"是不是那个人"；这里用视觉模型比对分镜人物与定妆图是否同人。
         # 结论只留痕 + 告警，不触发重画 —— 判定标准一旦能阻断，就会诱导
         # "改阈值"而不是"改质量"（MRD §0.6 判定线是决策依据，不是门禁）。
-        cons = await _consistency_sampling(ctx, out, subject_ref)
+        # 一致性抽检用「主导角色」（列表第一位）的定妆图做比对基准
+        cons = await _consistency_sampling(ctx, out, subject_refs[0] if subject_refs else None)
         if cons.get("checked"):
             out["consistency"] = cons
             if cons.get("found") and cons.get("same", 5) <= 2:
@@ -1080,6 +1245,10 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
     images: dict[str, dict] = _read_json_file(ctx, IMAGE_INDEX_REL) or {}
     workspace = ctx.storage.run_workspace(ctx.run_id)
 
+    # 链式首尾帧的"下一格"必须按格号取，否则链会接错画面（见 _order_panels）
+    order_notes: list[str] = []
+    panels = _order_panels(panels, order_notes)
+
     # 按清单顺序取格号；只有带分镜图的格才进链条（链的锚点就是分镜图）
     ordered: list[tuple[str, dict]] = []
     for i, p in enumerate(panels, 1):
@@ -1090,7 +1259,12 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
         frame_path = str(img.get("path") or "").strip()
         if not frame_path or not ctx.storage.exists(ctx.run_id, frame_path):
             continue
-        ordered.append((key, {"panel": p, "frame": frame_path}))
+        ordered.append((key, {
+            "panel": p,
+            "frame": frame_path,
+            # 图片指纹：片段是否还能复用，取决于"它当初是从哪张图生成的"
+            "fp": str(img.get("prompt_fingerprint") or ""),
+        }))
 
     if not ordered:
         return {"degraded": ["没有任何格带分镜图，无法视频化"], "generated": 0, "reused": 0}
@@ -1101,6 +1275,7 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
     reused: list[str] = []
     degraded: list[str] = []
     chained_flags: dict[str, bool] = {}  # 本轮每格是否带尾帧锚（从生成结果记，不读过期快照）
+    degraded.extend(order_notes)
     if shape_note:
         degraded.append(f"panels.json {shape_note}")
 
@@ -1109,26 +1284,51 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
         p = item["panel"]
         img = images.get(key) or {}
         clip = img.get("video") if isinstance(img.get("video"), dict) else {}
-        # 复用条件：ready + 文件在 + （链式模式下）片段本身是带尾帧锚点生成的。
-        # 旧的关键格片段没有 chained 标记 —— 它的结尾不是下一格开场，复用必跳变。
-        chained_ok = (not chain_enabled) or bool(clip.get("chained"))
+        # 复用条件：ready + 文件在 + 片段的「尾帧锚点状态」与本格预期一致。
+        # 为什么按格比对而不是「链式模式下必须有 chained」：
+        #   ① 最后一格本来就没有下一格，它的片段天然 chained=false ——
+        #      旧判据会把它判成"不可复用"，于是每轮重跑都重新生成一次（重复计费）；
+        #   ② 尾帧被模型拒绝而降级成单首帧的格，重试也只会得到同样的结果，
+        #      记了 chain_fallback 就直接复用，不再白烧一次。
+        want_chain = chain_enabled and pos + 1 < len(ordered)
+        chained_ok = (bool(clip.get("chained")) == want_chain) or bool(clip.get("chain_fallback"))
+
+        # 视频专用提示词：消费 motion/action/shot_size 字段 + 剥离锚点标签。
+        # 旧实现只用静态生图的 prompt，把运镜/动作/景别全丢了（根因修复，见 _build_video_prompt）。
+        base_prompt = _build_video_prompt(p)
+
+        # 片段指纹 = 本格图片指纹 + 下一格图片指纹 + 视频提示词。
+        # 为什么必须比指纹（2026-10-30 实测）：分镜重写后图片全部重画，但片段仍按
+        # 「格号 + chained 标记」复用 —— 成片里是新图配旧视频，画面直接对不上。
+        # 首尾帧链的"下一格"也参与指纹：下一格换图，本格的尾帧锚点就变了。
+        next_fp = ordered[pos + 1][1]["fp"] if pos + 1 < len(ordered) else ""
+        want_fp = _prompt_fingerprint(item["fp"], next_fp, base_prompt)
+
         if (
             str(clip.get("status") or "") == "ready"
             and clip.get("path")
             and chained_ok
             and ctx.storage.exists(ctx.run_id, clip["path"])
         ):
-            reused.append(key)
-            chained_flags[key] = bool(clip.get("chained"))
-            return
+            have_fp = str(clip.get("source_fingerprint") or "")
+            if not have_fp:
+                degraded.append(
+                    f"第 {key} 格的历史视频片段没有来源指纹，无法确认与当前分镜一致，已重新生成"
+                )
+            elif have_fp != want_fp:
+                degraded.append(f"第 {key} 格的分镜图/提示词已变更，旧视频片段不再复用，重新生成")
+            else:
+                reused.append(key)
+                chained_flags[key] = bool(clip.get("chained"))
+                return
 
-        # 视频专用提示词：消费 motion/action/shot_size 字段 + 剥离锚点标签。
-        # 旧实现只用静态生图的 prompt，把运镜/动作/景别全丢了（根因修复，见 _build_video_prompt）。
-        base_prompt = _build_video_prompt(p)
+        # 单首帧版本：尾帧不可用（模型不支持 / 最后一格）时的兜底提示词。
+        # 必须单独准备 —— 带"定格到尾帧"措辞的提示词配单首帧请求，模型会自己脑补一个结尾。
+        single_prompt = f"{base_prompt}\n\n画面从首帧开始，动作自然完整，保持人物与画风一致。"[:1200]
 
         # 链式尾帧：本格片段必须收在下一格的开场画面上
         last_frame: str | None = None
-        if chain_enabled and pos + 1 < len(ordered):
+        if chain_enabled and pos + 1 < len(ordered) and not _last_frame_unsupported():
             next_key, next_item = ordered[pos + 1]
             next_scene = str(
                 next_item["panel"].get("scene") or next_item["panel"].get("prompt") or ""
@@ -1141,39 +1341,67 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
                 "首帧与尾帧是同一连贯镜头的起点与落点，人物身份、服装与画风全程一致。"
             )[:1200]
         else:
-            prompt = f"{base_prompt}\n\n画面从首帧开始，动作自然完整，保持人物与画风一致。"[:1200]
+            prompt = single_prompt
 
-        # 审核/网关有随机性：同一张图此前过审、这次被拦的实例真实存在
-        # （火山内容审核对半写实人脸的判定不稳定）。每格最多 3 次尝试，
-        # 全失败才退回静态 —— 重试是廉价的，静默放弃一格动效才是贵的。
+        # 尝试计划：先按链式首尾帧试 2 次（网关有随机抖动），仍不行就退回单首帧 2 次。
+        # 为什么必须降级而不是死磕同一条报文：尾帧不被支持时，重试只是把同一个 500
+        # 再买一次（2026-10-28 实测：7 格 × 3 次 = 21 次提交全 500，一格没成）。
+        # 宁可少一次"无缝衔接"，也不能让整集退回静态图。
+        plans: list[tuple[str, str | None]] = []
+        if last_frame:
+            plans.append((prompt, last_frame))
+            plans.append((prompt, last_frame))
+        plans.append((single_prompt, None))
+        plans.append((single_prompt, None))
+
         out: dict[str, Any] | None = None
         last_err: Exception | None = None
-        for attempt in range(3):
+        used_last: str | None = None
+        for attempt, (use_prompt, use_last) in enumerate(plans):
             if attempt:
                 await asyncio.sleep(2.0 * attempt)
             try:
                 out = await generate_clip(
                     workspace,
-                    prompt=prompt,
+                    prompt=use_prompt,
                     first_frame=item["frame"],
-                    last_frame=last_frame,
+                    last_frame=use_last,
                     reference_video=None,
                     duration=5,
                     mode=None,
                     out_rel=f"panels/panel-{key}.mp4",
                     model=None,
                 )
+                used_last = use_last
                 break
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
+                if use_last and _looks_like_last_frame_reject(exc) and not _last_frame_unsupported():
+                    # 熔断：本进程后续格不再尝试尾帧，省掉每格两次必败的提交
+                    _LAST_FRAME_STATE["broken_models"].add(
+                        str(getattr(settings, "video_model", "") or "").strip()
+                    )
+                    degraded.append(
+                        "视频模型不支持尾帧（last_frame）请求，本集后续格改用单首帧生成；"
+                        "格间衔接由渲染端 crossfade 兜底"
+                    )
                 logger.warning("格 %s 视频化第 %s 次失败 run=%s: %s", key, attempt + 1, ctx.run_id, exc)
         if out is not None:
-            out.update({"status": "ready", "prompt": prompt[:300], "chained": bool(last_frame)})
+            chained = bool(used_last)
+            out.update({"status": "ready", "prompt": (prompt if chained else single_prompt)[:300],
+                        "chained": chained,
+                        # 来源指纹随片段落盘：下次复用前先比对（见上）
+                        "source_fingerprint": want_fp})
+            if last_frame and not chained:
+                # 明确记下"这是降级产物"：复用判据靠它，人工复核也靠它
+                out["chain_fallback"] = True
             set_panel_video(ctx.storage, ctx.run_id, key, out)
             generated.append(key)
-            chained_flags[key] = bool(last_frame)
+            chained_flags[key] = chained
         else:
-            degraded.append(f"第 {key} 格视频生成失败（重试 3 次），退回静态运镜：{str(last_err)[:200]}")
+            degraded.append(
+                f"第 {key} 格视频生成失败（尾帧/单首帧各重试后仍失败），退回静态运镜：{str(last_err)[:200]}"
+            )
 
     # 限流并行：每段独立提交（锚点都是静态分镜图，无依赖），3 路并发
     # 是对网关限流与下游排队的安全余量。
@@ -1203,7 +1431,34 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
     }
 
 
-async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) -> dict:
+def _clear_character_art(storage: Any, run_id: str, role: str) -> list[str]:
+    """删掉某个角色已有的定妆图（重生成前先清，避免新旧两张同时存在）。
+
+    为什么必须清：`_read_character_art` 按 .jpg → .png 的顺序探测，重生成若换了
+    扩展名（服务端返回 png、旧图是 jpg），旧图会先被命中 —— 用户点了「重新生成」，
+    逐格生图用的却还是旧脸，而且没有任何报错。这是最难查的一类"改了没用"。
+    """
+    safe = re.sub(r"[^a-z0-9_\-]", "", (role or "").lower())
+    removed: list[str] = []
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        rel = f"characters/{safe or 'unknown'}{ext}"
+        if not storage.exists(run_id, rel):
+            continue
+        try:
+            storage.abs_path(run_id, rel).unlink()
+            removed.append(rel)
+        except OSError:
+            logger.warning("删除旧定妆图失败：%s", rel)
+    return removed
+
+
+async def _generate_character_art(
+    ctx: ToolContext,
+    plan: dict | None = None,
+    *,
+    force: bool = False,
+    roles: list[str] | None = None,
+) -> dict:
     """FR-03：为每个角色生成定妆图（人物参考图），落盘 characters/{角色}.jpg。
 
     定妆图是后续 C5 逐格生图的**参考图来源**（subject_reference），从根上解决换脸。
@@ -1211,6 +1466,12 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
     - 每个角色用其锚点原文作为 prompt 生一张定妆图（正面、半身、画风锚可选）
     - 幂等：定妆图已存在则复用，不重复生（也不重复计费）
     - 降级诚实：真实生图不可用 → 程序化分镜卡 + 标注，参考图通道随之降级为「仅锚点文字」
+
+    2026-10-29 新增（用户要求「角色设定后，可以对角色的提示词进行更改，可以点击重新生成」）：
+    - `force=True`：忽略已存在的定妆图，强制重画（先清旧图，避免新旧并存）；
+    - `roles=[...]`：只处理指定角色（画布上单角色重生成，不牵连其他角色、不重复计费）；
+    - **单角色提示词覆盖**：`characters/art_prompts.json` 里按角色存用户改过的提示词，
+      有覆盖就用覆盖（锚点原文只作兜底）—— 用户改完提示词点重生成，改的必须生效。
 
     plan 参数预留（当前从 characters.md 直接提取锚点，不依赖额外清单）。
     """
@@ -1246,9 +1507,31 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
             "skipped": skipped_noncharacter,
         }
 
+    # 单角色重生成：只处理点名的角色（其余角色不重画、不重复计费）
+    wanted = [str(r).strip().lower() for r in (roles or []) if str(r).strip()]
+    if wanted:
+        # 锚点标签是 CHENMO（大写），画布传的是 chenmo（小写）—— 大小写不敏感匹配
+        missing = [r for r in wanted if r not in {k.lower() for k in anchors}]
+        anchors = {k: v for k, v in anchors.items() if k.lower() in wanted}
+        if not anchors:
+            return {
+                "error": f"characters.md 里没有这些角色：{'、'.join(missing)}",
+                "roles": list(anchors.keys()),
+                "hint": "角色标识取 characters.md 二级标题里的英文锚点标签（小写）。",
+            }
+
+    # 用户改过的单角色提示词（画布「改提示词 → 重新生成」的落点）
+    try:
+        from ..canvas_store import load_character_art_prompts
+
+        art_prompts = load_character_art_prompts(ctx.storage, ctx.run_id)
+    except Exception:  # noqa: BLE001 —— 读不到覆盖不该阻断生图
+        art_prompts = {}
+
     img_cfg = ctx.extra.get("image_config") or {} if isinstance(ctx.extra, dict) else {}
     model_ov = str(img_cfg.get("model") or "").strip() or None
     service_ov = str(img_cfg.get("service") or "").strip() or None
+    spec_style_anchor = _spec_style_anchor(ctx)
 
     created: list[str] = []
     reused: list[str] = []
@@ -1261,29 +1544,21 @@ async def _generate_character_art(ctx: ToolContext, plan: dict | None = None) ->
     style_gate = str(ctx.extra.get("skill_id") or "") in COMIC_STYLE_SKILLS
     for role, anchor in anchors.items():
         rel = _character_art_rel(role)
-        if ctx.storage.exists(ctx.run_id, rel):
+        if not force and ctx.storage.exists(ctx.run_id, rel):
             reused.append(rel)
             continue
-        # 定妆图 prompt：锚点原文 + 「正面半身、单人人像、干净背景」的定妆指令，
-        # 保证参考图质量（subject_reference 建议单人人脸正面照）。
-        prompt = (
-            f"{anchor}. Character design sheet, front-facing bust portrait of this single "
-            "character, neutral clean background, centered composition, consistent style."
-        )
+        if force:
+            _clear_character_art(ctx.storage, ctx.run_id, role)
+        # 定妆图 prompt：用户改过的提示词 > 锚点原文，再拼「正面半身、单人人像、
+        # 干净背景」的定妆指令，保证参考图质量（subject_reference 建议单人人脸正面照）。
+        body = str(art_prompts.get(role.lower()) or "").strip() or anchor
+        prompt = f"{body}. {CHARACTER_ART_STYLE}"
         if style_gate:
-            # 定妆图固定注入强化平涂条款（2026-10-22 补，不只「缺了才补」）：
-            # 定妆图是全片 subject_reference 的源头，源头一写实，人物一致性全盘漂。
-            # 「65岁老人+深皱纹」这类描述对模型的写实拉力极强，靠锚点校验补齐的
-            # 通用锚压不住（实测老渔夫定妆图生成半写实人像）—— 必须在定妆指令里
-            # 直接写死平涂赛璐璐 + 反纹理渲染的强约束。
-            prompt = (
-                f"{CHARACTER_ART_STYLE}. {prompt}"
-            )
-            # 风格锚门禁（与分镜生图同款，2026-10-22 补）：锚点原文可能带写实画种词
-            # （实测 "Thick oil painting style, realistic texture" 生出半写实人像定妆图，
-            # 与平涂分镜图风格分裂、还过不了视频审核）—— 必须过同一个中和 + 补齐逻辑。
+            # 风格锚门禁（与分镜生图同款）：规格锚原文必须在最前，缺了补齐并留痕。
+            # 定妆图与分镜图必须走**同一个** ensure_style_anchor —— 两边画风一旦分叉，
+            # 参考图就会把分镜往另一个画风上拽（2026-11-02 事故根因之一）。
             style_note = None
-            prompt, style_note = ensure_style_anchor(prompt)
+            prompt, style_note = ensure_style_anchor(prompt, spec_style_anchor)
             if style_note:
                 degraded.append(f"{role} 定妆图：{style_note}")
         out = await generate_image(
@@ -1366,11 +1641,22 @@ async def _synthesize_lines(ctx: ToolContext, plan: dict | None = None) -> dict:
             # 同一个句号出现两次 —— 不猜，如实上报，让上游修清单。
             degraded.append(f"第 {key} 句在 lines.json 里出现多次，后一条已忽略")
             continue
+        # 复用判据 = 键 + 文本指纹。只按句号复用，改了台词还会播旧音
+        # （与分镜图/视频片段同一类"静默复用过期产物"的缺陷，2026-10-30 一并收口）。
+        want_fp = _prompt_fingerprint(text, role, str(rate))
         prev = reusable.get(key) or {}
         if prev.get("path") and ctx.storage.exists(ctx.run_id, prev["path"]):
-            index[key] = prev
-            reused.append(prev["path"])
-            continue
+            have_fp = str(prev.get("text_fingerprint") or "")
+            if have_fp and have_fp == want_fp:
+                index[key] = prev
+                reused.append(prev["path"])
+                continue
+            if have_fp:
+                degraded.append(f"第 {key} 句台词已变更，旧配音不再复用，重新合成")
+            else:
+                degraded.append(
+                    f"第 {key} 句的历史配音没有文本指纹，无法确认与当前台词一致，已重新合成"
+                )
         if not text:
             degraded.append(f"第 {key} 句缺少台词文本，已跳过（不算完成）")
             continue
@@ -1380,6 +1666,8 @@ async def _synthesize_lines(ctx: ToolContext, plan: dict | None = None) -> dict:
         )
         out["index"] = key
         out["__line_scope__"] = True  # 标记：本条目是**句级**键，可与历史格级键区分
+        # 文本指纹随音轨落盘：台词改了就必须重合成，不能拿旧音配新字幕
+        out["text_fingerprint"] = want_fp
         index[key] = out
         created.append(out["path"])
         if out.get("is_fallback"):
@@ -1546,6 +1834,10 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
             "error": "清单里没有 panels 数组，无法合成",
             "hint": "合成阶段依赖 storyboard 阶段的 panels.json。",
         }
+
+    # 时间轴顺序 = 格号升序（不是数组顺序）。见 _order_panels 的实测说明。
+    order_notes: list[str] = []
+    panels = _order_panels(panels, order_notes)
 
     images: dict[str, dict] = _read_json_file(ctx, IMAGE_INDEX_REL) or {}
     audio_index: dict[str, dict] = _read_json_file(ctx, AUDIO_INDEX_REL) or {}
@@ -1817,6 +2109,7 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
     if freeze_notes:
         degraded.append("以下格的配音长于视频片段，片段播完后定格到尾帧：" + "、".join(freeze_notes))
     degraded.extend(f"台词映射：{n}" for n in mapping_notes)
+    degraded.extend(order_notes)
     if shape_note:
         degraded.append(f"panels.json {shape_note}")
     if clip_retimed:
@@ -1974,10 +2267,18 @@ def register_builtin_tools() -> None:
         ToolSpec(
             name="generate_character_art",
             description="按 characters.md 为每个角色生成定妆图（人物参考图），落盘 characters/{角色}.jpg。定妆图是后续逐格生图的参考图来源，用于保证人物跨格一致。",
-            when_to_use="阶段动作：characters 阶段在模型交出 characters.md 之后执行。幂等，已生成的定妆图会复用。",
+            when_to_use=(
+                "阶段动作：characters 阶段在模型交出 characters.md 之后执行。幂等，已生成的定妆图会复用；"
+                "画布上单角色重生成时传 force=true + roles=[角色标识]。"
+            ),
             inputs={
                 "type": "object",
-                "properties": {"plan": {"type": "object", "description": "预留，当前从 characters.md 直接提取锚点"}},
+                "properties": {
+                    "plan": {"type": "object", "description": "预留，当前从 characters.md 直接提取锚点"},
+                    "force": {"type": "boolean", "description": "忽略已存在的定妆图，强制重画（先清旧图）"},
+                    "roles": {"type": "array", "items": {"type": "string"},
+                              "description": "只处理这些角色（锚点标签小写，如 chenmo）"},
+                },
             },
             outputs="{created[],reused[],roles[],degraded[]}",
             cost_hint="按角色数计费（真实生图）；本地兜底免费",

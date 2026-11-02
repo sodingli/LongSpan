@@ -29,6 +29,7 @@ from ..models import (
     Checkpoint,
     CheckpointStatus,
     Decision,
+    Event,
     Gate,
     GateStatus,
     Run,
@@ -46,6 +47,9 @@ from .consistency import (
     validate_panel_anchors,
     validate_scene_references,
     validate_shot_budget,
+    validate_spec_duration,
+    validate_style_anchor,
+    validate_story_order,
 )
 from .skill import SkillDef, StageDef, registry
 from .tools import ToolContext
@@ -482,19 +486,57 @@ class RunManager:
         #     顺序很关键 —— 生图/视频读的就是 panels.json，回填必须发生在动作之前。
         self._apply_skeleton(db, run, stage, skel)
 
+        # ④.0 一致性硬校验（前置）：manifest 声明 consistency_checks，runner 只读声明调校验器。
+        #     这是「一致性优先于华丽」的机器化落点 —— 把 SKILL.md 里的软铁律变成硬闸。
+        #
+        #     **为什么必须排在动作之前**（2026-10-30 实测成本问题）：
+        #     这些校验全部只读清单文本（panels.json / scenes.json / script.md / spec.json），
+        #     不依赖任何动作产物。而动作是花钱的那一步 —— 12 张分镜图、12 段视频、一次渲染。
+        #     旧顺序是「先生成 12 张图，再告诉你格序排错了」，一轮白烧一遍。
+        #     契约：新增的一致性校验必须是纯清单校验，不得依赖动作产物。
+        consistency_failures = self._run_consistency_checks(
+            run.id, run.channel, stage, brief=dict(run.brief or {})
+        )
+        if consistency_failures and step.attempt <= quota["max_revisions_per_stage"]:
+            bus.emit(db, run.id, EventType.STAGE_REVISION,
+                     f"清单未通过一致性校验（第 {step.attempt} 次），未执行生成动作，直接重做："
+                     f"{'；'.join(consistency_failures)[:200]}",
+                     stage_id=stage.id,
+                     payload={"failures": consistency_failures, "attempt": step.attempt,
+                              "skipped_actions": True})
+            step.status = StepStatus.PENDING
+            db.commit()
+            feedback = "上一轮未通过验收：" + "；".join(consistency_failures)
+            # 定点修补：整份重写会打地鼠 —— 修好被点名的格，又在没被点名的格上
+            # 引入同类违约（实测：第 2 轮修好格 5/11，格 8/10/12 又出现"然后"）。
+            # 所以重做时把修补范围锁在被判违规的对象上，其余内容逐字保留。
+            #
+            # 但「格序」是唯一例外：格序校验判失败时，**要修的正是格序**，
+            # 这时再写"不要重排格序"就是自相矛盾的指令（模型只能原地打转）。
+            order_broken = any(
+                ("格序" in f) or ("剧情节拍" in f) for f in consistency_failures
+            )
+            feedback += (
+                "\n\n本轮是【定点修补】，不是重写：只允许修改上述被点名的那几处"
+                "（对应的格 / 字段），其余内容必须逐字保留上一轮的写法 ——"
+                + (
+                    "按 script.md 的格序把被搬走的剧情搬回原位（这是本轮唯一允许的格序调整）；"
+                    if order_broken
+                    else "不要重排格序；"
+                )
+                + "不要顺手改写没被点名的格。新引入的违约同样会判失败，且剩余重做次数有限。"
+            )
+            return await self._run_stage(db, run, skill, stage, quota, feedback=feedback)
+
         # ③ 阶段动作：模型交完结构化清单后，由工具做确定性执行（生图 / 配音 / 渲染）。
         #    这是「数据驱动执行」的落点 —— runner 只知道「读哪份清单、调哪个工具」，
         #    完全不知道"漫剧"是什么。加新形态视频 = 改 manifest，不改这个文件。
-        action_results = await self._run_actions(db, run, stage, ctx)
+        #    清单没过一致性校验（且重做次数已用尽）时**不执行**：不拿违约的清单去烧钱。
+        action_results = [] if consistency_failures else await self._run_actions(db, run, stage, ctx)
 
         # ④ 校验验收标准（此时工具产出已落盘，二进制产物也一并纳入校验视野）
         file_map = self._read_produced(run.id, stage)
         ok, failures = evaluate_criteria(stage.success_criteria, file_map)
-
-        # ④.0 一致性硬校验（数据驱动：manifest 声明 consistency_checks，runner 只读声明调校验器）。
-        #     这是「一致性优先于华丽」的机器化落点 —— 把 SKILL.md 里的软铁律变成硬闸。
-        #     校验失败 = 阶段未达标，走与文本验收失败相同的「自动重做」路径。
-        consistency_failures = self._run_consistency_checks(run.id, run.channel, stage)
         if consistency_failures:
             ok = False
             failures = list(failures) + consistency_failures
@@ -607,7 +649,9 @@ class RunManager:
         return None
 
     # ---------------- 一致性硬校验（数据驱动） ----------------
-    def _run_consistency_checks(self, run_id: str, channel: str, stage: StageDef) -> list[str]:
+    def _run_consistency_checks(
+        self, run_id: str, channel: str, stage: StageDef, brief: dict | None = None
+    ) -> list[str]:
         """执行阶段声明的确定性一致性校验（如分镜锚点复用）。
 
         与 stage.actions 同理：runner 不知道「什么算一致」，它只读 manifest 声明的
@@ -615,9 +659,8 @@ class RunManager:
         加一个 kind 分支 + 在 manifest 里声明，不动 runner 的流程骨架。
 
         slow_only 语义：与 actions 的 slow_only 一致 —— 快通道（草稿）下跳过。
-        草稿的定位是「3 分钟出方向」，角色一致性是精修通道的事；manifest 的
-        draft_gaps 已声明「角色形象没有锁定」。快通道下角色设计阶段根本没跑，
-        characters.md 不存在，强行校验只会让草稿永远失败。
+        它只该用在「快通道确实没跑那个上游阶段」的校验上：一旦上游进了快通道，
+        就必须同步去掉 slow_only，否则草稿会带着未校验的产物一路跑到底。
 
         返回失败原因列表；空列表 = 全部通过（或本阶段未声明任何一致性校验）。
         """
@@ -638,6 +681,20 @@ class RunManager:
                 failures.extend(self._check_scene_references(run_id, check))
             elif kind == "framing_consistency":
                 failures.extend(self._check_framing(run_id, check))
+            elif kind == "story_order":
+                # 格序契约（2026-10-29 实测事故）：成片的格序必须等于剧本的格序。
+                # 分镜曾为了满足场景预算把「点单」从第 9 格搬到第 4 格 —— 渲染没错，
+                # 是分镜重排了剧情节拍，成片顺序与剧本不一致。
+                failures.extend(self._check_story_order(run_id, check))
+            elif kind == "style_anchor_consistency":
+                # 画风契约（2026-11-02 实测事故）：成片 0:24 起画风突变、人物也变了。
+                # 根因是生图层把 spec 锚改写成 anime 并前置平涂条款，与规格锚对冲。
+                # 这条校验守住上游：每格 prompt 必须原文复用 style_anchor，
+                # 且不得另写一套被规格锚明确否定的画风词。
+                failures.extend(self._check_style_anchor(run_id, check))
+            elif kind == "spec_duration":
+                # C2 的数字契约：用户输入的时长/集数是硬数字，模型不得改判。
+                failures.extend(self._check_spec_duration(run_id, check, brief or {}))
             elif kind:
                 # 未识别的一致性校验类型：不静默忽略，如实上报（架构铁律 #2）。
                 failures.append(f"一致性校验类型未识别：{kind}（manifest 声明了 runner 不支持的类型）")
@@ -734,6 +791,72 @@ class RunManager:
         ok, reasons = validate_framing(plan)
         return [] if ok else reasons
 
+    def _check_story_order(self, run_id: str, check: dict) -> list[str]:
+        """格序契约（2026-10-29 实测事故）：成片格序必须等于剧本格序。
+
+        读 panels.json 与 script.md，用「字幕 ↔ 剧本台词」的确定性字符串比对定位
+        每一格画的是剧本第几格。错位 = 分镜重排了剧情节拍 → 判失败重做。
+
+        为什么必须机器校验：分镜在 storyboard.md 里是**主动交代**了重排的
+        （"格序按系统骨架重排，点单从第 9 格提前到第 4 格"），说明这不是疏忽，
+        而是模型认为"满足场景预算"比"遵守剧本顺序"更重要 —— 光靠提示词说不通。
+        """
+        plan_rel = str(check.get("plan") or "panels.json")
+        script_rel = str(check.get("script") or "script.md")
+        if not storage.exists(run_id, plan_rel):
+            return [f"格序校验缺少分镜清单 {plan_rel}（分镜未产出）"]
+        if not storage.exists(run_id, script_rel):
+            # 剧本缺失时无从比对：不拦（C3 缺失由上游验收负责），但也不假装通过
+            logger.info("格序校验跳过：%s 不存在（run=%s）", script_rel, run_id)
+            return []
+        plan = _read_json_artifact(run_id, plan_rel)
+        if plan is None:
+            return [f"格序校验读不懂 {plan_rel}（JSON 解析失败，先修清单格式）"]
+        try:
+            script_md = storage.read_text(run_id, script_rel)
+        except Exception as exc:  # noqa: BLE001
+            return [f"格序校验读不出 {script_rel}：{exc}"]
+        ok, reasons = validate_story_order(plan, script_md)
+        return [] if ok else reasons
+
+    def _check_style_anchor(self, run_id: str, check: dict) -> list[str]:
+        """画风契约（2026-11-02 实测事故）：每格 prompt 必须原文复用 spec.json 的 style_anchor。
+
+        事故：成片 0:24（格 5/6 分界）起画风从厚涂写实突变为日系平涂，人物脸也跟着变。
+        C5 的 panels.json 是对的（12 格全部以 style_anchor 原文开头），坏在生图层
+        改写了规格锚并前置了硬编码平涂条款。这条校验把「画风锚必须在、且必须是最前」
+        变成机器契约，让上游漂移在生图前就暴露。
+        """
+        plan_rel = str(check.get("plan") or "panels.json")
+        spec_rel = str(check.get("spec") or "spec.json")
+        if not storage.exists(run_id, spec_rel):
+            return [f"画风契约校验缺少 {spec_rel}（画风没有来源，逐格只能各自发挥）"]
+        if not storage.exists(run_id, plan_rel):
+            return [f"画风契约校验缺少分镜清单 {plan_rel}（分镜未产出）"]
+        plan = _read_json_artifact(run_id, plan_rel)
+        spec = _read_json_artifact(run_id, spec_rel)
+        if plan is None:
+            return [f"画风契约校验读不懂 {plan_rel}（JSON 解析失败，先修清单格式）"]
+        if spec is None:
+            return [f"画风契约校验读不懂 {spec_rel}（JSON 解析失败，先修规格格式）"]
+        ok, reasons = validate_style_anchor(plan, spec)
+        return [] if ok else reasons
+
+    def _check_spec_duration(self, run_id: str, check: dict, brief: dict) -> list[str]:
+        """C2 数字契约（2026-10-29 用户要求）：时长/格数/集数必须来自用户输入。
+
+        读 spec.json，与 run.brief 里的用户输入逐项对账。读不到 spec 判失败 ——
+        规格是后面所有阶段的数字来源，缺了它下游只能靠猜。
+        """
+        spec_rel = str(check.get("spec") or "spec.json")
+        if not storage.exists(run_id, spec_rel):
+            return [f"缺少生产规格 {spec_rel}（格数/时长没有数字来源，下游只能靠猜）"]
+        spec = _read_json_artifact(run_id, spec_rel)
+        if spec is None:
+            return [f"生产规格 {spec_rel} 读不懂（JSON 解析失败，先修格式）"]
+        ok, reasons = validate_spec_duration(spec, brief)
+        return [] if ok else reasons
+
     def _check_panel_anchors(self, run_id: str, check: dict) -> list[str]:
         """FR-02：分镜格必须复用角色锚点原文（跨格一致性）。
 
@@ -768,6 +891,35 @@ class RunManager:
         return [f"分镜一致性校验未通过：{r}" for r in reasons]
 
     # ---------------- 阶段动作（确定性媒体执行） ----------------
+    def _emit_degraded_once(
+        self, db: Session, run_id: str, stage_id: str, tool: str, note: Any
+    ) -> None:
+        """降级说明按「run + 阶段 + 原文」去重，同一问题只报一次。
+
+        为什么必须去重：阶段验收不过会自动重做，每次重做都重跑一遍 actions，
+        同一个降级（例如"第 3 格视频生成失败"）就会被反复 emit ——
+        实测一个任务刷了 73 条降级日志，其中 42 条是同一句"图生视频失败退回静态"，
+        真正的信号被自己的回声淹没了。去重后事件流里每种降级只留第一条。
+        """
+        msg = f"降级说明：{str(note)[:200]}"
+        try:
+            exists = (
+                db.query(Event.id)
+                .filter(
+                    Event.run_id == run_id,
+                    Event.stage_id == stage_id,
+                    Event.type == EventType.AGENT_THOUGHT,
+                    Event.message == msg,
+                )
+                .first()
+            )
+        except Exception:  # noqa: BLE001  去重失败不该阻断生产
+            exists = None
+        if exists:
+            return
+        bus.emit(db, run_id, EventType.AGENT_THOUGHT, msg,
+                 stage_id=stage_id, payload={"tool": tool, "degraded": note})
+
     async def _run_actions(
         self, db: Session, run: Run, stage: StageDef, ctx: ToolContext
     ) -> list[dict]:
@@ -821,8 +973,7 @@ class RunManager:
                          stage_id=stage.id,
                          payload={k: v for k, v in out.items() if k not in ("created", "reused")})
                 for note in (out.get("degraded") or []):
-                    bus.emit(db, run.id, EventType.AGENT_THOUGHT, f"降级说明：{str(note)[:200]}",
-                             stage_id=stage.id, payload={"tool": tool, "degraded": note})
+                    self._emit_degraded_once(db, run.id, stage.id, tool, note)
             else:
                 err = str((out or {}).get("error") if isinstance(out, dict) else out)[:400]
                 bus.emit(db, run.id, EventType.TOOL_RESULT,

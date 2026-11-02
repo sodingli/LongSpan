@@ -18,7 +18,8 @@
     3. **结论必须留痕**：每格的判定结果写回 images.json（vision 字段），
        人工复核时能看到"这格为什么被重画过"。
 
-协议：DashScope 原生 multimodal-generation（与生图同一中转，报文已验证可用）。
+协议：dashscope（原生 multimodal-generation）/ openai-compat（/chat/completions），
+按 vision_provider 或 base_url 自动选择 —— 中转站不一定有 qwen3-vl-plus。
 """
 
 from __future__ import annotations
@@ -89,14 +90,92 @@ def _parse_json_loose(text: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _endpoint() -> tuple[str, str, str]:
-    """返回 (url, api_key, model)。配置缺失时 url 为空。"""
+# 视觉检查支持两套协议（同一份「看图」能力，两种报文形状）：
+#   dashscope      —— DashScope 原生 multimodal-generation（阿里云百炼）
+#   openai-compat  —— OpenAI 兼容 POST {base}/chat/completions（京东云 modelservice 等中转）
+# 2026-10-28 实测事故：base_url 指向京东云（https://modelservice.jdcloud.com/v1），
+# 代码却拼 DashScope 原生 URL + 默认模型 qwen3-vl-plus —— 该 Key 下没有这个模型，
+# 每次自检都 400，8 格全部 checked=false，视觉这层形同不存在（还刷了 16 条降级日志）。
+_DS_HOSTS = ("dashscope", "aliyuncs.com")
+
+
+def _protocol(base: str) -> str:
+    """决定用哪套协议：显式配置优先，留空按 base_url 推断。"""
+    prov = str(getattr(settings, "vision_provider", "auto") or "auto").strip().lower()
+    if prov.startswith("dashscope"):
+        return "dashscope"
+    if prov in ("openai-compat", "openai", "compat"):
+        return "openai-compat"
+    low = (base or "").lower()
+    return "dashscope" if any(h in low for h in _DS_HOSTS) else "openai-compat"
+
+
+def _endpoint() -> tuple[str, str, str, str]:
+    """返回 (url, api_key, model, protocol)。配置缺失时 url 为空。"""
     base = (settings.vision_base_url or settings.image_base_url or "").rstrip("/")
     key = settings.vision_api_key or settings.image_api_key or ""
-    model = settings.vision_model or "qwen3-vl-plus"
+    protocol = _protocol(base)
+    model = str(getattr(settings, "vision_model", "") or "").strip()
+    if not model:
+        # 没配专用视觉模型时：OpenAI 兼容中转复用对话模型（实测 GPT-5.5 支持看图），
+        # DashScope 原生协议仍用 qwen3-vl-plus。
+        model = (
+            str(getattr(settings, "llm_model", "") or "").strip()
+            if protocol == "openai-compat"
+            else "qwen3-vl-plus"
+        )
     if not base or not key:
-        return "", "", model
-    return f"{base}/services/aigc/multimodal-generation/generation", key, model
+        return "", "", model, protocol
+    url = (
+        f"{base}/services/aigc/multimodal-generation/generation"
+        if protocol == "dashscope"
+        else f"{base}/chat/completions"
+    )
+    return url, key, model, protocol
+
+
+def _build_body(protocol: str, model: str, images: list[str], prompt: str) -> dict:
+    """按协议组装「多图 + 一段提示词」的请求体。
+
+    注意：OpenAI 兼容分支**不传 temperature** —— 部分新模型（实测 GPT-5.5）
+    只接受默认值 1，传 0 直接 400，而视觉自检是"不阻断"的一层，
+    一次 400 就等于这一格没检查。
+    """
+    if protocol == "openai-compat":
+        content: list[dict] = [
+            {"type": "image_url", "image_url": {"url": u}} for u in images
+        ]
+        content.append({"type": "text", "text": prompt})
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 800,
+        }
+    return {
+        "model": model,
+        "input": {"messages": [{"role": "user", "content":
+            [{"image": u} for u in images] + [{"text": prompt}]}]},
+        "parameters": {"result_format": "message", "temperature": 0},
+    }
+
+
+def _extract_text(data: dict, protocol: str) -> str:
+    """从两种响应结构里取出纯文本（取不到就抛，由调用方记 checked=False）。"""
+    if protocol == "openai-compat":
+        choices = data.get("choices") or []
+        if not choices:
+            raise KeyError("choices")
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(c.get("text") or "") for c in content if isinstance(c, dict)
+            )
+        return str(choices[0].get("text") or "")
+    content = data["output"]["choices"][0]["message"]["content"]
+    return "".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
 
 
 async def inspect_image(
@@ -119,7 +198,7 @@ async def inspect_image(
     if mode == "off":
         return {"checked": False, "ok": True, "reason": "视觉自检已关闭（vision_check_mode=off）"}
 
-    url, key, model = _endpoint()
+    url, key, model, protocol = _endpoint()
     if not url:
         return {
             "checked": False,
@@ -134,14 +213,12 @@ async def inspect_image(
 
     mime = "image/png" if str(image_path).lower().endswith(".png") else "image/jpeg"
     b64 = base64.b64encode(raw).decode()
-    body = {
-        "model": model,
-        "input": {"messages": [{"role": "user", "content": [
-            {"image": f"data:{mime};base64,{b64}"},
-            {"text": _PROMPT_ALLOW_HEADLESS if allow_headless else _PROMPT_STRICT},
-        ]}]},
-        "parameters": {"result_format": "message", "temperature": 0},
-    }
+    body = _build_body(
+        protocol,
+        model,
+        [f"data:{mime};base64,{b64}"],
+        _PROMPT_ALLOW_HEADLESS if allow_headless else _PROMPT_STRICT,
+    )
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -169,8 +246,7 @@ async def inspect_image(
 
     try:
         data = resp.json()
-        content = data["output"]["choices"][0]["message"]["content"]
-        text = "".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+        text = _extract_text(data, protocol)
         usage = data.get("usage") or {}
     except Exception as exc:  # noqa: BLE001
         return {"checked": False, "ok": True, "reason": f"视觉自检返回结构异常（不阻断）：{exc}"}
@@ -264,7 +340,7 @@ async def compare_character(
     mode = str(getattr(settings, "vision_check_mode", "auto") or "auto").lower()
     if mode == "off":
         return {"checked": False, "reason": "视觉能力已关闭"}
-    url, key, model = _endpoint()
+    url, key, model, protocol = _endpoint()
     if not url:
         return {"checked": False, "reason": "视觉能力未配置"}
 
@@ -280,15 +356,7 @@ async def compare_character(
     if not ref_url or not pan_url:
         return {"checked": False, "reason": "读图失败"}
 
-    body = {
-        "model": model,
-        "input": {"messages": [{"role": "user", "content": [
-            {"image": ref_url},
-            {"image": pan_url},
-            {"text": _COMPARE_PROMPT},
-        ]}]},
-        "parameters": {"result_format": "message", "temperature": 0},
-    }
+    body = _build_body(protocol, model, [ref_url, pan_url], _COMPARE_PROMPT)
 
     def _post() -> httpx.Response:
         return httpx.post(
@@ -308,8 +376,7 @@ async def compare_character(
         return {"checked": False, "reason": f"返回 {resp.status_code}：{resp.text[:160]}"}
     try:
         data = resp.json()
-        content = data["output"]["choices"][0]["message"]["content"]
-        text = "".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+        text = _extract_text(data, protocol)
     except Exception as exc:  # noqa: BLE001
         return {"checked": False, "reason": f"返回结构异常：{exc}"}
 
@@ -363,7 +430,7 @@ async def detect_face_box(
     mode = str(getattr(settings, "vision_check_mode", "auto") or "auto").lower()
     if mode == "off":
         return {"checked": False, "has_face": False, "box": None, "reason": "视觉能力已关闭"}
-    url, key, model = _endpoint()
+    url, key, model, protocol = _endpoint()
     if not url:
         return {"checked": False, "has_face": False, "box": None, "reason": "视觉能力未配置"}
     try:
@@ -373,14 +440,7 @@ async def detect_face_box(
 
     mime = "image/png" if str(image_path).lower().endswith(".png") else "image/jpeg"
     b64 = base64.b64encode(raw).decode()
-    body = {
-        "model": model,
-        "input": {"messages": [{"role": "user", "content": [
-            {"image": f"data:{mime};base64,{b64}"},
-            {"text": _FACE_PROMPT},
-        ]}]},
-        "parameters": {"result_format": "message", "temperature": 0},
-    }
+    body = _build_body(protocol, model, [f"data:{mime};base64,{b64}"], _FACE_PROMPT)
 
     def _post() -> httpx.Response:
         return httpx.post(
@@ -401,8 +461,7 @@ async def detect_face_box(
                 "reason": f"返回 {resp.status_code}：{resp.text[:160]}"}
     try:
         data = resp.json()
-        content = data["output"]["choices"][0]["message"]["content"]
-        text = "".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+        text = _extract_text(data, protocol)
     except Exception as exc:  # noqa: BLE001
         return {"checked": False, "has_face": False, "box": None, "reason": f"返回结构异常：{exc}"}
 

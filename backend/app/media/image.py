@@ -46,66 +46,47 @@ SIZE_TABLE = {
 # 实测教训（2026-10-20 高山流水）：同一任务 6 格里 2 格提示词漏了「角色风格化强化句」，
 # 生出的首帧往半写实漂（暖橙色调、写实脸、发型变形），视频跟着首帧跑，成片风格分裂。
 # 所以在生图入口做字符串级校验：缺哪层锚补哪层，并留痕（铁律 #2，绝不静默）。
+#
+# 2026-11-02 事故复盘（用户反馈「成片 0:24 之后风格变了、人物也不一样了」）：
+# 旧实现把 spec.json 的 style_anchor **改写**了（semi-realistic → semi-stylized anime），
+# 又在最前面硬编码注入 `flat cel shading on skin` + `clean drawn lineart` ——
+# 而同一段 prompt 里 spec 锚写着 `no flat cel-shading, no line-art comic style`。
+# 一段提示词里两套互相打架的画风指令，模型只能按「哪条更具体」来选：
+# 全景格（脸小）听厚涂条款 → 前 5 格是厚涂；近景/特写（脸大）听「anime face with
+# large expressive eyes」→ 第 6 格起全变日系平涂。0:24 正好是格 5/6 的分界。
+#
+# 结论（现在的铁律）：**spec.json 的 style_anchor 是 C2 冻结的画风契约，生图层只准
+# 原文复用，不准改写、不准加任何指定画种的条款**。生图层只负责一条与画种无关的
+# 审核底线：这是画出来的，不是照片/真人。画风本身漂了，是 C2 写错了锚，回 C2 改。
 
 COMIC_STYLE_SKILLS = {"comic-drama"}
 
-# 两层锚的「缺失判定关键字」与补齐用的完整条款
+# 审核底线条款：只声明「画出来的、不是照片」，**不含任何画种词**（平涂/线稿/厚涂/
+# 赛璐璐…）。画种由 spec.json 的 style_anchor 决定 —— 这两件事必须分开，
+# 否则生图层就又在替用户定画风了。
+AUDIT_SAFETY_CLAUSE = (
+    "Stylized illustration, clearly hand-drawn artwork rather than a photograph: "
+    "NOT a photograph, NOT photorealistic, NOT live-action, NOT a 3D render, "
+    "no realistic skin pores, no photographic depth of field"
+)
+_AUDIT_KEYWORD = "not photorealistic"
+
+# 兼容旧名字：外部（tools.py / canvas.py）只 import COMIC_STYLE_SKILLS，
+# 但保留别名可避免第三方脚本按旧名引用时直接 ImportError。
 COMIC_STYLE_CLAUSES: list[tuple[str, str, str]] = [
-    # (key, 判定关键字（小写）, 补齐条款)
-    (
-        "反写实条款",
-        "not photorealistic",
-        "NOT a photograph, NOT photorealistic, NOT live-action, NOT 3D render",
-    ),
-    (
-        "角色风格化强化句",
-        "stylized 2d anime",
-        "Stylized 2D anime character design, anime face with large expressive eyes, "
-        "clean drawn lineart, flat cel shading on skin, no realistic skin texture, no photography",
-    ),
-    # 2026-10-21 实测：即便有上面两条，模型在句首写 "thick paint realistic
-    # illustration" 仍会产出半写实厚涂人脸 —— 这类图过不了视频模型的内容审核
-    # （火山 InputImageSensitiveContentDetected.PrivacyInformation「疑似真人」，
-    # 12 格里 10 格被拦，重试也救不回来）。平涂赛璐璐 TV 动画画风是实测能
-    # 稳定过审的风格，同时让全片风格统一。
-    (
-        "平涂赛璐璐条款",
-        "tv anime",
-        "Flat 2D TV anime screenshot style, thick clean outlines, uniform flat colors, "
-        "simplified facial shading, absolutely no realistic skin texture, no painterly brushwork, no oil painting texture",
-    ),
+    ("审核底线条款", _AUDIT_KEYWORD, AUDIT_SAFETY_CLAUSE),
 ]
 
-# 模型爱在句首写写实倾向的画种描述，与风格锚直接对冲 —— 出现即中和并留痕
-# （2026-10-22 补：角色卡锚点里出现 "Thick oil painting style, realistic texture,
-# heavy brushstrokes"，定妆图直接生成半写实人像 —— 与平涂分镜图风格分裂，
-# 且这类写实人脸过不了视频内容审核。中和规则必须覆盖锚点原文里的全部写实画种词。）
-# 注意否定前缀保护（2026-10-22 实测 bug）：「no/NOT photorealistic」是否定句，
-# 误中和会反转成「NOT stylized anime」（= 要求写实）—— 语义灾难。lookbehind 挡掉。
+# 正文里**只中和真正的"照片级写实"断言**（2026-11-02 收窄）：
+# 旧表把 oil painting / brushstrokes / realistic illustration 这些**画种词**也一起
+# 改写成 anime —— 那等于让生图层否决 C2 的画风契约，正是本次事故的直接原因。
+# 现在只保留「照片/真人」语义的词，且**永不作用于 spec 锚原文**（见 _neutralize_body）。
 _REALISM_PATTERNS = [
-    (re.compile(r"\bthick\s+oil\s+painting\s+style\b", re.I), "flat 2D anime style"),
-    (re.compile(r"\boil\s+painting\s+style\b", re.I), "flat 2D anime style"),
-    (re.compile(r"\brealistic\s+texture\b", re.I), "clean flat cel shading"),
-    (re.compile(r"\bheavy\s+brushstrokes\b", re.I), "clean bold lineart"),
-    (re.compile(r"\bthick\s+paint\s+realistic\s+illustration\b", re.I), "stylized anime illustration"),
-    (re.compile(r"\brealistic\s+illustration\b", re.I), "stylized anime illustration"),
-    (re.compile(r"(?<!no )(?<!not )(?<!non-)\bhyper[- ]?realistic\b", re.I), "stylized anime"),
-    (re.compile(r"(?<!no )(?<!not )(?<!non-)\bphotorealistic\b(?!.*\bnot\b)", re.I), "stylized anime"),
+    (re.compile(r"(?<!no )(?<!not )(?<!non-)\bhyper[- ]?realistic\b", re.I), "stylized illustration"),
+    (re.compile(r"(?<!no )(?<!not )(?<!non-)\bphotorealistic\b", re.I), "stylized illustration"),
+    (re.compile(r"(?<!no )(?<!not )(?<!non-)\bphoto[- ]?realistic\b", re.I), "stylized illustration"),
+    (re.compile(r"(?<!no )(?<!not )(?<!non-)\brealistic\s+skin\s+(?:texture|pores)\b", re.I), "simplified skin rendering"),
 ]
-
-
-# 无脸镜头（prompt 已声明 no face / only … fills the frame）专用的角色风格化条款。
-# 为什么单独一份（2026-10-22 实测）：通用条款里写着 "anime face with large expressive eyes"，
-# 而这类镜头的 prompt 明确要求"画面里没有脸" —— 两条指令直接对冲，模型只能二选一：
-# 要么给你塞进一张脸（破坏取景），要么两边都糊弄（生成悬空的衣领）。
-_COMIC_FACE_CLAUSE = (
-    "Stylized 2D anime character design, anime face with large expressive eyes, "
-    "clean drawn lineart, flat cel shading on skin, no realistic skin texture, no photography"
-)
-_COMIC_NOFACE_CLAUSE = (
-    "Stylized 2D anime rendering, clean drawn lineart, flat cel shading on skin and cloth, "
-    "no realistic skin texture, no photography"
-)
 
 # 判断「本格是有意的局部特写」：与 harness.consistency._FRAMING_DECL_RE 同源判据的轻量版
 # （media 层不反向依赖 harness，避免循环导入；两边都覆盖"no face/only … fills the frame"）。
@@ -123,52 +104,74 @@ def is_headless_framing(prompt: str) -> bool:
     return bool(_HEADLESS_HINT_RE.search(prompt or ""))
 
 
-def ensure_style_anchor(prompt: str) -> tuple[str, str | None]:
-    """漫剧类生图提示词的风格锚校验：缺「反写实 / 角色风格化」条款就在开头补齐。
+def _neutralize_body(text: str) -> tuple[str, list[str]]:
+    """中和**正文**里的照片级写实断言。返回 (新文本, 留痕列表)。
 
-    另有两层修正：
-    - **写实倾向中和**：模型句首写 "realistic illustration" 这类画种描述时，补再多锚
-      也会被它带偏（实测半写实人脸过不了视频内容审核），直接替换并留痕；
-    - **无脸镜头换条款**：prompt 已声明"画面里没有脸/头"时，角色风格化条款改用不含
-      "anime face with large expressive eyes" 的版本 —— 否则两条指令对冲，模型要么
-      给你塞一张脸（破坏取景），要么生成一个悬空的衣领。
-
-    返回 (修正后的提示词, 留痕说明)。提示词本来就齐 → 原样返回 (prompt, None)。
-    校验是字符串级的 —— 模型写出的提示词再"看起来对"，缺了关键字就是缺了，
-    不做语义层猜测（可计量、可复核）。
+    调用方必须先把 spec 锚原文摘出去 —— 规格锚是契约，一个字符都不许改。
     """
     notes: list[str] = []
     for pat, repl in _REALISM_PATTERNS:
-        prompt, n = pat.subn(repl, prompt)
+        text, n = pat.subn(repl, text)
         if n:
-            notes.append(f"中和写实倾向描述 {n} 处（→ {repl}）")
-    low = (prompt or "").lower()
-    # 无脸镜头：显式"不出现脸"的局部特写，以及空镜（本就不该有人）——
-    # 两种情况都不能注入"anime face with large expressive eyes"，否则等于
-    # 用风格条款命令模型画脸（2026-10-22 实测：空镜"小船驶向雾中"因此被
-    # 画出蓝发少女，成片结尾凭空多一个人）。
-    headless = is_headless_framing(prompt)
-    if not headless:
-        try:
-            from ..harness.consistency import is_empty_shot
+            notes.append(f"中和正文写实倾向描述 {n} 处（→ {repl}）")
+    return text, notes
 
-            headless = is_empty_shot(prompt)
-        except Exception:  # noqa: BLE001 —— 判定失败退回常规条款（不阻断生图）
-            headless = False
-    clauses = []
-    for key, keyword, clause in COMIC_STYLE_CLAUSES:
-        if keyword in low:
-            continue
-        if headless and key == "角色风格化强化句":
-            clause = _COMIC_NOFACE_CLAUSE
-        clauses.append((key, clause))
-    missing = clauses
-    if not missing and not notes:
+
+def _split_spec_anchor(prompt: str, spec: str) -> tuple[str, str]:
+    """把 prompt 拆成 (规格锚原文, 其余正文)；规格锚不在时返回 ("", prompt)。"""
+    if not spec:
+        return "", prompt
+    idx = prompt.lower().find(spec.lower())
+    if idx < 0:
+        return "", prompt
+    return prompt[idx:idx + len(spec)], prompt[:idx] + prompt[idx + len(spec):]
+
+
+def ensure_style_anchor(
+    prompt: str, style_anchor: str | None = None
+) -> tuple[str, str | None]:
+    """漫剧类生图提示词的风格锚校验：规格锚原文必须在最前，缺了补上并留痕。
+
+    style_anchor（2026-10-29 用户要求「生图提示词缺少风格锚，要严格按照 spec.json 里的
+    风格来确定」）：C2 在 spec.json 里冻结的**规格风格锚**，是"这一集是什么画风"的
+    唯一来源。
+
+    2026-11-02 修正（事故：成片 0:24 起画风突变）：
+      - **规格锚原文一字不改**。旧实现会把 semi-realistic 改写成 semi-stylized anime，
+        再前置一段硬编码的平涂条款，与规格锚里的 `no flat cel-shading` 直接对冲；
+      - 规格锚**统一提到最前**（模型写在中间也搬过来），保证 12 格拿到同一个前缀 ——
+        前缀不一致本身就是风格漂移的来源（实测第 10 格走了无脸分支，前缀与其余 11 格不同）；
+      - 只补一条**与画种无关**的审核底线（AUDIT_SAFETY_CLAUSE），不再指定平涂/线稿；
+      - 正文里的照片级写实断言仍会中和，但**只在规格锚之外**做，绝不碰契约原文。
+
+    返回 (修正后的提示词, 留痕说明)。提示词本来就齐 → 原样返回 (prompt, None)。
+    """
+    notes: list[str] = []
+    spec = (style_anchor or "").strip()
+    text = prompt or ""
+
+    found, body = _split_spec_anchor(text, spec)
+    body, body_notes = _neutralize_body(body)
+    notes.extend(body_notes)
+    if spec and not found:
+        notes.append("生图提示词缺少规格风格锚（spec.json style_anchor），已在开头补齐")
+        found = spec
+    elif found and not text.startswith(found):
+        notes.append("规格风格锚不在提示词开头，已统一提到最前（保证逐格前缀一致）")
+    # 前缀顺序：规格锚 → 审核底线 → 正文。
+    # 规格锚必须排第一（它是画风契约，也是逐格前缀一致的基准）；
+    # 审核底线紧跟在它后面 —— 旧实现把审核条款前置到规格锚之前，
+    # 等于又让「生图层自己写的条款」压过 C2 的画风契约。
+    prefix = [found] if found else []
+    if _AUDIT_KEYWORD not in f"{found} {body}".lower():
+        prefix.append(AUDIT_SAFETY_CLAUSE)
+        notes.append("生图提示词缺少审核底线条款（非照片/非真人），已自动补齐")
+    parts = prefix + ([body.strip()] if body.strip() else [])
+    text = ". ".join(p for p in parts if p)
+
+    if not notes:
         return prompt, None
-    if missing:
-        prompt = ", ".join(clause for _, clause in missing) + ". " + prompt
-        notes.append("生图提示词缺少风格锚（" + "、".join(k for k, _ in missing) + "），已在开头自动补齐")
-    return prompt, "；".join(notes)
+    return text, "；".join(notes)
 
 
 def attach_note(out: dict[str, Any], note: str) -> None:
@@ -287,6 +290,74 @@ def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# 参考图未生效时的统一措辞：generate_image 靠它判断「参考图到底有没有被用上」，
+# 不能只看通道能力位 —— 能力位说支持、服务端不认 edits，同样是没生效。
+_REF_UNUSED_NOTE = "参考图未生效"
+
+
+async def _decode_image_payload(data: dict) -> tuple[bytes, str]:
+    """解析 OpenAI 兼容生图返回：b64_json 或 url 两种形状。"""
+    item = (data.get("data") or [{}])[0]
+    if item.get("b64_json"):
+        return base64.b64decode(item["b64_json"]), "png"
+    if item.get("url"):
+        async with httpx.AsyncClient(timeout=120) as cli:
+            img = await cli.get(item["url"])
+        if img.status_code >= 400:
+            raise RuntimeError(f"下载生图结果失败：HTTP {img.status_code}")
+        ct = img.headers.get("content-type", "")
+        ext = "png" if "png" in ct else ("jpg" if ("jpeg" in ct or "jpg" in ct) else "png")
+        return img.content, ext
+    raise RuntimeError(f"生图返回里既没有 b64_json 也没有 url：{str(data)[:200]}")
+
+
+async def _request_openai_edit(
+    prompt: str,
+    model: str | None,
+    base: str,
+    key: str,
+    size: str,
+    extra: dict | None,
+    subject_refs: list[str],
+) -> tuple[bytes, str]:
+    """走 OpenAI 兼容 `/images/edits`（图生图），把定妆图当参考图送进去。
+
+    为什么必须走这个端点（2026-10-29 实测）：
+    主通道是 `openai-compat`（gpt-image-2），`/images/generations` 只吃文字，
+    参考图能力位是 False —— 于是「用定妆图锁脸」在配置层面就是空转：
+    定妆图生成得再准，逐格生图也从来没看过它一眼。
+
+    报文形状是**实测**出来的，不要按 OpenAI 官方文档想当然（三个坑都踩过）：
+      1. 不是 multipart —— 京东云网关会把 multipart 当 JSON 解析，
+         报 `invalid character '-' in numeric literal`；
+      2. `image` 不是字符串 —— 传字符串报
+         `cannot unmarshal string into Go struct field GetImageEditRequest.Image of type []string`；
+      3. 正确形状是 JSON + `"image": ["data:image/png;base64,..."]`（数组），
+         实测 gpt-image-2 返回 b64_json，约 30 秒。
+
+    2026-11-02：`image` 本来就是数组，多角色同框格可以一次送多张定妆图
+    （旧实现只送 1 张 → 同框格里的配角没有参考，每格重画一张脸）。
+    """
+    body: dict = {
+        "model": model or settings.image_model,
+        "prompt": prompt,
+        "image": list(subject_refs),
+        "n": 1,
+        "size": size,
+    }
+    if extra:
+        body.update(extra)
+    async with httpx.AsyncClient(timeout=240) as cli:
+        resp = await cli.post(
+            base + "/images/edits",
+            headers={"Authorization": f"Bearer {key}"},
+            json=body,
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"图生图接口返回 {resp.status_code}：{resp.text[:300]}")
+    return await _decode_image_payload(resp.json())
+
+
 async def _request_real_image(
     prompt: str,
     ratio: str,
@@ -298,12 +369,16 @@ async def _request_real_image(
     negative_prompt: str = "",
     seed: int = 0,
     extra: dict | None = None,
+    subject_refs: list[str] | None = None,
 ) -> tuple[bytes, str, list[str]]:
     """调 OpenAI 兼容生图接口，返回 (图片字节, 扩展名, 未能生效的参数说明)。
 
     三个可选参数（size / negative_prompt / seed）不是所有服务商都支持。
     **不支持时要如实回传"没生效"**，而不是照发了事 —— 用户以为加了负向提示词、
     实际没加，属于典型的静默劣化。
+
+    subject_refs 非空时先走 `/images/edits`（图生图，定妆图当参考图，可多张）；
+    该端点不可用（404/405/400…）才退回纯文生图，并在返回值里写明"参考图未生效"。
     """
     ignored: list[str] = []
     if ratio == "9:16":
@@ -312,10 +387,23 @@ async def _request_real_image(
         default_size = "1792x1024"
     else:
         default_size = "1024x1024"
+    final_size = (size or "").strip() or default_size
+    base = (base_url or settings.image_base_url).rstrip("/")
+    key = api_key or settings.image_api_key
+
+    if subject_refs:
+        try:
+            data, ext = await _request_openai_edit(
+                prompt, model, base, key, final_size, extra, subject_refs
+            )
+            return data, ext, ignored
+        except Exception as exc:  # noqa: BLE001 —— 端点不支持就退回文生图，但必须留痕
+            ignored.append(f"{_REF_UNUSED_NOTE}：{str(exc)[:200]}（已退化为纯文生图）")
+
     body: dict = {
         "model": model or settings.image_model,
         "prompt": prompt,
-        "size": (size or "").strip() or default_size,
+        "size": final_size,
         "n": 1,
         "response_format": "b64_json",
     }
@@ -329,25 +417,14 @@ async def _request_real_image(
         body.update(extra)
     async with httpx.AsyncClient(timeout=180) as cli:
         resp = await cli.post(
-            (base_url or settings.image_base_url).rstrip("/") + "/images/generations",
-            headers={"Authorization": f"Bearer {api_key or settings.image_api_key}"},
+            base + "/images/generations",
+            headers={"Authorization": f"Bearer {key}"},
             json=body,
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"生图接口返回 {resp.status_code}：{resp.text[:300]}")
-    data = resp.json()
-    item = (data.get("data") or [{}])[0]
-    if item.get("b64_json"):
-        return base64.b64decode(item["b64_json"]), "png", ignored
-    if item.get("url"):
-        async with httpx.AsyncClient(timeout=120) as cli:
-            img = await cli.get(item["url"])
-        if img.status_code >= 400:
-            raise RuntimeError(f"下载生图结果失败：HTTP {img.status_code}")
-        ct = img.headers.get("content-type", "")
-        ext = "png" if "png" in ct else ("jpg" if ("jpeg" in ct or "jpg" in ct) else "png")
-        return img.content, ext, ignored
-    raise RuntimeError(f"生图返回里既没有 b64_json 也没有 url：{str(data)[:200]}")
+    data, ext = await _decode_image_payload(resp.json())
+    return data, ext, ignored
 
 
 # 京东云 image-01（MiniMax）支持的宽高比（超出则回退 9:16，不赌）
@@ -365,6 +442,7 @@ async def _request_jdcloud_image(
     subject_reference: str | None = None,
     seed: int = 0,
     extra: dict | None = None,
+    extra_refs: int = 0,
 ) -> tuple[bytes, str, list[str]]:
     """京东云 modelservice「预置服务」生图，返回 (图片字节, 扩展名, 参数说明)。
 
@@ -394,6 +472,11 @@ async def _request_jdcloud_image(
     if subject_reference:
         body["subject_reference"] = [{"type": "character", "image_file": subject_reference}]
         notes.append("已携带人物参考图（subject_reference）")
+    if extra_refs:
+        notes.append(
+            f"该通道 subject_reference 仅支持 1 张，同框格其余 {extra_refs} 张定妆图未送入"
+            "（多角色一致性由提示词锚点承担）"
+        )
     if seed:
         body["seed"] = seed
         notes.append(f"已固定随机种子 seed={seed}")
@@ -568,7 +651,9 @@ _CAPS = {
     "dashscope-mm": (True, True, True),
     "dashscope": (False, True, True),
     "jdcloud": (True, False, True),
-    "openai-compat": (False, True, True),
+    # openai-compat：2026-10-29 起支持参考图 —— 走 `/images/edits`（multipart 图生图）。
+    # 端点不可用时会在 _request_real_image 里退回文生图并写明"参考图未生效"。
+    "openai-compat": (True, True, True),
 }
 
 _KNOWN_KINDS = frozenset(_CAPS)
@@ -676,7 +761,9 @@ _SOFTEN_L2: list[tuple[str, str]] = [
 ]
 
 _SOFTEN_SUFFIX_L1 = "wholesome, family-friendly illustration, no violence, no gore"
-_SOFTEN_SUFFIX_L2 = "gentle flat illustration, safe for all audiences, soft lighting"
+# 软化后缀不许带画种词（旧值 "gentle flat illustration" 会把厚涂/水墨任务
+# 在审核重试时悄悄改成平涂 —— 与 spec 锚对冲，属于同一类静默改画风）。
+_SOFTEN_SUFFIX_L2 = "gentle illustration, safe for all audiences, soft lighting"
 
 
 def soften_prompt(prompt: str, level: int) -> str:
@@ -817,7 +904,7 @@ async def generate_image(
     service_override: str | None = None,
     *,
     params: dict | None = None,
-    subject_reference: str | None = None,
+    subject_reference: str | list[str] | None = None,
 ) -> dict[str, Any]:
     """生成一张分镜图。返回 {path, provider, is_placeholder, fallback_reason?, params_note?, channel_trace?}。
 
@@ -827,6 +914,7 @@ async def generate_image(
     优先级：调用方传入 > 全局配置。未生效的参数会回传 params_note，不静默吞掉。
 
     subject_reference（FR-04，人物一致性）：本地参考图路径或 data URL / 公网 URL。
+    支持传列表（多角色同框格）—— 通道能吃几张就送几张，吃不下的如实留痕。
     路由（image_routing）：auto 时带参考图的格**优先走支持参考图的通道**（保持相对顺序）；
     main 时永远主通道优先。参考图传到不支持的通道时如实回传 params_note，绝不静默吞掉。
 
@@ -847,14 +935,19 @@ async def generate_image(
         seed = 0
     extra = _parse_extra(str(params.get("params_json") or settings.image_params_json or ""), "生图")
 
-    # 参考图归一化：本地路径 → data URL；已是 data URL / http URL 则原样使用
-    subject_ref: str | None = None
+    # 参考图归一化：本地路径 → data URL；已是 data URL / http URL 则原样使用。
+    # 多角色同框格可以传列表（2026-11-02：旧实现只送 1 张，配角每格重画一张脸）。
+    subject_refs: list[str] = []
     if subject_reference:
-        sr = subject_reference.strip()
-        if sr.startswith("data:") or re.match(r"^https?://", sr):
-            subject_ref = sr
-        else:
-            subject_ref = _image_to_data_url(sr)
+        raw_refs = [subject_reference] if isinstance(subject_reference, str) else list(subject_reference)
+        for item in raw_refs:
+            sr = str(item or "").strip()
+            if not sr:
+                continue
+            if sr.startswith("data:") or re.match(r"^https?://", sr):
+                subject_refs.append(sr)
+            else:
+                subject_refs.append(_image_to_data_url(sr))
 
     channels = parse_channels()
     if model_override and channels:
@@ -862,7 +955,7 @@ async def generate_image(
         channels[0] = dataclasses.replace(channels[0], model=model_override)
 
     routing = (settings.image_routing or "auto").strip().lower()
-    if subject_ref and routing == "auto" and len(channels) > 1:
+    if subject_refs and routing == "auto" and len(channels) > 1:
         # 参考图能力优先：稳定排序，不打破同能力通道的主备顺序
         channels = sorted(channels, key=lambda c: 0 if c.supports_reference else 1)
 
@@ -891,7 +984,7 @@ async def generate_image(
                     service_override if ch is channels[0] else None,
                     size=size, negative_prompt=negative if ch.supports_negative else "",
                     seed=seed, extra=extra or None,
-                    subject_ref=subject_ref,
+                    subject_refs=subject_refs,
                 )
                 used_channel = ch
                 used_prompt = attempt_prompt
@@ -926,11 +1019,18 @@ async def generate_image(
         ineffective: list[str] = list(notes)
         if negative and not used_channel.supports_negative:
             ineffective.append("负面提示词不被该通道协议支持，已忽略；防写实请写进提示词的反写实条款")
-        if subject_ref and not used_channel.supports_reference:
+        if subject_refs and not used_channel.supports_reference:
             ineffective.append("参考图（subject_reference）未生效：该通道不支持人物参考图，已退化为纯文生图")
         if ineffective:
             out["params_note"] = "；".join(ineffective)
-        if subject_ref and used_channel.supports_reference:
+        # 能力位说支持 ≠ 真的用上了：服务端不认 edits 时会退回文生图并留下
+        # "参考图未生效"的说明 —— 那种情况不能标成已用参考图（否则一致性无从追溯）。
+        ref_actually_used = bool(
+            subject_refs
+            and used_channel.supports_reference
+            and not any(_REF_UNUSED_NOTE in n for n in notes)
+        )
+        if ref_actually_used:
             out["used_subject_reference"] = True
         out["prompt_used"] = used_prompt[:1200]
         return out
@@ -950,7 +1050,7 @@ async def generate_image(
     }
     if trace:
         out["channel_trace"] = trace
-    if subject_ref:
+    if subject_refs:
         out["params_note"] = "参考图（subject_reference）未生效：本地兜底分镜卡不支持人物参考图"
     return out
 
@@ -966,15 +1066,16 @@ async def _request_via_channel(
     negative_prompt: str,
     seed: int,
     extra: dict | None,
-    subject_ref: str | None,
+    subject_refs: list[str] | None,
 ) -> tuple[bytes, str, list[str]]:
     """按通道协议分发请求。model_override / service_override 仅主通道消费。"""
+    refs = [r for r in (subject_refs or []) if r]
     if ch.kind == "dashscope-mm":
         return await _request_dashscope_mm_image(
             prompt, ratio, model=model_override or ch.model or None,
             base_url=ch.base_url, api_key=ch.api_key,
             size=size or None, negative_prompt=negative_prompt, seed=seed,
-            extra=extra, reference_images=[subject_ref] if subject_ref else None,
+            extra=extra, reference_images=refs or None,
         )
     if ch.kind == "dashscope":
         return await _request_dashscope_image(
@@ -987,10 +1088,12 @@ async def _request_via_channel(
             prompt, ratio, model=model_override or ch.model or None,
             service=service_override or ch.service or None,
             base_url=ch.base_url, api_key=ch.api_key,
-            subject_reference=subject_ref, seed=seed, extra=extra,
+            subject_reference=refs[0] if refs else None, seed=seed, extra=extra,
+            extra_refs=max(0, len(refs) - 1),
         )
     return await _request_real_image(
         prompt, ratio, model=model_override or ch.model or None,
         base_url=ch.base_url, api_key=ch.api_key,
         size=size or None, negative_prompt=negative_prompt, seed=seed, extra=extra,
+        subject_refs=refs or None,
     )

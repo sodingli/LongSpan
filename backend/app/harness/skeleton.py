@@ -183,23 +183,31 @@ def render_table(skel: dict) -> str:
     """把骨架渲染成 Markdown 表（表格比 JSON 更容易被模型逐行照抄）。"""
     lines = [
         f"共 **{skel['panel_count']} 格**（格数由 spec 决定，不是 12 就照抄 12）。"
-        "下表由系统生成，**格号 / shot_size 两列必须原样照抄**；"
-        "scene_id 是你决定的内容（场景有几个、叫什么，写进 scenes.json），"
-        "只需保证换场不三连（A-B-A）、场景总数 ≤3。"
+        "下表由系统生成，**格号 / shot_size 两列必须原样照抄**。"
         "只填 action / prompt / subtitle / speaker / motion / duration_seconds：",
         "",
-        "| 格 | scene_id（建议） | shot_size（必照抄） | 剧情功能（按此写内容，不要改结构） |",
-        "| --- | --- | --- | --- |",
+        "| 格 | shot_size（必照抄） | 剧情功能（按此写内容，不要改结构） |",
+        "| --- | --- | --- |",
     ]
     for p in skel["panels"]:
         lines.append(
-            f"| {p['index']} | {p['scene_id']} | {p['shot_size']} | "
+            f"| {p['index']} | {p['shot_size']} | "
             f"{p['function'] or _SHOT_LABEL.get(p['shot_size'], '')} |"
         )
     lines.append("")
     lines.append(
-        "相邻格景别已排开，不要自行升/降景别；scene_id 是建议值，"
-        "你可以按剧情改成别的场景号，但要写进 scenes.json，且换场遵守 A-B-A（不三连）。"
+        "相邻格景别已排开，不要自行升/降景别。"
+    )
+    # 2026-10-29 实测事故：旧版这张表还带一列「scene_id（建议）」，按固定位置预分配
+    # S1/S2/S3（第 4/5 格=S2、第 8/9 格=S3）。模型把建议当契约，为了让剧情落在
+    # 这些"指定"的场景位上，把「点单」从剧本第 9 格搬到了第 4 格 —— 成片顺序与剧本
+    # 不一致。场景是创作内容（故事发生在哪几个空间），不该由机器按格位预分配；
+    # 格序则相反，是剧本的契约，一个字都不能搬。所以这里只留结构列，并写明格序铁律。
+    lines.append(
+        "**格序铁律**：第 N 格必须演 `script.md` 第 N 格的剧情，一格对一格，禁止搬动剧情节拍。"
+        "场景预算（≤3 场景 / A-B-A / 主场景占比）只能靠「同格换视距、把相邻空间合并成一个场景卡、"
+        "或回 C2 调整场景预算」来满足 —— **不允许为了场景序列好看去重排剧情**。"
+        "scene_id 由你按剧本顺序决定，写进 scenes.json 即可。"
     )
     return "\n".join(lines)
 

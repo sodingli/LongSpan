@@ -33,6 +33,43 @@ FILE_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# DeepSeek/京东云网关会输出一套 DSML 工具调用方言。这里的关键字符是全角竖线
+#（U+FF5C），不能用普通 ASCII | 简单替换，否则会漏掉真实调用。
+_DSML_OPEN = "<｜｜DSML｜｜"
+_DSML_CLOSE = "</｜｜DSML｜｜"
+_DSML_INVOKE_RE = re.compile(
+    re.escape(_DSML_OPEN)
+    + r"\s*invoke\s+name=[\"'](?P<name>[^\"']+)[\"']\s*>\s*(?P<body>.*?)\s*"
+    + re.escape(_DSML_CLOSE + " invoke>"),
+    re.DOTALL,
+)
+_DSML_PARAM_RE = re.compile(
+    re.escape(_DSML_OPEN)
+    + r"\s*parameter\s+name=[\"'](?P<name>[^\"']+)[\"']\s+string=[\"']"
+    + r"(?P<string>true|false)[\"']\s*>\s*(?P<value>.*?)\s*"
+    + re.escape(_DSML_CLOSE + " parameter>"),
+    re.DOTALL,
+)
+_DSML_CALLS_RE = re.compile(
+    re.escape(_DSML_OPEN) + r"\s*calls>\s*.*?\s*" + re.escape(_DSML_CLOSE + " calls>"),
+    re.DOTALL,
+)
+
+# 另一个真实模型方言：把 OpenAI 风格的 tool call JSON 写进自定义标签。
+# 标签在运行期拼出来，避免这段协议标记被其它工具误当作真实调用。
+_TOOL_OPEN_TAG = "<" + "tool_call" + ">"
+_TOOL_CLOSE_TAG = "</" + "tool_call" + ">"
+_TOOL_CALL_BLOCK_RE = re.compile(
+    re.escape(_TOOL_OPEN_TAG)
+    + r"\s*(?P<body>.*?)\s*"
+    + re.escape(_TOOL_CLOSE_TAG),
+    re.DOTALL,
+)
+_FENCE_RE = re.compile(
+    r"(" + "`" * 3 + r")(?:json)?\s*(?P<body>.*?)\s*\1",
+    re.DOTALL,
+)
+
 # 宽容模式：模型写了 <<<FILE:...>>> 却漏掉 <<<END>>>（实测真实模型会这样）。
 # 取到下一个文件块开始标记或文本末尾为止 —— 先保住产物，质量交给验收标准判断。
 OPEN_FILE_BLOCK_RE = re.compile(
@@ -76,6 +113,135 @@ def strip_file_blocks(text: str) -> str:
     return out.strip()
 
 
+def _decode_tool_call_object(value: Any, valid_names: set[str] | None) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    if valid_names is not None and name not in valid_names:
+        return None
+    arguments = value.get("arguments", {})
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return {"name": name, "arguments": arguments}
+
+
+def parse_dsml_calls(text: str, valid_names: set[str] | None = None) -> list[dict]:
+    """解析模型真实输出的 DSML 方言。
+
+    已实测两种形态：
+    - 无参调用：list_artifacts
+    - 参数调用：record_decision，其中 string="false" 表示参数值是 JSON
+    """
+    calls: list[dict] = []
+    for match in _DSML_INVOKE_RE.finditer(text or ""):
+        name = match.group("name").strip()
+        if valid_names is not None and name not in valid_names:
+            continue
+        arguments: dict[str, Any] = {}
+        for param in _DSML_PARAM_RE.finditer(match.group("body")):
+            key = param.group("name").strip()
+            raw_value = param.group("value")
+            if param.group("string").lower() == "false":
+                try:
+                    value = json.loads(raw_value)
+                except (TypeError, json.JSONDecodeError):
+                    value = raw_value
+            else:
+                value = raw_value
+            arguments[key] = value
+        calls.append({"name": name, "arguments": arguments})
+    return calls
+
+
+def parse_json_tool_calls(text: str, valid_names: set[str]) -> list[dict]:
+    """解析 JSON 形态的工具调用（自定义标签与 fenced code block）。
+
+    只接受 name/arguments 结构，并且工具名必须在阶段白名单内，避免把普通
+    JSON 产物误认成工具调用。
+    """
+    calls: list[dict] = []
+    for regex in (_TOOL_CALL_BLOCK_RE, _FENCE_RE):
+        for match in regex.finditer(text or ""):
+            try:
+                obj = json.loads(match.group("body"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            call = _decode_tool_call_object(obj, valid_names)
+            if call is not None:
+                calls.append(call)
+
+    # 同一轮里 DSML 与 JSON 可能重复表达同一个调用；去重后再执行。
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for call in calls:
+        key = call["name"] + ":" + json.dumps(call["arguments"], ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(call)
+    return unique
+
+
+def strip_tool_protocol(text: str, valid_names: set[str] | None = None) -> str:
+    """从展示正文中剔除 DSML/JSON 工具调用协议，只保留人能读的内容。"""
+    out = _DSML_CALLS_RE.sub("", text or "")
+    out = _DSML_INVOKE_RE.sub("", out)
+    out = _TOOL_CALL_BLOCK_RE.sub("", out)
+
+    def strip_fence(match: re.Match[str]) -> str:
+        try:
+            obj = json.loads(match.group("body"))
+        except (TypeError, json.JSONDecodeError):
+            return match.group(0)
+        call = _decode_tool_call_object(obj, valid_names)
+        return "" if call is not None else match.group(0)
+
+    out = _FENCE_RE.sub(strip_fence, out)
+    return out.strip()
+
+
+def normalize_tool_arguments(spec: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    """按 ToolSpec 过滤参数，并把字符串形态的 int/bool 矫正回来。"""
+    inputs = spec.inputs if isinstance(getattr(spec, "inputs", None), dict) else {}
+    properties = inputs.get("properties") if isinstance(inputs.get("properties"), dict) else {}
+    cleaned: dict[str, Any] = {}
+    for key, value in (arguments or {}).items():
+        if key not in properties:
+            continue
+        schema = properties.get(key)
+        if isinstance(schema, dict):
+            value_type = schema.get("type")
+            if value_type == "integer" and isinstance(value, str):
+                try:
+                    value = int(value.strip())
+                except ValueError:
+                    pass
+            elif value_type == "boolean" and isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"true", "false"}:
+                    value = normalized == "true"
+        cleaned[key] = value
+    return cleaned
+
+
+def _compact_json(value: Any, limit: int = 4000) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        text = str(value)
+    return text if len(text) <= limit else text[:limit] + f"…（截断，共 {len(text)} 字符）"
+
+
+def _format_observation(name: str, arguments: dict[str, Any], output: Any) -> str:
+    return (
+        f"### 工具 {name} 执行结果\n"
+        f"输入：{_compact_json(arguments)}\n"
+        f"输出：{_compact_json(output)}"
+    )
+
+
 class AgentRunner:
     def __init__(self, on_event: Callable[..., None]) -> None:
         self.on_event = on_event
@@ -93,7 +259,16 @@ class AgentRunner:
     ) -> AgentResult:
         provider = get_provider_for(model_override)
         visible = registry.whitelist(tools_whitelist or [])
+        visible_names = {t.name for t in visible}
         result = AgentResult()
+        current_user = user
+        seen_decisions: set[str] = set()
+        declared_produces = ctx.extra.get("declared_produces") or {}
+        stage_produces = {
+            str(path).strip().lstrip("./")
+            for path, owner in declared_produces.items()
+            if owner == ctx.stage_id
+        }
 
         self.on_event(
             EventType.AGENT_THOUGHT,
@@ -104,106 +279,256 @@ class AgentRunner:
                 "provider": provider.name,
                 "model": getattr(provider, "model", ""),
                 "model_overridden": bool(model_override and getattr(provider, "model", "") == model_override),
-            },
+                },
         )
 
-        resp = await provider.chat(system=system, user=user, demo=demo, json_mode=json_mode)
-        result.raw = resp.text
-        result.tokens += resp.tokens
-        result.cost_usd += resp.cost_usd
-        result.iterations = 1
-
-        # 主模型不可用而自动回退时，如实告知 —— 用户必须知道"这次的产物是谁写的"
-        if getattr(resp, "fallback_from", ""):
+        async def write_artifact(path: str, content: str, source: str, model: str) -> bool:
+            rel = str(path).strip().lstrip("./")
+            if stage_produces and rel not in stage_produces:
+                message = (
+                    f"已忽略 {path or '（空路径）'}：它不是本阶段声明的交付产物 "
+                    f"（本阶段应交付：{'、'.join(sorted(stage_produces))}）。"
+                )
+                result.observations.append(message)
+                self.on_event(
+                    EventType.TOOL_RESULT,
+                    message,
+                    stage_id=stage_id,
+                    payload={
+                        "tool": "write_artifact",
+                        "source": source,
+                        "model": model,
+                        "ignored": True,
+                        "path": path,
+                        "expected": sorted(stage_produces),
+                    },
+                )
+                return False
             self.on_event(
-                EventType.AGENT_THOUGHT,
-                f"主模型 {resp.fallback_from} 不可用，已自动回退到备用模型 {resp.model} 完成本阶段",
+                EventType.TOOL_CALL,
+                f"写入产物 {path}",
                 stage_id=stage_id,
-                payload={
-                    "fallback_from": resp.fallback_from,
-                    "fallback_to": resp.model,
-                    "reason": getattr(resp, "fallback_reason", ""),
-                },
+                payload={"tool": "write_artifact", "path": path, "source": source, "model": model},
             )
-
-        blocks = parse_file_blocks(resp.text)
-        if blocks and is_tolerant_parse(resp.text):
+            out = await registry.invoke(
+                "write_artifact", ctx, path=path, content=content, kind=_guess_kind(path)
+            )
+            if isinstance(out, dict) and out.get("error"):
+                result.observations.append(f"写入失败 {path}: {out['error']}")
+                self.on_event(
+                    EventType.TOOL_RESULT,
+                    f"写入失败：{out['error']}",
+                    stage_id=stage_id,
+                    payload={"tool": "write_artifact", "source": source, "model": model, **out},
+                )
+                return False
+            result.files.append(path)
             self.on_event(
-                EventType.AGENT_THOUGHT,
-                f"模型漏写了文件块结束标记，已按宽容模式解析并落盘 {len(blocks)} 个产物（请人工留意内容完整性）",
+                EventType.ARTIFACT_CREATED,
+                f"产物已生成：{path}",
                 stage_id=stage_id,
-                payload={"tolerant_parse": True, "files": [p for p, _ in blocks]},
+                payload={"path": path, "stage_id": stage_id},
             )
-        if blocks:
+            return True
+
+        async def record_decision(arguments: dict[str, Any]) -> tuple[bool, Any]:
+            what = arguments.get("what")
+            if not what:
+                return False, {"error": "record_decision 缺少 what"}
+            what = str(what)
+            key = what[:80]
+            if key in seen_decisions:
+                return False, {"skipped": "重复决策，已忽略"}
+            seen_decisions.add(key)
+            payload = {
+                "what": what,
+                "why": str(arguments.get("why", "")),
+                "alternatives": arguments.get("alternatives") or [],
+            }
+            result.decisions.append(payload)
+            out = await registry.invoke("record_decision", ctx, **payload)
+            self.on_event(
+                EventType.DECISION_RECORDED,
+                f"决策：{what[:60]}",
+                stage_id=stage_id,
+                payload=payload,
+            )
+            return True, out
+
+        for iteration in range(1, MAX_ITERATIONS + 1):
+            resp = await provider.chat(
+                system=system,
+                user=current_user,
+                demo=demo if iteration == 1 else None,
+                json_mode=json_mode,
+            )
+            result.raw = resp.text
+            result.tokens += resp.tokens
+            result.cost_usd += resp.cost_usd
+            result.iterations = iteration
+
+            # 主模型不可用而自动回退时，如实告知 —— 用户必须知道"这次的产物是谁写的"
+            if getattr(resp, "fallback_from", ""):
+                self.on_event(
+                    EventType.AGENT_THOUGHT,
+                    f"主模型 {resp.fallback_from} 不可用，已自动回退到备用模型 {resp.model} 完成本阶段",
+                    stage_id=stage_id,
+                    payload={
+                        "fallback_from": resp.fallback_from,
+                        "fallback_to": resp.model,
+                        "reason": getattr(resp, "fallback_reason", ""),
+                    },
+                )
+
+            observation_start = len(result.observations)
+            blocks = parse_file_blocks(resp.text)
+            if blocks and is_tolerant_parse(resp.text):
+                self.on_event(
+                    EventType.AGENT_THOUGHT,
+                    f"模型漏写了文件块结束标记，已按宽容模式解析并落盘 {len(blocks)} 个产物（请人工留意内容完整性）",
+                    stage_id=stage_id,
+                    payload={"tolerant_parse": True, "files": [p for p, _ in blocks]},
+                )
+
+            files_this_round = 0
             for path, body in blocks:
+                written = await write_artifact(path, body, "file_block", resp.model)
+                files_this_round += int(written)
+
+            dsml_calls = parse_dsml_calls(resp.text, visible_names)
+            json_calls = parse_json_tool_calls(resp.text, visible_names)
+            if dsml_calls:
+                self.on_event(
+                    EventType.AGENT_THOUGHT,
+                    "模型输出了 DSML 工具调用，Harness 已识别并执行："
+                    + "、".join(c["name"] for c in dsml_calls),
+                    stage_id=stage_id,
+                    payload={
+                        "protocol": "dsml",
+                        "tools": [c["name"] for c in dsml_calls],
+                        "model": resp.model,
+                    },
+                )
+            tool_calls = [*dsml_calls, *json_calls]
+            unique_calls: list[dict] = []
+            seen_calls: set[str] = set()
+            for call in tool_calls:
+                key = call["name"] + ":" + _compact_json(call["arguments"])
+                if key in seen_calls:
+                    continue
+                seen_calls.add(key)
+                unique_calls.append(call)
+
+            executed_calls = 0
+            for call in unique_calls:
+                name = call["name"]
+                spec = registry.get(name)
+                if spec is None or name not in visible_names:
+                    continue
+                arguments = normalize_tool_arguments(spec, call["arguments"])
+                executed_calls += 1
+
+                if name == "write_artifact":
+                    path = str(arguments.get("path", ""))
+                    content = str(arguments.get("content", ""))
+                    if await write_artifact(path, content, "dsml_or_json", resp.model):
+                        files_this_round += 1
+                    continue
+
                 self.on_event(
                     EventType.TOOL_CALL,
-                    f"写入产物 {path}",
+                    f"模型使用 {name} 工具",
                     stage_id=stage_id,
-                    payload={"tool": "write_artifact", "path": path},
+                    payload={
+                        "tool": name,
+                        "source": "dsml_or_json",
+                        "model": resp.model,
+                        "arguments": arguments,
+                    },
                 )
-                out = await registry.invoke(
-                    "write_artifact", ctx, path=path, content=body, kind=_guess_kind(path)
-                )
-                if isinstance(out, dict) and out.get("error"):
-                    result.observations.append(f"写入失败 {path}: {out['error']}")
-                    self.on_event(
-                        EventType.TOOL_RESULT,
-                        f"写入失败：{out['error']}",
-                        stage_id=stage_id,
-                        payload=out,
-                    )
+                if name == "record_decision":
+                    recorded, out = await record_decision(arguments)
                 else:
+                    out = await registry.invoke(name, ctx, **arguments)
+
+                failed = isinstance(out, dict) and bool(out.get("error"))
+                result.observations.append(_format_observation(name, arguments, out))
+                self.on_event(
+                    EventType.TOOL_RESULT,
+                    f"工具 {name} {'失败' if failed else '完成'}",
+                    stage_id=stage_id,
+                    payload={
+                        "tool": name,
+                        "source": "dsml_or_json",
+                        "model": resp.model,
+                        "result": out,
+                    },
+                )
+
+                if name == "placeholder_image" and not failed and isinstance(out, dict) and out.get("path"):
+                    path = str(out["path"])
                     result.files.append(path)
+                    files_this_round += 1
                     self.on_event(
                         EventType.ARTIFACT_CREATED,
                         f"产物已生成：{path}",
                         stage_id=stage_id,
-                        payload={"path": path, "stage_id": stage_id},
+                        payload={"path": path, "stage_id": stage_id, "source": "tool"},
                     )
 
-        # 决策留痕：模型可能把 decisions 写在正文 JSON 里，也可能写在某个产物 JSON 内
-        payloads: list[dict] = []
-        top = extract_json(resp.text)
-        if isinstance(top, dict):
-            payloads.append(top)
-        for _path, body in blocks:
-            inner = extract_json(body)
-            if isinstance(inner, dict):
-                payloads.append(inner)
+            # 决策留痕：模型可能把 decisions 写在正文 JSON 里，也可能写在某个产物 JSON 内
+            payloads: list[dict] = []
+            top = extract_json(resp.text)
+            if isinstance(top, dict):
+                payloads.append(top)
+            for _path, body in blocks:
+                inner = extract_json(body)
+                if isinstance(inner, dict):
+                    payloads.append(inner)
 
-        seen_what: set[str] = set()
-        for payload in payloads:
-            for d in payload.get("decisions", []) or []:
-                if not isinstance(d, dict) or not d.get("what"):
-                    continue
-                key = str(d["what"])[:80]
-                if key in seen_what:
-                    continue
-                seen_what.add(key)
-                result.decisions.append(d)
-                await registry.invoke(
-                    "record_decision",
-                    ctx,
-                    what=str(d.get("what", "")),
-                    why=str(d.get("why", "")),
-                    alternatives=d.get("alternatives") or [],
-                )
+            for payload in payloads:
+                for d in payload.get("decisions", []) or []:
+                    if not isinstance(d, dict) or not d.get("what"):
+                        continue
+                    await record_decision(d)
+
+            vis = strip_tool_protocol(strip_file_blocks(resp.text), visible_names)
+            if vis:
+                result.text = vis
                 self.on_event(
-                    EventType.DECISION_RECORDED,
-                    f"决策：{str(d.get('what',''))[:60]}",
+                    EventType.AGENT_MESSAGE,
+                    vis[:600],
                     stage_id=stage_id,
-                    payload=d,
+                    payload={"full": vis},
                 )
 
-        vis = strip_file_blocks(resp.text)
-        if vis:
-            result.text = vis
+            # 有交付就结束本轮 agent loop；没有交付但模型调用了工具，则把只读结果
+            # 回灌给模型继续跑。典型场景：DeepSeek 先 list_artifacts 侦察，再写产物。
+            if files_this_round > 0:
+                break
+            if executed_calls == 0 and not blocks:
+                break
+            if iteration >= MAX_ITERATIONS:
+                break
+
+            new_observations = result.observations[observation_start:]
+            if not new_observations:
+                break
+            current_user += (
+                f"\n\n## HARNESS TOOL OBSERVATIONS（第 {iteration} 轮）\n"
+                + "\n\n".join(new_observations)
+                + "\n\n你上一轮调用了工具，但没有交付文件。请基于以上真实结果继续完成本阶段交付；"
+                  "交付产物必须使用文件块（<<<FILE:相对路径>>> ... <<<END>>>），不要把工具调用写成产物文件。"
+            )
             self.on_event(
-                EventType.AGENT_MESSAGE,
-                vis[:600],
+                EventType.AGENT_THOUGHT,
+                f"第 {iteration} 轮没有文件交付，已执行 {executed_calls} 个工具调用并把结果回灌模型",
                 stage_id=stage_id,
-                payload={"full": vis},
+                payload={
+                    "iteration": iteration,
+                    "executed_calls": executed_calls,
+                    "tool_calls": [c["name"] for c in unique_calls],
+                },
             )
 
         return result

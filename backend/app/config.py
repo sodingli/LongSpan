@@ -91,7 +91,13 @@ class Settings(BaseSettings):
     vision_check_mode: str = "auto"
     vision_api_key: str = ""        # 留空 = 复用 image_api_key（同一中转）
     vision_base_url: str = ""       # 留空 = 复用 image_base_url
-    vision_model: str = "qwen3-vl-plus"
+    # 协议：auto（按 base_url 推断）/ dashscope（原生 multimodal-generation）/
+    #       openai-compat（POST {base}/chat/completions，京东云等中转走这个）
+    vision_provider: str = "auto"
+    # 留空 = 自动挑：openai-compat 复用 llm_model，dashscope 用 qwen3-vl-plus。
+    # 2026-10-28 事故：写死 qwen3-vl-plus + 京东云 base_url → 该 Key 下没有此模型，
+    # 每格自检都 400，视觉这层等于不存在。
+    vision_model: str = ""
     # 检出构图残缺后自动重画的次数上限（0 = 只标注不重画；1 次足够，两次都画错多半是提示词问题）
     vision_retry_limit: int = 1
     # Remotion 渲染并发 tab 数：本机 macOS < 15 时高并发会部分 tab 连不上

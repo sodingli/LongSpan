@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,6 +30,9 @@ PANELS_REL = "panels.json"
 PANELS_ORIGIN_REL = "panels.origin.json"
 CHARACTERS_REL = "characters.md"
 CHARACTERS_ORIGIN_REL = "characters.origin.md"
+# 单角色定妆图提示词覆盖：{role: {"prompt": "...", "updated_at": "..."}}
+# 用户改完提示词点「重新生成定妆图」时写这里，生图工具优先用它（锚点原文只作兜底）。
+CHARACTER_ART_PROMPTS_REL = "characters/art_prompts.json"
 IMAGES_REL = "media/images.json"
 LINES_REL = "lines.json"
 OVERRIDES_REL = "canvas_overrides.json"
@@ -284,13 +288,120 @@ def save_characters(storage: Any, run_id: str, text: str) -> dict:
     return {"ok": True, "backed_up_origin": backed_up, "chars": len(text)}
 
 
-def characters_state(storage: Any, run_id: str) -> dict:
-    """角色卡状态：当前文本 + 从锚点里抽出的角色名（供画布渲染角色标签）。"""
-    text = load_characters(storage, run_id)
-    # 角色标题形如「陈默（主角）」；不带括号的二级标题通常是"自检 / 留痕"等说明段，不算角色
+def load_character_art_prompts(storage: Any, run_id: str) -> dict[str, str]:
+    """读单角色定妆图提示词覆盖 → {role: prompt}（只返回非空的）。"""
+    data = read_json(storage, run_id, CHARACTER_ART_PROMPTS_REL, {}) or {}
+    out: dict[str, str] = {}
+    for role, item in (data.items() if isinstance(data, dict) else []):
+        prompt = ""
+        if isinstance(item, dict):
+            prompt = str(item.get("prompt") or "").strip()
+        elif isinstance(item, str):
+            prompt = item.strip()
+        if prompt:
+            out[str(role).strip().lower()] = prompt
+    return out
+
+
+def save_character_art_prompt(storage: Any, run_id: str, role: str, prompt: str) -> dict:
+    """写/清某个角色的定妆图提示词覆盖。空字符串 = 清除覆盖、回到锚点原文。"""
+    key = str(role or "").strip().lower()
+    if not key:
+        raise ValueError("角色标识不能为空")
+    data = read_json(storage, run_id, CHARACTER_ART_PROMPTS_REL, {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    text = str(prompt or "").strip()
+    if text:
+        data[key] = {"prompt": text, "updated_at": _now()}
+    else:
+        data.pop(key, None)
+    storage.write_json(run_id, CHARACTER_ART_PROMPTS_REL, data)
+    record_edit(storage, run_id, "character_art_prompt", {"role": key, "chars": len(text)})
+    return {"ok": True, "role": key, "prompt": text, "cleared": not text}
+
+
+def character_art_state(
+    storage: Any, run_id: str, pairs: list[tuple[str, str]]
+) -> dict[str, dict]:
+    """每个角色的定妆图状态：有没有图、路径、用户改过的提示词。
+
+    画布要能回答「这个角色的定妆图定了没 / 我上次改的提示词是什么」——
+    只给一个角色名标签是不够的：用户点「重新生成」时得看到当前用的是哪句提示词。
+
+    pairs 是 (展示名, 角色标识) —— 展示名来自 `## 陈默（主角）` 标题，
+    角色标识来自 `CHENMO_ANCHOR` 标签（定妆图文件名就是它的小写形式）。
+    两者在 characters.md 里没有显式关联，只能按标题顺序 ↔ 锚点顺序对齐
+    （与 consistency.extract_role_names 的既有约定一致）。
+    """
+    prompts = load_character_art_prompts(storage, run_id)
+    out: dict[str, dict] = {}
+    for name, role in pairs:
+        key = str(role or "").strip().lower()
+        if not key:
+            continue
+        safe = "".join(ch for ch in key if ch.isalnum() or ch in "_-")
+        path = ""
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            rel = f"characters/{safe}{ext}"
+            if storage.exists(run_id, rel):
+                path = rel
+                break
+        out[str(name)] = {
+            "role": key,
+            "name": str(name),
+            "art_path": path,
+            "has_art": bool(path),
+            "prompt": prompts.get(key, ""),
+        }
+    return out
+
+
+# 锚点定义行：行首的 `XXX_ANCHOR:` / `XXX_ANCHOR =`
+_ANCHOR_DEF_RE = re.compile(r"^\s*([A-Za-z0-9_\-]+)_ANCHOR\s*[:=]", re.IGNORECASE)
+
+
+def _role_pairs(text: str) -> list[tuple[str, str]]:
+    """(展示名, 角色标识) 列表 —— 画布定位定妆图的唯一依据。
+
+    角色标识取 `XXX_ANCHOR` 标签（定妆图文件名就是它的小写）；
+    展示名取该锚点**上方最近的二级标题**。
+
+    为什么不用"所有二级标题"（旧实现，2026-10-29 实测踩到）：
+    真实 characters.md 里有 `## 0. 本版与上游的关系` / `## 4. 视觉区分度` /
+    `## 5. 定妆图清单` 这类说明小节，旧实现把它们全当成了角色名 ——
+    画布上出现 4 个"角色"，其中 3 个没有定妆图，用户根本不知道该点哪个。
+    锚点一定写在角色小节里，说明小节不会有锚点定义行，天然被排除。
+
+    只认**行首**的锚点定义：正文里引用 `LINXIAOMAN_ANCHOR:` / `CHENMO_ANCHOR:`
+    的说明句（"标签为 `A_ANCHOR:` / `B_ANCHOR:`"）不能算角色。
+    """
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    heading = ""
+    for line in (text or "").splitlines():
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            continue
+        m = _ANCHOR_DEF_RE.match(line)
+        if not m:
+            continue
+        tag = m.group(1).strip().lower()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        name = heading or tag
+        name = re.sub(r"^\d+\s*[.、)）]\s*", "", name)   # 去掉「1. 」编号
+        name = re.split(r"[·|｜]", name)[0].strip() or tag  # 去掉「· 女生 · 21」副标题
+        pairs.append((name, tag))
+    return pairs
+
+
+def _heading_roles(text: str) -> list[str]:
+    """兜底：没有锚点标签时，退回二级标题里的角色名（旧行为，不猜但也不空手）。"""
     names: list[str] = []
     loose: list[str] = []
-    for line in text.splitlines():
+    for line in (text or "").splitlines():
         if not line.startswith("## "):
             continue
         raw = line[3:].strip()
@@ -301,10 +412,24 @@ def characters_state(storage: Any, run_id: str) -> dict:
             names.append(bare)
         elif bare:
             loose.append(bare)
+    return names or loose
+
+
+def characters_state(storage: Any, run_id: str) -> dict:
+    """角色卡状态：当前文本 + 角色名 + 每个角色的定妆图状态（供画布渲染）。"""
+    text = load_characters(storage, run_id)
+    pairs = _role_pairs(text)
+    if not pairs:
+        pairs = [(name, str(name).lower()) for name in _heading_roles(text)]
+    roles = [name for name, _ in pairs]
     return {
         "text": text,
-        # 一个带括号的都没抽到，就退回全部二级标题（不猜、但也不空手）
-        "roles": names or loose,
+        # 角色展示名（与 role_tags 同序）；没有锚点标签时退回二级标题
+        "roles": roles,
+        # 角色标识（锚点标签）与展示名可能不同：画布按 role 定位定妆图与提示词覆盖
+        "art": character_art_state(storage, run_id, pairs),
+        # 机器可读的角色标识列表（与 roles 同序），前端不必自己猜
+        "role_tags": [tag for _, tag in pairs],
         "has_origin": storage.exists(run_id, CHARACTERS_ORIGIN_REL),
         "origin_text": read_text(storage, run_id, CHARACTERS_ORIGIN_REL, ""),
     }

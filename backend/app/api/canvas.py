@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -32,6 +33,22 @@ from ..store import storage
 logger = logging.getLogger("longspan.canvas.api")
 
 router = APIRouter(prefix="/api/runs", tags=["canvas"])
+
+def _spec_style_anchor(run_id: str) -> str | None:
+    """读 C2 在 spec.json 里冻结的规格风格锚（画布重绘与管线同源）。
+
+    2026-10-29：风格锚以 spec.json 为准，media 层的硬编码条款只作兜底。
+    画布上「重画这一格」如果走另一套风格，等于手改一格就把全片画风撕开。
+    """
+    for rel in ("spec.json", "production_spec.json"):
+        try:
+            doc = json.loads(storage.read_text(run_id, rel))
+        except Exception:  # noqa: BLE001 —— 读不到就退回硬编码兜底
+            continue
+        if isinstance(doc, dict):
+            return str(doc.get("style_anchor") or "").strip() or None
+    return None
+
 
 _DATA_URL_RE = re.compile(r"^data:image/([a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
 _VIDEO_DATA_URL_RE = re.compile(r"^data:video/([a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
@@ -388,15 +405,16 @@ async def regenerate_panel(
     # FR-07（2026-10-22）：重绘也走「参考图」—— 手改一格，脸不再变。
     # 复用管线同一套三级查找（标签文件名 → 锚点内容匹配 → 任意定妆图兜底），
     # 保证画布重绘与自动生成拿到的是同一张定妆图（同一张源头，风格才对等）。
-    ref_path: str | None = None
-    ref_role: str | None = None
+    ref_paths: list[str] = []
+    ref_roles: list[str] = []
     ref_notes: list[str] = []
     try:
         from types import SimpleNamespace
 
-        from ..harness.tools import _find_reference_art
+        from ..harness.tools import _find_reference_arts
 
-        ref_path, ref_role, ref_notes = _find_reference_art(
+        # 同框格把每个出场角色的定妆图都带上（2026-11-02）—— 只带一张等于给配角换脸
+        ref_paths, ref_roles, ref_notes = _find_reference_arts(
             SimpleNamespace(storage=storage, run_id=run_id), prompt
         )
     except Exception as exc:  # noqa: BLE001 —— 参考图是增强，找不到就退回纯文生图
@@ -404,26 +422,37 @@ async def regenerate_panel(
 
     # 锚点标签是机器路标不是画面内容（管线同款处理）：送生图前剥掉。
     # 注意 panels.json 里落盘的仍是原文（管线重跑还要靠它匹配锚点）。
-    from ..harness.tools import _apply_empty_shot_guard, _strip_anchor_tags
+    from ..harness.tools import (
+        _apply_empty_shot_guard, _apply_scene_anchor, _prompt_fingerprint,
+        _read_scene_map, _strip_anchor_tags,
+    )
 
     send_prompt = _strip_anchor_tags(prompt) or prompt
 
     # 空镜守卫（与管线同款，且必须在风格锚之前）：手改一格空镜同样会被凭空补出
-    # 人物；而风格锚会补 "anime face with large expressive eyes"，一句话就让空镜
-    # 判定失效（先注入声明，风格锚才会走"无脸条款"）。
+    # 人物；而风格锚会补角色条款，一句话就可能让空镜判定失效。
     send_prompt, empty_note = _apply_empty_shot_guard(send_prompt)
 
     # 风格锚校验（FR-04 补充）：漫剧类任务的提示词缺「反写实 / 角色风格化」条款，
     # 在生图入口补齐并留痕 —— 不让写实漂移从画布重绘这条路溜进来。
     style_note = None
     if run.skill_id in COMIC_STYLE_SKILLS:
-        send_prompt, style_note = ensure_style_anchor(send_prompt)
-    notes = [n for n in (style_note, empty_note) if n] + list(ref_notes)
+        send_prompt, style_note = ensure_style_anchor(send_prompt, _spec_style_anchor(run_id))
+
+    # 场景锚（2026-11-02 补）：管线的逐格生图会拼上 scenes.json 的冻结背景描述，
+    # 画布重绘以前漏了这一步 —— 同一格在两条路径下拿到的提示词不同，
+    # 背景会漂，提示词指纹也对不上（下次整阶段重跑会误判"提示词变了"而白重画一遍）。
+    from types import SimpleNamespace as _NS
+
+    scene_map = _read_scene_map(_NS(storage=storage, run_id=run_id))
+    send_prompt, scene_note = _apply_scene_anchor(target, send_prompt, scene_map, str(index))
+
+    notes = [n for n in (style_note, empty_note, scene_note) if n] + list(ref_notes)
     style_note = "；".join(notes) or None
     bus.emit(
         db, run_id, EventType.TOOL_CALL,
         f"重画第 {index} 格（模型 {model or '默认'}"
-        + (f"，参考图 {ref_role}" if ref_path else "，无参考图") + "）",
+        + (f"，参考图 {'、'.join(ref_roles)}" if ref_paths else "，无参考图") + "）",
         stage_id=stage_id,
         payload={"human_edit": "regenerate", "index": index, "model": model or "", "service": service or ""},
     )
@@ -431,10 +460,17 @@ async def regenerate_panel(
     out = await generate_image(
         storage, run_id, send_prompt, f"panels/panel-{int(index):02d}.svg", ratio,
         model_override=model or None, service_override=service or None,
-        subject_reference=ref_path,
+        subject_reference=ref_paths or None,
     )
     out["index"] = str(index)
     out["source"] = "model"
+    # 留痕：这张图实际用了哪些角色的定妆图（旧代码不写，images.json 里一直是上一次
+    # 整阶段重跑留下的旧值 —— "用了谁的参考图"从此不可复核）。
+    if ref_roles:
+        out["subject_reference_role"] = ref_roles[0]
+        out["subject_reference_roles"] = list(ref_roles)
+    # 指纹与管线同口径：画布重绘过的图，下次整阶段重跑能正确复用（而不是白重画）
+    out["prompt_fingerprint"] = _prompt_fingerprint(send_prompt, "+".join(ref_roles))
     attach_note(out, style_note or "")
 
     idx = cs.load_image_index(storage, run_id)
@@ -540,6 +576,79 @@ def get_characters_origin(run_id: str, db: Session = Depends(get_db)) -> dict:
     if not text:
         raise HTTPException(status_code=404, detail="没有备份的原件（说明还没被人工改过）")
     return {"text": text}
+
+
+@router.post("/{run_id}/characters/{role}/regenerate")
+async def regenerate_character_art(
+    run_id: str, role: str, payload: dict = Body(default={}), db: Session = Depends(get_db)
+) -> dict:
+    """单角色重生成定妆图：可以先改提示词，再点重新生成。
+
+    2026-10-29 用户要求「角色设定后，可以对角色的提示词进行更改，可以点击重新生成」。
+    与「重跑整个 C4」的区别：
+      - 只重画这一个角色，其他角色的定妆图不动、不重复计费；
+      - 提示词覆盖单独存盘（characters/art_prompts.json），后续整阶段重跑也沿用；
+      - 传 `prompt: ""` = 清除覆盖、回到 characters.md 里的锚点原文。
+    """
+    run = _require_run(db, run_id)
+    state = cs.characters_state(storage, run_id)
+    art = state.get("art") or {}
+    entry = art.get(role) or next(
+        (v for v in art.values() if str(v.get("role")) == str(role).lower()), None
+    )
+    tag = str((entry or {}).get("role") or role).strip().lower()
+    if not tag:
+        raise HTTPException(status_code=400, detail="角色标识不能为空")
+
+    if "prompt" in payload:
+        cs.save_character_art_prompt(storage, run_id, tag, str(payload.get("prompt") or ""))
+
+    eff = cs.effective_image_config(storage, run_id, "characters")
+    model = str(payload.get("image_model") or "").strip() or eff["model"]
+    service = str(payload.get("image_service") or "").strip() or eff["service"]
+
+    from ..harness.tools import ToolContext, _generate_character_art
+
+    ctx = ToolContext(
+        run_id=run_id, stage_id="characters", brief=dict(run.brief or {}), storage=storage,
+        extra={
+            "skill_id": run.skill_id,
+            "channel": run.channel,
+            "image_config": {"model": model, "service": service},
+        },
+    )
+    bus.emit(
+        db, run_id, EventType.TOOL_CALL,
+        f"重新生成角色「{tag}」的定妆图（模型 {model or '默认'}）",
+        stage_id="characters",
+        payload={"human_edit": "character_art_regenerate", "role": tag, "model": model or ""},
+    )
+    out = await _generate_character_art(ctx, force=True, roles=[tag])
+    if isinstance(out, dict) and out.get("error"):
+        raise HTTPException(status_code=400, detail=str(out["error"]))
+
+    created = list(out.get("created") or [])
+    degraded = list(out.get("degraded") or [])
+    art_path = created[0] if created else ""
+    ok = bool(art_path) and not any("占位" in str(d) for d in degraded)
+    bus.emit(
+        db, run_id,
+        EventType.ARTIFACT_CREATED if ok else EventType.AGENT_THOUGHT,
+        f"角色「{tag}」定妆图已重生成：{art_path}" if ok
+        else f"角色「{tag}」定妆图生成降级：{'；'.join(str(d) for d in degraded)[:160]}",
+        stage_id="characters",
+        payload={"human_edit": "character_art_regenerate", "role": tag,
+                 "path": art_path, "degraded": not ok},
+    )
+    cs.record_edit(storage, run_id, "character_art_regenerate", {"role": tag, "model": model or ""})
+    return {
+        "ok": ok,
+        "role": tag,
+        "art_path": art_path,
+        "prompt": (cs.load_character_art_prompts(storage, run_id) or {}).get(tag, ""),
+        "degraded": degraded,
+        "note": "重画只影响之后生成的画面；已画好的分镜格仍是旧脸，需要重画相关格。",
+    }
 
 
 # --------------------------------------------------------------------- 阶段覆盖
@@ -660,7 +769,28 @@ async def regenerate_frame(
     # 风格锚校验（FR-04 补充）：同 regenerate_panel，缺条款自动补齐并留痕。
     style_note = None
     if run.skill_id in COMIC_STYLE_SKILLS:
-        prompt, style_note = ensure_style_anchor(prompt)
+        prompt, style_note = ensure_style_anchor(prompt, _spec_style_anchor(run_id))
+
+    # 人物一致性（2026-10-29 用户要求「首帧、尾帧等要严格按照角色确定的图片生成」）：
+    # 这条路径以前**完全没带参考图** —— 画布上重生成首/中/尾帧，脸只能靠文字描述，
+    # 与逐格生图的锁脸结果不是同一个人。与 regenerate_panel 共用同一套四级查找。
+    from types import SimpleNamespace
+
+    from ..harness.tools import _apply_empty_shot_guard, _find_reference_arts, _strip_anchor_tags
+
+    ref_paths: list[str] = []
+    ref_roles: list[str] = []
+    ref_notes: list[str] = []
+    try:
+        ref_paths, ref_roles, ref_notes = _find_reference_arts(
+            SimpleNamespace(storage=storage, run_id=run_id), prompt
+        )
+    except Exception as exc:  # noqa: BLE001 —— 参考图是增强，找不到就退回纯文生图
+        ref_notes.append(f"参考图查找失败（退回纯文生图）：{exc}")
+    prompt = _strip_anchor_tags(prompt) or prompt
+    prompt, empty_note = _apply_empty_shot_guard(prompt)
+    if empty_note:
+        ref_notes.append(empty_note)
 
     bus.emit(
         db, run_id, EventType.TOOL_CALL,
@@ -673,11 +803,15 @@ async def regenerate_frame(
     out = await generate_image(
         storage, run_id, prompt, f"panels/panel-{n:02d}{suffix}.svg", ratio,
         model_override=model or None, service_override=service or None,
+        subject_reference=ref_paths or None,
     )
     out["index"] = str(index)
     out["source"] = "model"
     out["note"] = "由首帧提示词派生的动作时刻描述" if is_derived else ""
-    attach_note(out, style_note or "")
+    if ref_roles:
+        out["subject_reference_role"] = ref_roles[0]
+        out["subject_reference_roles"] = list(ref_roles)
+    attach_note(out, "；".join([n for n in ([style_note] + list(ref_notes)) if n]))
     cs.set_frame(storage, run_id, index, role, out)
     cs.record_edit(storage, run_id, "frame_regenerate", {"index": str(index), "role": role, "model": model or ""})
 

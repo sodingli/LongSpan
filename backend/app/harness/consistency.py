@@ -277,6 +277,133 @@ def validate_panel_anchors(
     return True, reasons
 
 
+# --------------------------------------------------------------------------- #
+# 画风契约（style_anchor）：spec.json 冻结的画风，逐格原文复用
+#
+# 2026-11-02 事故（用户反馈「成片 0:24 之后风格变了、人物也不一样了」）：
+# C5 其实做对了 —— 12 格 prompt 都以 spec.json 的 style_anchor 原文开头。
+# 坏在生图层：ensure_style_anchor 把规格锚改写成 anime，又前置了一段硬编码平涂条款，
+# 与规格锚里的 `no flat cel-shading` 直接对冲。近景/特写格（脸大）听「anime face」，
+# 全景格（脸小）听厚涂条款 —— 0:24 正好是格 5/6 的分界，成片从此变日系平涂。
+#
+# 所以这条校验守两件事，都在**分镜清单**这一层（生图前就能判，不烧钱）：
+#   1. 每格 prompt 必须以 style_anchor 原文开头（前缀一致 = 全片同一套画风指令）；
+#   2. 不许在正文里另写一套与规格锚**明确否定**的画风词（如规格锚写 no flat
+#      cel-shading，正文却写 flat cel shading）—— 一段提示词里两套画风，模型只会挑
+#      更具体的那条听，结果就是逐格随机漂移。
+# --------------------------------------------------------------------------- #
+
+# 画风词表：只用于「规格锚否定了它、正文却还在要求它」这种确定性冲突判定。
+# 不做审美判断 —— 规格锚没否定的画风词一律放行（画风由 C2 决定，不归校验器管）。
+_STYLE_TERMS = (
+    "flat cel shading",
+    "cel shading",
+    "line art comic style",
+    "lineart",
+    "line art",
+    "anime face",
+    "thick impasto",
+    "oil painting",
+    "watercolor",
+    "ink wash",
+    "photorealistic",
+    "photoreal",
+)
+
+_NEGATION_PREFIX_RE = re.compile(
+    r"(?:\bno|\bnot|\bnon|\bwithout|\bavoid|\bnever|不要|禁止|不得)\s*$", re.IGNORECASE
+)
+
+
+def _norm_style_text(text: str) -> str:
+    """画风词比对前的归一：连字符当空格、压空白、转小写。
+
+    必须归一（2026-11-02 实测）：规格锚写 `no flat cel-shading`（带连字符），
+    正文写 `Flat cel shading`（不带）—— 不归一就判不出这是同一个画风词，
+    校验形同虚设。
+    """
+    return re.sub(r"\s+", " ", (text or "").replace("-", " ")).strip().lower()
+
+
+def _negated_style_terms(anchor: str) -> list[str]:
+    """从规格锚里提取被**明确否定**的画风词（"no flat cel-shading" → "flat cel shading"）。"""
+    low = _norm_style_text(anchor)
+    out: list[str] = []
+    for term in _STYLE_TERMS:
+        idx = low.find(term)
+        while idx >= 0:
+            if _NEGATION_PREFIX_RE.search(low[:idx]):
+                out.append(term)
+                break
+            idx = low.find(term, idx + 1)
+    # 长词优先：避免 "cel shading" 把 "flat cel shading" 的命中重复报一遍
+    out.sort(key=len, reverse=True)
+    deduped: list[str] = []
+    for t in out:
+        if not any(t in kept for kept in deduped):
+            deduped.append(t)
+    return deduped
+
+
+def _asserts_style(text: str, term: str) -> bool:
+    """正文里是否**正向**要求了某个画风词（否定上下文不算）。"""
+    low = _norm_style_text(text)
+    idx = low.find(term)
+    while idx >= 0:
+        if not _NEGATION_PREFIX_RE.search(low[:idx]):
+            return True
+        idx = low.find(term, idx + len(term))
+    return False
+
+
+def validate_style_anchor(panels_json: Any, spec: Any) -> tuple[bool, list[str]]:
+    """逐格校验分镜提示词是否原文复用了 spec.json 的 style_anchor。
+
+    返回 (是否通过, 原因列表)。规格缺失/为空一律判失败 —— 画风没有数字来源时，
+    下游只能各自发挥，那就是「同一集里两种画风」的起点。
+    """
+    reasons: list[str] = []
+    anchor = ""
+    if isinstance(spec, dict):
+        anchor = str(spec.get("style_anchor") or "").strip()
+    if not anchor:
+        return False, [
+            "spec.json 缺少 style_anchor（画风契约未冻结）：分镜没有统一的画风来源，"
+            "逐格只能各自发挥 —— 回 C2 把画风写成英文风格锚"
+        ]
+
+    panels = _extract_items(panels_json, _PANEL_LIST_KEYS)
+    if not panels:
+        return False, ["panels.json 里没有可校验的 panels 数组"]
+
+    fingerprint = _anchor_substring(anchor)
+    negated = _negated_style_terms(anchor)
+    failures: list[str] = []
+    for i, p in enumerate(panels, 1):
+        prompt = _panel_prompt(p)
+        if not prompt:
+            continue  # 缺 prompt 由生图阶段另行判定「跳过」，这里不重复报
+        no = _panel_no(p, i)
+        if fingerprint not in prompt:
+            failures.append(
+                f"第 {no} 格 prompt 未复用 spec.json 的 style_anchor 原文"
+                "（画风锚缺失 = 这一格会自己发挥画风，成片风格分裂）"
+            )
+            continue
+        if not prompt.lstrip().startswith(fingerprint):
+            reasons.append(f"第 {no} 格 style_anchor 不在 prompt 开头（生图时会统一提到最前）")
+        for term in negated:
+            if _asserts_style(prompt, term):
+                failures.append(
+                    f"第 {no} 格正文要求了「{term}」，而 spec.json 的 style_anchor 明确否定它"
+                    "（一段提示词里两套画风，模型只会挑更具体的那条听）"
+                )
+
+    if failures:
+        return False, failures
+    return True, reasons
+
+
 def validate_panel_anchors_reason(panels_json: Any, anchors: dict[str, str]) -> str:
     """给 runner 的验收失败文本：把失败原因拼成一句话。"""
     ok, reasons = validate_panel_anchors(panels_json, anchors)
@@ -318,6 +445,131 @@ _MULTI_ACTION_MARKERS = (
     "and then", "then he", "then she", "after that", "while also",
     "然后", "接着", "同时", "并且", "随后", "，又", "；", ";",
 )
+
+
+# ---------------------------------------------------------------- 生产规格数字契约
+
+
+def _as_number(value: Any) -> float | None:
+    """尽量把 spec.json 里的数字读出来（容忍 "12" / 12.0 / {"nominal": 4.75}）。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", value)
+        return float(m.group(0)) if m else None
+    if isinstance(value, dict):
+        for key in ("nominal", "value", "seconds", "avg", "average"):
+            if key in value:
+                got = _as_number(value.get(key))
+                if got is not None:
+                    return got
+    return None
+
+
+def _spec_total_seconds(spec: dict) -> float | None:
+    for key in ("total_duration_seconds", "total_duration", "duration_seconds", "duration"):
+        got = _as_number(spec.get(key))
+        if got and got > 0:
+            return got
+    return None
+
+
+def _spec_grid_count(spec: dict) -> int | None:
+    for key in ("grid_count", "panel_count", "panels"):
+        raw = spec.get(key)
+        if isinstance(raw, list):
+            return len(raw)
+        got = _as_number(raw)
+        if got and got > 0:
+            return int(got)
+    return None
+
+
+def _tolerance_seconds(spec: dict, total: float) -> tuple[float, float]:
+    """规格允许的时长区间 → (下限, 上限)。读不到就按 ±10%。"""
+    tol = spec.get("tolerance")
+    if isinstance(tol, dict):
+        rng = tol.get("range_seconds") or tol.get("range")
+        if isinstance(rng, list) and len(rng) == 2:
+            lo, hi = _as_number(rng[0]), _as_number(rng[1])
+            if lo is not None and hi is not None and lo <= hi:
+                return lo, hi
+        pct = _as_number(tol.get("percent") or tol.get("pct"))
+        if pct is not None:
+            pct = abs(pct) / 100 if abs(pct) > 1 else abs(pct)
+            return total * (1 - pct), total * (1 + pct)
+    pct = _as_number(tol)
+    if pct is not None:
+        pct = abs(pct) / 100 if abs(pct) > 1 else abs(pct)
+        return total * (1 - pct), total * (1 + pct)
+    return total * 0.9, total * 1.1
+
+
+def validate_spec_duration(spec: Any, brief: dict | None) -> tuple[bool, list[str]]:
+    """C2 的数字契约：spec.json 的时长与格数必须来自用户输入，模型不得改判。
+
+    2026-10-29 用户要求：「C2 生产规格 → spec.json，把创意反推成可执行规格，
+    要按照用户输入的时长来制定，这是后面所有阶段的数字契约，不输入集数，
+    就以用户输入的为准。」
+
+    为什么必须是机器校验而不是提示词约定（实测事故）：
+    constraints.json 里模型把用户填的 `episodes=-18` 判成"无效输入"、自行改成单集 ——
+    用户输入与模型判断的边界不清，数字契约就成了一句建议。这里的口径是：
+    **用户显式填的正数就是硬契约**，模型只能如实执行或如实报错，不能悄悄改判。
+
+    三条判据（全部可计量、可复核）：
+      1. `total_duration_seconds` 必须落在用户时长的容差区间内（默认 ±10%）；
+      2. `grid_count × seconds_per_panel` 必须约等于 `total_duration_seconds`（±1 格）；
+      3. spec 若写了 `episodes`，必须等于用户输入的集数（用户没填就是 1）。
+    """
+    if not isinstance(spec, dict):
+        return False, ["规格 spec.json 读不懂（不是 JSON 对象），无法核对时长契约"]
+
+    failures: list[str] = []
+    brief = brief or {}
+    user_duration = _as_number(brief.get("duration"))
+    total = _spec_total_seconds(spec)
+
+    if user_duration and user_duration > 0:
+        if total is None:
+            failures.append(
+                f"spec.json 缺少 total_duration_seconds —— 用户给了 {user_duration:g} 秒，"
+                "规格必须把它写成明确的数字契约"
+            )
+        else:
+            lo, hi = _tolerance_seconds(spec, user_duration)
+            if not (lo <= total <= hi):
+                failures.append(
+                    f"总时长 {total:g}s 偏离用户输入 {user_duration:g}s"
+                    f"（允许区间 {lo:.1f}~{hi:.1f}s）—— 用户输入的时长是硬契约，不得改判"
+                )
+
+    if total:
+        grid = _spec_grid_count(spec)
+        per_panel = _as_number(spec.get("seconds_per_panel"))
+        if grid is None:
+            failures.append("spec.json 缺少 grid_count —— 格数必须由「总时长 ÷ 每格时长」算出")
+        elif per_panel and per_panel > 0:
+            expect = total / per_panel
+            if abs(grid - expect) > 1.0:
+                failures.append(
+                    f"格数 {grid} 与「{total:g}s ÷ 每格 {per_panel:g}s ≈ {expect:.1f} 格」对不上"
+                    "（容差 ±1 格）—— 格数要算出来，不是拍出来的"
+                )
+
+    user_episodes = _as_number(brief.get("episodes"))
+    spec_episodes = _as_number(spec.get("episodes") or spec.get("episode_count"))
+    if spec_episodes is not None:
+        want = user_episodes if (user_episodes and user_episodes > 0) else 1.0
+        if abs(spec_episodes - want) > 0.01:
+            failures.append(
+                f"集数 {spec_episodes:g} 与用户输入 {want:g} 不一致 —— 用户没填集数就按 1 集做，"
+                "不得自行扩集或改判"
+            )
+
+    return (not failures), failures
 
 
 def _extract_items(payload: Any, keys: tuple[str, ...]) -> list[dict]:
@@ -708,4 +960,142 @@ def validate_framing(panels_json: Any) -> tuple[bool, list[str]]:
             '"only the hand and the fabric fill the frame, no face, no head, no torso"；'
             "② 升一档景别（medium / medium close-up）让人物完整入画。"
         )
+    return (not failures), failures
+
+
+# --------------------------------------------------------------------------- #
+# 剧情节拍顺序（2026-10-29 实测事故）
+# --------------------------------------------------------------------------- #
+
+# 事故复盘（run 7e5a1588，60 秒 12 格）：
+#   剧本 script.md 的格序是「修车 1-8 → 点单 9 → 回店 10-12」，
+#   分镜 panels.json 却把「点单」搬到了第 4-5 格，修车被推到 6-9 格。
+#   分镜自己在 storyboard.md 里写明了原因：
+#     「格序按系统骨架重排，点单从第 9 格提前到第 4 格……要同时满足
+#      场景 ≤3 / 换场 A-B-A / S1 占比 ≥50%，唯一排法是 S1×3 → S2×2 → S1×2 → S3×2 → S1×3」
+#   —— 为了满足**场景预算**去搬动**剧情节拍**，成片顺序就和剧本对不上了。
+#   渲染侧完全无辜：时间轴 1→12 严格单调，12 段视频首帧与各自分镜图 SSIM 0.85+ 一一对应。
+#
+# 结论：格序是剧本的契约，不是分镜的创作自由。场景预算只能靠「换视距/合并场景/回 C2 调整」
+# 来满足，不能靠重排剧情节拍。这条铁律必须有机器校验兜底，否则模型每次都会"合理"地重排。
+
+_SCRIPT_BEAT_RE = re.compile(r"^#{2,4}\s*第\s*(\d+)\s*格", re.MULTILINE)
+_SCRIPT_LINE_FIELD_RE = re.compile(r"\*\*台词\*\*\s*[:：]\s*(.*)")
+_QUOTED_LINE_RE = re.compile(r"[「“\"]([^」”\"]{1,120})[」”\"]")
+_PUNCT_RE = re.compile(
+    r"[\s，。！？、；：…—·,.!?;:\"'“”‘’（）()【】\[\]《》<>~～\-—_/／]+"
+)
+
+
+def _norm_cn(text: str) -> str:
+    """归一化：去掉标点/空白/破折号，只留字面内容，用于跨写法比对。"""
+    return _PUNCT_RE.sub("", str(text or ""))
+
+
+def parse_script_beats(script_md: str) -> list[tuple[int, list[str]]]:
+    """从 script.md 提取「第 N 格 → 该格台词」表。
+
+    只认 `### 第 N 格` 这种逐格小标题（C3 的固定写法），台词取 `**台词**：` 行里
+    引号中的句子。解析不出来就返回空表 —— 调用方据此跳过校验，绝不猜。
+    """
+    text = str(script_md or "")
+    marks = list(_SCRIPT_BEAT_RE.finditer(text))
+    beats: list[tuple[int, list[str]]] = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        body = text[m.end():end]
+        lines: list[str] = []
+        for raw in body.splitlines():
+            fm = _SCRIPT_LINE_FIELD_RE.search(raw)
+            if not fm:
+                continue
+            for q in _QUOTED_LINE_RE.findall(fm.group(1)):
+                q = q.strip()
+                if q:
+                    lines.append(q)
+        beats.append((int(m.group(1)), lines))
+    return beats
+
+
+def validate_story_order(
+    panels_json: Any, script_md: str
+) -> tuple[bool, list[str]]:
+    """格序校验：成片的格序必须等于剧本的格序。
+
+    判据（只用确定性字符串比对，不做语义判断）：
+      ① 一一对应：剧本格数 == 分镜格数时，第 i 格的字幕必须来自剧本第 i 格；
+      ② 单调性：格数不等时，台词在成片里的出现顺序不得倒退。
+    字幕与剧本台词按「去标点后互相包含」匹配，长度 <4 的短句不参与（"不用""好"太容易误配）。
+    匹配不上的格直接跳过 —— 宁可漏判，不冤枉模型。
+    """
+    beats = parse_script_beats(script_md)
+    if len(beats) < 2:
+        return True, []  # 剧本没有逐格结构，无从比对；不猜、不拦
+
+    panels = _extract_items(panels_json, _PANEL_LIST_KEYS)
+    if not panels:
+        return False, ["panels.json 里没有可校验的 panels 数组"]
+
+    beat_norm = {no: _norm_cn("".join(lines)) for no, lines in beats}
+
+    # 逐格定位：这一格的字幕来自剧本第几格
+    located: list[tuple[str, int, str]] = []  # (分镜格号, 剧本格号, 命中的字幕)
+    for i, p in enumerate(panels, 1):
+        sub = str(p.get("subtitle") or p.get("line") or p.get("dialogue") or "").strip()
+        if not sub:
+            continue
+        hit: int | None = None
+        for chunk in re.split(r"\s*[/／]\s*", sub):
+            n = _norm_cn(chunk)
+            if len(n) < 4:
+                continue
+            for no, text in beat_norm.items():
+                if not text:
+                    continue
+                if n in text or (len(text) >= 4 and text in n):
+                    hit = no
+                    break
+            if hit is not None:
+                break
+        if hit is not None:
+            located.append((_panel_no(p, i), hit, sub))
+
+    if not located:
+        return True, []  # 一格都没匹配上（可能整集无台词/全改写），不拦
+
+    failures: list[str] = []
+
+    # ① 一一对应：格数相同却错位 = 分镜把剧情搬了家
+    if len(beats) == len(panels):
+        for panel_no, beat_no, sub in located:
+            try:
+                expect = int(panel_no)
+            except (TypeError, ValueError):
+                continue
+            if beat_no == expect:
+                continue
+            failures.append(
+                f"第 {panel_no} 格的字幕是剧本第 {beat_no} 格的台词「{sub[:24]}」——"
+                f"这一格画的是剧本第 {beat_no} 格的剧情，却被排在第 {panel_no} 格。"
+                "分镜重排了剧情节拍，成片顺序与剧本不一致。"
+                f"改法：按 script.md 的格序逐格对应重写（第 {panel_no} 格必须是剧本第 "
+                f"{panel_no} 格的内容）；场景预算冲突时改取景/合并场景，不要搬动剧情节拍。"
+            )
+            if len(failures) >= 2:
+                break
+        if failures:
+            return False, failures
+
+    # ② 单调性：台词在成片里的出现顺序不得倒退（格数不等时的兜底）
+    prev_beat = 0
+    prev_panel = ""
+    for panel_no, beat_no, sub in located:
+        if beat_no < prev_beat:
+            failures.append(
+                f"第 {panel_no} 格用的是剧本第 {beat_no} 格的台词「{sub[:24]}」，"
+                f"却排在第 {prev_panel} 格（剧本第 {prev_beat} 格）之后 ——"
+                "剧情节拍被重排，成片顺序与剧本不一致。请按 script.md 的格序逐格对应重写。"
+            )
+            break
+        prev_beat, prev_panel = beat_no, panel_no
     return (not failures), failures

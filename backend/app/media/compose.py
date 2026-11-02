@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +28,6 @@ logger = logging.getLogger("longspan.media.compose")
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 REMOTION_DIR = BACKEND_DIR / "media" / "remotion"
 
-# node 的 bin 目录候选：默认走 PATH；需要指定版本时设 LONGSPAN_NODE_BIN
-NODE_BIN_CANDIDATES = [d for d in [os.environ.get("LONGSPAN_NODE_BIN", "")] if d]
 CHROME_CANDIDATES = [c for c in [os.environ.get("LONGSPAN_CHROME", "")] if c] + [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -47,15 +44,15 @@ VALID_MOTIONS = {"zoom-in", "zoom-out", "pan-left", "pan-right", "pan-up", "pan-
 TRANSITION_SECONDS = 0.5
 
 
-def _node_bin() -> str:
-    for d in NODE_BIN_CANDIDATES:
-        npx = Path(d) / "npx"
-        if npx.exists():
-            return str(npx)
-    found = shutil.which("npx")
-    if not found:
-        raise RuntimeError("找不到 npx，无法驱动 Remotion 合成")
-    return found
+def _remotion_bin() -> str:
+    """返回随项目锁文件安装的 Remotion CLI，避免 npx 解析到错误的包。"""
+    path = REMOTION_DIR / "node_modules" / ".bin" / "remotion"
+    if not path.is_file():
+        raise RuntimeError(
+            "Remotion 渲染依赖未安装：请在项目根目录执行 `bash install.sh remotion`"
+            "（全新部署执行 `bash install.sh`）"
+        )
+    return str(path)
 
 
 def _chrome_bin() -> str | None:
@@ -268,7 +265,7 @@ async def render_video(
 
     for i, conc in enumerate(concs):
         cmd = [
-            _node_bin(), "remotion", "render", "src/index.ts", "ComicDrama", str(tmp_abs),
+            _remotion_bin(), "render", "src/index.ts", "ComicDrama", str(tmp_abs),
             f"--props={props_path}",
             f"--public-dir={workspace}",
             "--log=error",
