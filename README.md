@@ -40,11 +40,12 @@
 ### 0. 装依赖
 
 ```bash
-cd backend && python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-cd ../frontend && npm install
+bash install.sh
 ```
+
+标准安装会同时处理三部分依赖：后端 Python 依赖、前端 npm 依赖、
+以及视频合成所需的 Remotion 依赖（安装在 `backend/media/remotion/node_modules`）。
+部署环境必须执行这一步；只补装渲染器时可运行 `bash install.sh remotion`。
 
 ### 1. 启动后端
 
@@ -229,6 +230,10 @@ frontend/
 
 合计 25 项全绿（scripts/e2e_http.py）
 ```
+
+> 以上是当时的验收快照。**2026-10-29 起快通道是 6 个阶段**：角色设计（C4）已从精修专属
+> 挪进快通道 —— 顺序必须是 `C3 剧本 → C4 角色（含定妆图）→ C5 分镜`，否则分镜会画在
+> 临时描述上。精修专属只剩「合成」一个阶段。
 
 ---
 

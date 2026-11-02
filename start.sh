@@ -70,6 +70,13 @@ if ! command -v npm >/dev/null 2>&1; then
   echo "找不到 npm（需要 Node 18+）。请安装，或用 LONGSPAN_NODE_BIN 指定 node 的 bin 目录。" >&2
   exit 1
 fi
+REMOTION_BIN="$ROOT/backend/media/remotion/node_modules/.bin/remotion"
+if [ ! -x "$REMOTION_BIN" ]; then
+  echo "缺少 Remotion 渲染依赖，视频合成阶段会失败。" >&2
+  echo "  先安装：bash install.sh remotion" >&2
+  echo "  全新部署：bash install.sh" >&2
+  exit 1
+fi
 
 cleanup() {
   echo ""
@@ -79,13 +86,19 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "▸ 启动后端 http://127.0.0.1:8000"
-(cd "$ROOT/backend" && exec "$PY" -m uvicorn app.main:app --host 127.0.0.1 --port 8000) &
+# 后端端口可覆盖：本机 8000 被别的服务占用时（实测：OrbStack 转发了一个容器到 8000），
+#   LONGSPAN_BACKEND_PORT=8010 bash start.sh
+# 前端代理会跟着这个端口走（见 frontend/vite.config.ts）。
+BACKEND_PORT="${LONGSPAN_BACKEND_PORT:-8000}"
+export LONGSPAN_BACKEND_URL="${LONGSPAN_BACKEND_URL:-http://127.0.0.1:$BACKEND_PORT}"
+
+echo "▸ 启动后端 $LONGSPAN_BACKEND_URL"
+(cd "$ROOT/backend" && exec "$PY" -m uvicorn app.main:app --host 127.0.0.1 --port "$BACKEND_PORT") &
 BACKEND_PID=$!
 
 # 等后端就绪再拉前端，避免首屏就报"连不上后端"
 for _ in $(seq 1 30); do
-  if curl -s --noproxy '*' -m 1 http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
+  if curl -s --noproxy '*' -m 1 "$LONGSPAN_BACKEND_URL/api/health" >/dev/null 2>&1; then
     echo "  后端就绪"
     break
   fi
