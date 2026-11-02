@@ -86,7 +86,10 @@ orchestration:
   budget_default_usd: 10
   max_revisions_per_stage: 3
   max_send_backs: 3
-  max_wall_time_minutes: 40   # 精修通道含生图/配音/渲染，给足时间
+  # 精修通道含 12 张分镜图 + 12 段视频 + 渲染，40 分钟实测不够：
+  # 龟兔赛跑任务光分镜生图就 15 分钟，加上配音/视频/合成约 37 分钟，贴着上限。
+  # 注意这里只统计**执行时间**，人工确认的等待不计入（见 runner._elapsed_exec_minutes）。
+  max_wall_time_minutes: 60
 
   # 硬约束（consistency_checks）重做次数用尽后的处置：
   #   fail    → 阶段判失败，整轮停下等续跑（默认。约束是契约，违约的分镜会污染

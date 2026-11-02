@@ -181,6 +181,28 @@ def build_draft_info(run: Run, skill: SkillDef | None, steps: list[Step]) -> dic
     }
 
 
+def _elapsed_exec_minutes(started: float, gate_wait_seconds: float = 0.0,
+                          now: float | None = None) -> float:
+    """本次执行的**有效时长**（分钟）：墙钟 − 等人时间，永不为负。
+
+    为什么必须扣掉等人（2026-11-02 龟兔赛跑事故）：门禁等待是用户在看产物，
+    不是机器在干活。把它算进墙钟配额，等于「用户越认真确认，任务越容易被判超时」——
+    那次 55 分钟里 33 分钟在等人，40 分钟配额被吃光，配音/合成从未执行。
+    """
+    end = time.monotonic() if now is None else now
+    return max(0.0, (end - started - max(0.0, gate_wait_seconds)) / 60)
+
+
+def _unfinished_stage_ids(target_ids: list[str], statuses: dict[str, str]) -> list[str]:
+    """目标阶段里还没完成的那些（收尾自检用）。
+
+    不变量：**succeeded 必须意味着目标阶段全部完成**。否则界面显示「全部完成」，
+    用户却拿不到成片（2026-11-02 实测：5/7 阶段却报成功）。
+    """
+    done = (StepStatus.COMPLETED, StepStatus.SKIPPED)
+    return [sid for sid in target_ids if statuses.get(sid) not in done]
+
+
 # --------------------------------------------------------------------------- #
 # Run 管理器
 # --------------------------------------------------------------------------- #
@@ -190,6 +212,8 @@ class RunManager:
         self._gate_waiters: dict[str, asyncio.Event] = {}
         self._gate_results: dict[str, dict] = {}
         self._cancelled: set[str] = set()
+        # 每个 Run 累计的「等人」秒数：门禁等待不计入墙钟配额（见 _open_gate）
+        self._gate_wait_seconds: dict[str, float] = {}
 
     # ---------------- 对外控制 ----------------
     def start(self, run_id: str) -> None:
@@ -234,6 +258,7 @@ class RunManager:
     async def _execute(self, run_id: str) -> None:
         db = SessionLocal()
         started = time.monotonic()
+        self._gate_wait_seconds[run_id] = 0.0
         try:
             run = db.get(Run, run_id)
             if run is None:
@@ -295,20 +320,32 @@ class RunManager:
                 if stage.id in done_ids:
                     continue
 
-                # 配额：墙钟
-                elapsed_min = (time.monotonic() - started) / 60
+                # 配额：墙钟 —— **只算执行时间，不算等人**
+                # 2026-11-02 事故（龟兔赛跑）：全程 55 分钟里 33 分钟在等人工确认，
+                # 40 分钟配额被"等人"吃光 —— 分镜刚确认就被判超时，配音/合成从未执行，
+                # 任务却标成 succeeded，用户看到"已完成"却没有视频。
+                # 门禁等待时长由 _open_gate 累计，这里扣掉。
+                waited_s = self._gate_wait_seconds.get(run.id, 0.0)
+                elapsed_min = _elapsed_exec_minutes(started, waited_s)
                 if elapsed_min > quota["max_wall_time_minutes"]:
                     bus.emit(db, run.id, EventType.QUOTA_CAP,
-                             f"已达墙钟上限 {quota['max_wall_time_minutes']} 分钟，安全收尾",
+                             f"已达执行时长上限 {quota['max_wall_time_minutes']} 分钟"
+                             f"（等人时间不计入），已完成 {idx}/{len(target)} 个阶段，可续跑",
                              stage_id=stage.id)
-                    self._finish(db, run, status=RunStatus.SUCCEEDED,
-                                 note="达到时间上限，输出当前已完成部分")
+                    # 还有阶段没跑完 → 绝不能报"成功"：那会让界面显示"全部完成"却没有成片。
+                    # interrupted 是可续跑状态，前端会给出「续跑」按钮。
+                    self._finish(db, run, status=RunStatus.INTERRUPTED,
+                                 note=f"达到执行时长上限，已完成 {idx}/{len(target)} 个阶段，"
+                                      "点「续跑」继续未完成的阶段")
                     return
-                # 配额：预算
+                # 配额：预算（同理：没跑完就是中断，不是成功）
                 if run.cost_usd > quota["budget_default_usd"]:
                     bus.emit(db, run.id, EventType.QUOTA_CAP,
-                             f"已达预算上限 ${quota['budget_default_usd']}，安全收尾", stage_id=stage.id)
-                    self._finish(db, run, status=RunStatus.SUCCEEDED, note="达到预算上限")
+                             f"已达预算上限 ${quota['budget_default_usd']}，"
+                             f"已完成 {idx}/{len(target)} 个阶段，可续跑", stage_id=stage.id)
+                    self._finish(db, run, status=RunStatus.INTERRUPTED,
+                                 note=f"达到预算上限，已完成 {idx}/{len(target)} 个阶段，"
+                                      "点「续跑」继续未完成的阶段")
                     return
 
                 gate_decision = await self._run_stage(db, run, skill, stage, quota)
@@ -343,7 +380,22 @@ class RunManager:
                          stage_id=stage.id, payload={"progress": run.progress,
                                                      "index": idx + 1, "total": len(target)})
 
-            self._finish(db, run, status=RunStatus.SUCCEEDED)
+            # 收尾自检：**成功必须意味着目标阶段全部完成**。
+            # 2026-11-02 事故：配额分支把"只跑了 5/7 阶段"的任务标成 succeeded，
+            # 界面显示"全部完成"、实际没有配音也没有成片。这里兜住任何漏跑路径。
+            statuses = {}
+            for st in target:
+                step_row = self._get_step(db, run.id, st.id)
+                # 没有 Step 记录 = 从没跑过（不能靠 Step() 的列默认值，实例化时还没生效）
+                statuses[st.id] = step_row.status if step_row is not None else StepStatus.PENDING
+            unfinished = _unfinished_stage_ids([st.id for st in target], statuses)
+            if unfinished:
+                self._finish(
+                    db, run, status=RunStatus.INTERRUPTED,
+                    note="以下阶段未完成：" + "、".join(unfinished) + "，点「续跑」继续",
+                )
+            else:
+                self._finish(db, run, status=RunStatus.SUCCEEDED)
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Run 执行异常 %s", run_id)
@@ -352,6 +404,7 @@ class RunManager:
             if run:
                 self._fail(db, run, str(exc))
         finally:
+            self._gate_wait_seconds.pop(run_id, None)
             db.close()
 
     # ---------------- 单阶段 ----------------
@@ -1010,7 +1063,13 @@ class RunManager:
                  stage_id=stage.id, payload=gate.to_dict())
         self._emit_status(db, run)
 
+        # 等人时长单独累计：门禁可能挂几十分钟，算进墙钟配额等于
+        # "用户越认真看，任务越容易被判超时"（2026-11-02 龟兔赛跑实测）。
+        _wait_t0 = time.monotonic()
         result = await self._wait_gate(run.id, timeout_minutes=settings.max_wall_time_minutes)
+        self._gate_wait_seconds[run.id] = (
+            self._gate_wait_seconds.get(run.id, 0.0) + (time.monotonic() - _wait_t0)
+        )
 
         gate.status = result.get("status", GateStatus.APPROVED)
         gate.decision = result.get("decision", {}) or {}
