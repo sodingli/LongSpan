@@ -203,6 +203,8 @@ async def _probe_video(cfg: dict) -> dict:
             "error": "缺少 API Key 或接口地址",
             "hint": "京东云是 {base_url}/task/submit；万相(dashscope)是 {base_url}/services/aigc/video-generation/video-synthesis。",
         }
+    if cfg["provider"] == "openai-video":
+        return await _probe_openai_video(cfg, started)
     if cfg["provider"] == "dashscope":
         url = f"{cfg['base_url']}/tasks/__longspan_probe__"
     else:
@@ -233,4 +235,62 @@ async def _probe_video(cfg: dict) -> dict:
         "model": cfg["model"],
         "message": "鉴权通过（本次未提交任何生成任务，不产生费用）",
         "detail": body,
+    }
+
+
+async def _probe_openai_video(cfg: dict, started: float) -> dict:
+    """零成本体检：查 `GET /models`，看配置的模型在不在清单里。
+
+    为什么这条比"查个不存在的 task_id"更有用：视频网关对**不存在的模型**照样
+    返回 503 model_not_found，鉴权是通的、任务却一个也出不来。模型清单是唯一
+    能在不花钱的前提下证明"这个模型真的能用"的证据。
+    """
+    url = f"{cfg['base_url']}/models"
+    try:
+        async with httpx.AsyncClient(timeout=30) as cli:
+            resp = await cli.get(url, headers={"Authorization": f"Bearer {cfg['api_key']}"})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "stage": "network", "error": str(exc)[:300], "hint": "检查网络或代理设置。"}
+
+    latency = int((time.time() - started) * 1000)
+    if resp.status_code in (401, 403):
+        return {
+            "ok": False,
+            "stage": "auth",
+            "http_status": resp.status_code,
+            "latency_ms": latency,
+            "error": resp.text[:300],
+            "hint": "鉴权失败：Key 不对，或这个 Key 没有该网关的权限。",
+        }
+    if resp.status_code >= 400:
+        return {
+            "ok": False,
+            "stage": "request",
+            "http_status": resp.status_code,
+            "latency_ms": latency,
+            "error": resp.text[:300],
+            "hint": "该网关可能没有 /models 接口，或 Base URL 少了 /v1。",
+        }
+    try:
+        ids = [str(m.get("id")) for m in (resp.json().get("data") or []) if isinstance(m, dict)]
+    except Exception:  # noqa: BLE001
+        ids = []
+    if ids and cfg["model"] not in ids:
+        return {
+            "ok": False,
+            "stage": "model",
+            "http_status": 200,
+            "latency_ms": latency,
+            "model": cfg["model"],
+            "error": f"模型清单里没有「{cfg['model']}」",
+            "hint": f"该 Key 当前可用：{'、'.join(ids[:12])}。视频模型必须出现在这个清单里。",
+        }
+    return {
+        "ok": True,
+        "stage": "done",
+        "http_status": 200,
+        "latency_ms": latency,
+        "model": cfg["model"],
+        "message": "网关连通，模型在清单里（未提交生成任务，不产生费用）",
+        "detail": "、".join(ids[:12]),
     }

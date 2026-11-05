@@ -35,7 +35,7 @@ VALID_PROVIDERS = {"auto", "mock", "openai-compat"}
 MEDIA_PROVIDERS = {
     "image": ["auto", "local", "openai-compat", "jdcloud", "dashscope", "dashscope-mm"],
     "tts": ["auto", "local", "openai-compat"],
-    "video": ["off", "jdcloud", "dashscope"],
+    "video": ["off", "jdcloud", "dashscope", "openai-video"],
 }
 
 
@@ -177,7 +177,7 @@ def get_media_config() -> dict:
         "notes": {
             "image": "支持 OpenAI 兼容 /v1/images/generations、京东云预置服务（同步）、万相 DashScope 异步任务，以及 dashscope-mm 多模态同步（qwen-image / wan2.7，支持参考图与负向提示词）；另可配 LONGSPAN_IMAGE_FALLBACKS 备用通道链（审核拦截软化重试后自动切换）",
             "tts": "支持 OpenAI 兼容 /v1/audio/speech；没配就用本机语音（音色单一，会如实标注）",
-            "video": "视频为异步任务接口（京东云 task/submit 或万相 wan3.0 video-synthesis，二选一）：提交 → 轮询 → 下载。单片段按次计费，不会自动跑",
+            "video": "视频为异步任务接口（京东云 task/submit、万相 wan3.0 video-synthesis、openai-video 的 /v1/videos 三选一）：提交 → 轮询 → 下载。单片段按次计费，不会自动跑；openai-video 只吃首帧 + 文字",
         },
     }
 

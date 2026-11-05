@@ -16,6 +16,10 @@
 │ (万相)   │ generation/video-synthesis    │ output.task_status / video_url   │
 │          │ input.media 数组，X-DashScope- │                                  │
 │          │ Async: enable 必带            │                                  │
+│ openai-  │ POST /videos（multipart，      │ GET /videos/{id}                 │
+│ video    │ 首帧走 input_reference 文件）  │ status=completed → /content 取片 │
+│ (Sora 式 │                               │ （Sora / new-api 中转通用）      │
+│  中转)   │                               │                                  │
 └──────────┴───────────────────────────────┴──────────────────────────────────┘
 
 wan3.0-video（阿里云百炼 / DashScope 协议）要点（来自官方 API 参考，非猜测）：
@@ -67,8 +71,11 @@ _ALLOWED_DURATIONS = {
     "jdcloud": {5, 10},
     # wan3.0：无视频输入时 [2,30]，默认 5；-1 是"智能时长"（交给模型定）
     "dashscope": set(range(2, 31)) | {-1},
+    # Sora 原生只认 4/8/12，但中转站（new-api 等）各接各的下游，秒数白名单不一致。
+    # 这里放宽到 2–30，由网关裁决；本地只挡明显离谱的值。
+    "openai-video": set(range(2, 31)),
 }
-_VIDEO_PROVIDERS = {"jdcloud", "dashscope"}
+_VIDEO_PROVIDERS = {"jdcloud", "dashscope", "openai-video"}
 
 # 同一网关上的不同模型族参数集不一样：mode(std/pro) 是 Seedance 专有，
 # Vidu 首尾帧协议没有这个字段（官方文档只有 duration/resolution/watermark/audio/is_rec）。
@@ -91,7 +98,10 @@ def provider() -> str:
 
 def api_key() -> str:
     """视频 Key 允许留空复用图片 Key —— 同一网关同一把 Key 的场景，
-    逼用户再填一遍只会多一个填错的机会。dashscope 是独立网关，必须有自己的 Key。"""
+    逼用户再填一遍只会多一个填错的机会。
+
+    只有 jdcloud 允许复用：它和生图是同一个网关。dashscope / openai-video 是
+    独立网关，用错 Key 的报错会指向生图，排查方向就歪了。"""
     key = (settings.video_api_key or "").strip()
     if not key and provider() == "jdcloud":
         key = (settings.image_api_key or "").strip()
@@ -107,10 +117,49 @@ def video_ready() -> tuple[bool, str]:
     if not api_key():
         if prov == "dashscope":
             return False, "缺少视频 API Key（dashscope 网关与图片不同源，不能复用图片 Key）"
+        if prov == "openai-video":
+            return False, "缺少视频 API Key（openai-video 网关与图片不同源，不能复用图片 Key）"
         return False, "缺少视频 API Key（留空时会复用图片 Key）"
     if not settings.video_base_url or not settings.video_model:
         return False, "缺少视频接口地址或模型名"
     return True, ""
+
+
+async def preflight() -> tuple[bool, str]:
+    """开跑前的一次性体检：确认「这个模型在这个网关上真的存在」。
+
+    为什么值得多一次请求：视频是异步任务，模型名写错时网关**先受理再报错**，
+    一个 12 格的 Run 会连吃 12 次失败、12 条降级记录，最后成片全是静态图。
+    一次 `GET /models` 就能把这件事提前到第 0 秒。
+
+    只对 openai-video 生效（其它协议没有标准的模型清单接口）。查不到清单时
+    一律放行 —— 不能因为网关没实现 /models 就判它不可用。
+    """
+    if provider() != "openai-video":
+        return True, ""
+    base = (settings.video_base_url or "").strip().rstrip("/")
+    model = (settings.video_model or "").strip()
+    if not base or not model:
+        return True, ""
+    try:
+        async with httpx.AsyncClient(timeout=20) as cli:
+            resp = await cli.get(f"{base}/models", headers={"Authorization": f"Bearer {api_key()}"})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("视频模型预检请求失败（放行）：%s", exc)
+        return True, ""
+    if resp.status_code != 200:
+        return True, ""
+    try:
+        ids = [str(m.get("id")) for m in (resp.json().get("data") or []) if isinstance(m, dict)]
+    except Exception:  # noqa: BLE001
+        return True, ""
+    if not ids or model in ids:
+        return True, ""
+    return False, (
+        f"视频网关 {base} 的模型清单里没有「{model}」（现有：{'、'.join(ids[:12])}）。"
+        "多半是模型名写错，或这个 Key 没开通该模型 —— 现在拦住，"
+        "比让每个镜头各吃一次 503 好。"
+    )
 
 
 def _data_url(abs_path: Path) -> str:
@@ -220,6 +269,11 @@ def build_payload(
             prompt=prompt, duration=duration, first_frame=first_frame,
             last_frame=last_frame, reference_video=reference_video, model=model,
         )
+    if prov == "openai-video":
+        return _build_openai_video(
+            prompt=prompt, duration=duration, first_frame=first_frame,
+            last_frame=last_frame, reference_video=reference_video, model=model,
+        )
     return _build_jdcloud(
         prompt=prompt, duration=duration, mode=mode, first_frame=first_frame,
         last_frame=last_frame, reference_video=reference_video, model=model,
@@ -274,6 +328,66 @@ def _build_jdcloud(
         "content": content,
         "parameters": params,
     }
+
+
+def _build_openai_video(
+    *,
+    prompt: str,
+    duration: int | None,
+    first_frame: str | None,
+    last_frame: str | None,
+    reference_video: str | None,
+    model: str | None,
+) -> dict:
+    """OpenAI / Sora 式视频协议（new-api 等中转站普遍实现这一套）。
+
+    报文：`POST {base}/videos`，multipart/form-data：
+      model / prompt / seconds / size / input_reference（首帧图片文件）。
+    查询：`GET {base}/videos/{id}` → `{status: queued|in_progress|completed|failed}`，
+    取片：`GET {base}/videos/{id}/content`（**要带鉴权头**，不是公开直链）。
+
+    这套协议的能力边界比 Seedance 窄：只有「首帧 + 文字」，没有尾帧位置，
+    也没有参考视频入参。硬塞会被网关拒或静默忽略 —— 所以这里如实丢弃并写进 note，
+    由上层决定是否降级，而不是假装参数生效了。
+    """
+    dur = int(duration or settings.video_duration or 5)
+    _validate_duration(dur)
+    chosen = (model or settings.video_model).strip()
+
+    notes: list[str] = []
+    if reference_video:
+        notes.append("OpenAI 视频协议没有「参考视频」入参，本单已忽略参考视频")
+    if last_frame:
+        notes.append("OpenAI 视频协议只吃首帧，尾帧已忽略（格间衔接靠提示词与转场）")
+
+    body: dict = {
+        "model": chosen,
+        "prompt": prompt,
+        "seconds": str(dur),
+    }
+    size = (settings.video_resolution or "").strip()
+    if size:
+        body["size"] = size
+    body.update(_extra_params())
+    body.update(_model_params(chosen))
+
+    return {
+        **body,
+        # 下划线开头 = 私有字段，submit_task 发请求前会剔除
+        "_first_frame": first_frame,
+        "_duration": dur,
+        "_note": "；".join(notes),
+    }
+
+
+def _decode_data_url(value: str) -> tuple[bytes, str, str]:
+    """data:image/png;base64,xxx → (bytes, mime, 扩展名)。"""
+    m = re.match(r"^data:([^;,]+);base64,(.*)$", value or "", re.S)
+    if not m:
+        raise VideoConfigError("首帧不是可解析的 data URL，无法作为文件上传")
+    mime = m.group(1).strip().lower()
+    ext = mimetypes.guess_extension(mime) or ".png"
+    return base64.b64decode(m.group(2)), mime, ext
 
 
 def _build_dashscope(
@@ -355,10 +469,25 @@ def _build_dashscope(
     }
 
 
+async def _ref_bytes(ref: str) -> tuple[bytes, str, str]:
+    """把首帧（data URL 或公网 URL）变成可上传的字节。"""
+    if ref.startswith("data:"):
+        return _decode_data_url(ref)
+    if re.match(r"^https?://", ref):
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as cli:
+            resp = await cli.get(ref)
+        if resp.status_code >= 400:
+            raise VideoConfigError(f"首帧图片下载失败 HTTP {resp.status_code}：{ref[:120]}")
+        mime = (resp.headers.get("content-type") or "image/png").split(";")[0].strip()
+        return resp.content, mime, mimetypes.guess_extension(mime) or ".png"
+    raise VideoConfigError("首帧既不是 data URL 也不是 http 地址")
+
+
 async def submit_task(payload: dict) -> str:
     # `_note` 等下划线开头的键是 build 阶段留给上层的说明，不发给网关
     wire = {k: v for k, v in payload.items() if not str(k).startswith("_")}
     prov = provider()
+    files: dict | None = None
     if prov == "dashscope":
         url = (
             settings.video_base_url.rstrip("/")
@@ -371,6 +500,16 @@ async def submit_task(payload: dict) -> str:
             "X-DashScope-Async": "enable",
         }
         ok_key, err_key = "output", "task_id"
+    elif prov == "openai-video":
+        # Sora 式协议：multipart/form-data，首帧是**文件**而不是 URL 字段
+        url = settings.video_base_url.rstrip("/") + "/videos"
+        headers = {"Authorization": f"Bearer {api_key()}"}
+        ok_key, err_key = "", "id"
+        first = payload.get("_first_frame")
+        if first:
+            raw, mime, ext = await _ref_bytes(first)
+            files = {"input_reference": (f"first_frame{ext}", raw, mime)}
+        wire = {k: str(v) for k, v in wire.items()}
     else:
         url = settings.video_base_url.rstrip("/") + "/task/submit"
         headers = {
@@ -380,8 +519,13 @@ async def submit_task(payload: dict) -> str:
         }
         ok_key, err_key = "result", "task_id"
 
-    async with httpx.AsyncClient(timeout=90) as cli:
-        resp = await cli.post(url, headers=headers, json=wire)
+    async with httpx.AsyncClient(timeout=120) as cli:
+        if files is not None:
+            resp = await cli.post(url, headers=headers, data=wire, files=files)
+        elif prov == "openai-video":
+            resp = await cli.post(url, headers=headers, data=wire)
+        else:
+            resp = await cli.post(url, headers=headers, json=wire)
     text = resp.text[:600]
     if resp.status_code >= 400:
         raise RuntimeError(f"视频任务提交失败 HTTP {resp.status_code}：{text}")
@@ -390,6 +534,8 @@ async def submit_task(payload: dict) -> str:
         raise RuntimeError(f"视频任务提交被拒：{str(data.get('error') or data.get('message') or data.get('code'))[:300]}")
     if prov == "dashscope":
         task_id = (data.get("output") or {}).get("task_id")
+    elif prov == "openai-video":
+        task_id = data.get("id") or data.get("task_id") or (data.get("data") or {}).get("id")
     else:
         result = data.get("result") or {}
         task_id = result.get("task_id") or result.get("taskId") or data.get("task_id")
@@ -446,8 +592,11 @@ def _is_real_error(err: Any) -> bool:
 
 async def poll_task(task_id: str) -> dict:
     """轮询直到出结果。返回 {status: succeeded|failed, video_url?, raw?, error?}。"""
-    if provider() == "dashscope":
+    prov = provider()
+    if prov == "dashscope":
         url = settings.video_base_url.rstrip("/") + f"/tasks/{task_id}"
+    elif prov == "openai-video":
+        url = settings.video_base_url.rstrip("/") + f"/videos/{task_id}"
     else:
         url = settings.video_base_url.rstrip("/") + f"/task/{task_id}"
     interval = max(3, int(settings.video_poll_seconds or 10))
@@ -470,7 +619,22 @@ async def poll_task(task_id: str) -> dict:
             return {"status": "failed", "error": f"查询任务失败 HTTP {resp.status_code}：{resp.text[:300]}"}
 
         last = body
-        if provider() == "dashscope":
+        if prov == "openai-video":
+            status = str((body or {}).get("status") or (body or {}).get("state") or "").lower()
+            if status in {"completed", "succeeded", "success"}:
+                # 有的中转直接给直链，有的只给 /content 端点（要带鉴权头）
+                direct = _find_video_url(body)
+                return {
+                    "status": "succeeded",
+                    "video_url": direct
+                    or f"{settings.video_base_url.rstrip('/')}/videos/{task_id}/content",
+                    "needs_auth": not direct,
+                    "raw": body,
+                }
+            if status in _STATUS_FAIL:
+                err = (body or {}).get("error") or (body or {}).get("message") or body
+                return {"status": "failed", "error": str(err)[:500]}
+        elif prov == "dashscope":
             out = (body or {}).get("output") or {}
             status = str(out.get("task_status") or "").lower()
             if status == "succeeded":
@@ -517,11 +681,12 @@ async def poll_task(task_id: str) -> dict:
         await asyncio.sleep(interval)
 
 
-async def download(url: str, dest: Path) -> int:
+async def download(url: str, dest: Path, headers: dict | None = None) -> int:
+    """下载片段。headers 用于「结果不在公开直链上」的网关（如 /videos/{id}/content）。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.stem + ".part" + dest.suffix)
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as cli:
-        async with cli.stream("GET", url) as resp:
+        async with cli.stream("GET", url, headers=headers or {}) as resp:
             if resp.status_code >= 400:
                 raise RuntimeError(f"下载视频失败 HTTP {resp.status_code}")
             with tmp.open("wb") as fh:
@@ -586,10 +751,12 @@ async def generate_clip(
     result = await poll_task(task_id)
     if result["status"] != "succeeded":
         raise RuntimeError(f"视频生成失败：{result.get('error')}")
-    size = await download(result["video_url"], workspace / out_rel)
+    dl_headers = {"Authorization": f"Bearer {api_key()}"} if result.get("needs_auth") else None
+    size = await download(result["video_url"], workspace / out_rel, headers=dl_headers)
     used = [p for p in (first_frame, last_frame) if p]
     dropped = ["mid"] if mid_frame else []
     params = payload.get("parameters") or {}
+    used_duration = params.get("duration") or payload.get("_duration") or payload.get("seconds")
     build_note = payload.pop("_note", "")  # build 阶段的说明（互斥丢弃 / 分辨率兜底）
     if dropped and not build_note:
         build_note = "视频模型只吃首帧/尾帧，中间帧不参与生成（已在画布上保留，可换用尾帧）"
@@ -599,7 +766,7 @@ async def generate_clip(
         "size": size,
         "video_url": result["video_url"],
         "model": payload["model"],
-        "duration": params.get("duration"),
+        "duration": int(used_duration) if str(used_duration or "").isdigit() else used_duration,
         # jdcloud 的 mode 是 std/pro，dashscope 没有 —— 用分辨率代替，前端照样有信息可显示
         "mode": params.get("mode") or params.get("resolution") or "",
         # 前端要的是"这段片用了哪些帧、参考了什么"，不是一个布尔值

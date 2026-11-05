@@ -32,6 +32,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   'openai-compat': 'OpenAI 兼容接口',
   jdcloud: '京东云 modelservice',
   dashscope: '万相通义（DashScope 异步）',
+  'openai-video': 'OpenAI / Sora 式视频（/v1/videos）',
   'dashscope-mm': '万相/Qwen 多模态同步（支持参考图）',
   off: '关闭（不生成视频）',
 }
