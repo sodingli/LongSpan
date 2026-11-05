@@ -1309,9 +1309,29 @@ class RunManager:
         # 角色入库：本集铸造的角色进入资产库，下一集可直接复用（系列化的前提）。
         # 失败/取消也登记 —— 已经画出来的定妆图是真金白银生成的，不该随任务失败一起丢。
         self._register_cast(db, run)
+
+        # 快通道收尾必须把「这是草稿、没有成片」说在明面上（2026-11-05 用户反馈）。
+        # 快通道按设计只跑到样片/分镜，不合成 video/final.mp4。旧实现收尾只写
+        # "任务完成"，用户点开产物发现没有视频 —— 这不是误会，是文案失职。
+        has_final = False
+        if status == RunStatus.SUCCEEDED:
+            try:
+                has_final = storage.exists(run.id, "video/final.mp4")
+            except Exception:  # noqa: BLE001 —— 探测失败按"没有成片"处理，宁可说少不说过
+                has_final = False
+        if status == RunStatus.SUCCEEDED and run.channel == "fast" and not has_final:
+            draft_note = (
+                "快通道草稿完成：本次只产出草稿（剧本 / 分镜 / 样片），"
+                "**没有成片 video/final.mp4**。要成片请点「继续优化」跑完整管线。"
+            )
+            note = f"{note}｜{draft_note}" if note else draft_note
+            # 单独一条事件：前端"产物"区能直接看到，不用翻终态文案
+            bus.emit(db, run.id, EventType.AGENT_MESSAGE, draft_note,
+                     payload={"channel": "fast", "has_final": False, "is_draft": True})
+
         bus.emit(db, run.id, EventType.RUN_FINISHED,
                  note or ("任务完成" if status == RunStatus.SUCCEEDED else "任务结束"),
-                 payload={"status": status})
+                 payload={"status": status, "channel": run.channel, "has_final": has_final})
         self._emit_status(db, run)
 
     # ---------------- 角色资产库（跨集复用） ----------------

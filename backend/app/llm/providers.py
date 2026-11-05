@@ -62,6 +62,31 @@ def looks_degenerate(text: str) -> bool:
     return bool(_DEGENERATE_RE.search(text))
 
 
+# 模型输出的控制符清理。
+# 2026-11-05 实测：MiniMax-M3-W8A8 会在正文里漏出 `]<]minimax[>[` 这类特殊 token
+# （服务端没把它当 stop token 吃掉）。这类字符一旦落进 <<<FILE:>>> 块或 DSML 调用里，
+# 解析器就认不出来 —— 表现是"模型明明写了清单，harness 说没产出"，然后整阶段重做。
+# 只清**明确的控制符形态**，不碰正常文本（宁可漏清，不可误删正文）。
+_SPECIAL_TOKEN_RE = re.compile(
+    r"\]<\]\s*[A-Za-z0-9_.\-]{1,32}\s*\[>\[?"   # ]<]minimax[>[ / ]<]minimax[>
+    r"|<\]\s*[A-Za-z0-9_.\-]{1,32}\s*\[>"        # <]minimax[>
+    r"|<\|[A-Za-z0-9_.\-]{1,32}\|>"                # <|endoftext|> / <|im_start|>
+)
+
+
+def sanitize_model_text(text: str) -> str:
+    """去掉模型漏出的特殊 token 与它们留下的空行。"""
+    if not text:
+        return text
+    cleaned = _SPECIAL_TOKEN_RE.sub("", text)
+    if cleaned == text:
+        return text
+    # 控制符被删掉后常留下孤零零的空行/行尾空格
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
+
 @dataclass
 class LLMResponse:
     text: str
@@ -441,7 +466,7 @@ class OpenAICompatProvider(BaseProvider):
                         if piece:
                             pieces.append(piece)
 
-        text = "".join(pieces)
+        text = sanitize_model_text("".join(pieces))
         if looks_degenerate(text):
             raise RetryableLLMError(
                 f"模型输出疑似退化（{len(text)} 字符中出现长时间重复片段），已丢弃本次结果并重试"

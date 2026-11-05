@@ -305,7 +305,9 @@ export default function App() {
                     (() => {
                       const cut = run.steps.find((s) => s.status === 'interrupted')?.stage_name
                       if (cut) return `${cut} · 已中断`
-                      return run.status === 'succeeded' ? '全部完成' : '准备中'
+                      if (run.status !== 'succeeded') return '准备中'
+                      // 快通道只跑到草稿：这里写「全部完成」就是骗人（用户点开产物没有 mp4）
+                      return run.channel === 'fast' ? '草稿完成（无成片）' : '全部完成'
                     })()}
                 </span>
                 <span>{Math.round(run.progress * 100)}%</span>

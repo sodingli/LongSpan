@@ -146,7 +146,8 @@ def normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 "motion": motion,
                 "subtitle": (p.get("subtitle") or "").strip() or None,
                 "speaker": (p.get("speaker") or "").strip() or None,
-                "label": p.get("label") or f"格 {i + 1}",
+                # 不再兜底成「格 x」：那是内部格号，画在成片上就是违和感
+                "label": str(p.get("label") or "").strip(),
                 "isPlaceholder": is_ph,
             }
         )

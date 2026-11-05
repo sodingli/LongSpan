@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     # 通道路由：auto（带参考图的格优先走支持参考图的通道，保持相对顺序）/
     #           main（永远主通道优先，参考图不支持就如实标注未生效）
     image_routing: str = "auto"
+    # 分镜图并发生成路数（2026-11-05）：9 格串行实测 10 分 22 秒，3 路并发约 3 分半。
+    # 不要随手调大 —— 网关对生图有排队与限流，路数超了换来的是 429 和更长的退避。
+    image_concurrency: int = 3
     # ---- 视觉自检（生图后的多模态检查）----
     # 唯一「看图」的一层：文本校验只能防「话没说对」，防不了「画没画对」。
     # 实测事故：extreme-close 拍手+衬衫内袋 → 结构校验全过，但成图没有脑袋。
@@ -114,7 +117,9 @@ class Settings(BaseSettings):
 
     # ---- 视频（M2：图生视频 / 参考视频生视频）----
     # provider: off（不启用，成片走静态图 + 运镜）/ jdcloud（京东云异步任务接口）
+    #           / dashscope（阿里云百炼万相）/ openai-video（Sora 式，new-api 中转通用）
     # 京东云：POST {base_url}/task/submit → GET {base_url}/task/{task_id}
+    # openai-video：POST {base_url}/videos → GET {base_url}/videos/{id}
     # 这是**异步任务**接口，与文本/生图的同步接口不是一套协议，必须分开配。
     video_provider: str = "off"
     video_api_key: str = ""

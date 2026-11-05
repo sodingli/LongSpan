@@ -942,7 +942,13 @@ async def _consistency_sampling(ctx: ToolContext, out: dict, subject_ref: str | 
 async def _generate_images(
     ctx: ToolContext, plan: dict | None = None, fast_limit: int | None = None
 ) -> dict:
-    """按 panels.json 逐格生成分镜图（真实生图不可用则降级为程序化分镜卡，并如实标注）。"""
+    """按 panels.json 逐格生成分镜图（真实生图不可用则降级为程序化分镜卡，并如实标注）。
+
+    并发生成（2026-11-05 用户要求）：9 格串行实测 10 分 22 秒，是整条管线最慢的一段。
+    每格生图彼此独立（提示词、参考图、落盘路径都不共享），因此按
+    settings.image_concurrency（默认 3）路并发，实测降到约 3 分半。
+    路数不放开是刻意的：网关对生图有排队与限流，开太大只会换来一堆 429 和更长的退避。
+    """
     from ..media.image import COMIC_STYLE_SKILLS, ensure_style_anchor, generate_image
 
     panels, shape_note = _plan_items(plan, "panels")
@@ -962,28 +968,28 @@ async def _generate_images(
     scene_map = _read_scene_map(ctx)
     # 规格风格锚（spec.json）：全片画风的唯一来源，逐格强制原文复用。
     spec_style_anchor = _spec_style_anchor(ctx)
-    created: list[str] = []
-    reused: list[str] = []
-    degraded: list[str] = list(order_notes)
-    if shape_note:
-        degraded.append(f"panels.json {shape_note}")
 
     # 阶段级模型覆盖（画布上单独指定）—— 只影响本次执行，不动全局配置
     img_cfg = ctx.extra.get("image_config") or {} if isinstance(ctx.extra, dict) else {}
     model_ov = str(img_cfg.get("model") or "").strip() or None
     service_ov = str(img_cfg.get("service") or "").strip() or None
 
-    for i, p in enumerate(panels, 1):
-        if not isinstance(p, dict):
-            continue
+    # index 是**整体落盘**的（不是按 key 追加），并发写必须互斥：
+    # 否则后写的快照会覆盖先写的，最终少几格记录 —— 成片直接缺画面，且没有任何报错。
+    lock = asyncio.Lock()
+
+    async def _one(i: int, p: dict) -> dict:
+        """生成一格。只返回本格增量，不直接改共享列表 —— 否则日志顺序会随调度乱跳。"""
+        res: dict[str, Any] = {"key": "", "created": [], "reused": [], "degraded": []}
         key = _item_index(p, i)
+        res["key"] = key
         prompt = str(
             p.get("prompt") or p.get("image_prompt") or p.get("scene") or p.get("description") or ""
         ).strip()
         ratio = str(p.get("ratio") or "9:16")
         if not prompt:
-            degraded.append(f"第 {key} 格缺少画面提示词，已跳过（不算完成）")
-            continue
+            res["degraded"].append(f"第 {key} 格缺少画面提示词，已跳过（不算完成）")
+            return res
 
         # ---- 提示词准备（纯函数，不调模型）----
         # 必须放在复用判定**之前**：复用判据要拿「实际会送进模型的提示词」算指纹。
@@ -1026,13 +1032,13 @@ async def _generate_images(
             if not have_fp:
                 # 历史图（本机制上线前生成）没有指纹：无法证明与当前分镜一致。
                 # 宁可重画一次，也不能把"可能已经对不上"的画面继续带进成片。
-                degraded.append(
+                res["degraded"].append(
                     f"第 {key} 格的历史分镜图没有提示词指纹，无法确认与当前分镜一致，已重新生成"
                 )
             elif have_fp != want_fp:
-                degraded.append(f"第 {key} 格的提示词已变更，旧图不再复用，重新生成")
+                res["degraded"].append(f"第 {key} 格的提示词已变更，旧图不再复用，重新生成")
             else:
-                reused.append(prev["path"])
+                res["reused"].append(prev["path"])
                 # 历史图补检：视觉自检是 2026-10-22 才有的，之前的图从没被"看过"，
                 # 复用它们等于把没验过的画面继续带进成片。这里只判定不重画 ——
                 # 重画属于"改产物"，由人工或整阶段重跑决定（不替用户做决定）。
@@ -1048,26 +1054,26 @@ async def _generate_images(
                     except Exception as exc:  # noqa: BLE001
                         v = {"checked": False, "ok": True, "reason": f"补检异常：{exc}"}
                     if v.get("checked"):
-                        prev = {**prev, "vision": v}
-                        index[key] = prev
+                        async with lock:
+                            index[key] = {**prev, "vision": v}
                         if not v.get("ok"):
-                            degraded.append(
+                            res["degraded"].append(
                                 f"第 {key} 格历史分镜图视觉自检未通过：{v.get('issue')}"
                                 "（未重画，请人工确认是否重跑该格）"
                             )
                     else:
-                        degraded.append(
+                        res["degraded"].append(
                             f"第 {key} 格历史分镜图未做视觉自检：{str(v.get('reason') or '')[:140]}"
                         )
-                continue
+                return res
 
-        degraded.extend(ref_notes)
+        res["degraded"].extend(ref_notes)
         if empty_note:
-            degraded.append(f"第 {key} 格：{empty_note}")
+            res["degraded"].append(f"第 {key} 格：{empty_note}")
         if style_note:
-            degraded.append(f"第 {key} 格：{style_note}")
+            res["degraded"].append(f"第 {key} 格：{style_note}")
         if scene_note:
-            degraded.append(scene_note)
+            res["degraded"].append(scene_note)
 
         out = await generate_image(
             ctx.storage, ctx.run_id, clean_prompt, f"panels/panel-{i:02d}.svg", ratio,
@@ -1095,7 +1101,7 @@ async def _generate_images(
             ctx, out, clean_prompt, key, ratio, model_ov, service_ov, subject_refs
         )
         out = vision["out"]
-        degraded.extend(vision["notes"])
+        res["degraded"].extend(vision["notes"])
         if vision.get("detail"):
             out["vision"] = vision["detail"]
 
@@ -1108,33 +1114,73 @@ async def _generate_images(
         if cons.get("checked"):
             out["consistency"] = cons
             if cons.get("found") and cons.get("same", 5) <= 2:
-                degraded.append(
+                res["degraded"].append(
                     f"第 {key} 格一致性抽检偏低（同人评分 {cons.get('same')}/5）："
                     f"{cons.get('reason', '')[:100]}（仅告警，未重画，请人工确认）"
                 )
         elif cons.get("reason"):
-            degraded.append(f"第 {key} 格一致性抽检未执行：{str(cons.get('reason'))[:140]}")
+            res["degraded"].append(f"第 {key} 格一致性抽检未执行：{str(cons.get('reason'))[:140]}")
 
-        # 关键：**合并**进已有条目，不能整体覆盖 —— 条目里可能已经有人工补的
-        # 中间帧 / 尾帧 / 视频片段，直接 index[key]=out 会把它们静默抹掉。
-        entry = dict(index.get(key) or {})
-        frames = dict(entry.get("frames") or {}) if isinstance(entry.get("frames"), dict) else {}
-        frames["first"] = out
-        entry.update(out)
-        entry["frames"] = frames
-        # 图被视觉自检判否并重画 → 该格旧视频片段的首帧已经不对，必须作废。
-        # 只提示"需重生成"是不够的：下游会继续用旧 mp4，成片里还是那张错图。
-        if out is not original_out and isinstance(entry.get("video"), dict):
-            entry.pop("video", None)
-            degraded.append(
-                f"第 {key} 格分镜图已重画，该格视频片段已作废（需重新生成，否则成片仍是旧画面）"
-            )
-        index[key] = entry
-        created.append(out["path"])
+        async with lock:
+            # 关键：**合并**进已有条目，不能整体覆盖 —— 条目里可能已经有人工补的
+            # 中间帧 / 尾帧 / 视频片段，直接 index[key]=out 会把它们静默抹掉。
+            entry = dict(index.get(key) or {})
+            frames = dict(entry.get("frames") or {}) if isinstance(entry.get("frames"), dict) else {}
+            frames["first"] = out
+            entry.update(out)
+            entry["frames"] = frames
+            # 图被视觉自检判否并重画 → 该格旧视频片段的首帧已经不对，必须作废。
+            # 只提示"需重生成"是不够的：下游会继续用旧 mp4，成片里还是那张错图。
+            if out is not original_out and isinstance(entry.get("video"), dict):
+                entry.pop("video", None)
+                res["degraded"].append(
+                    f"第 {key} 格分镜图已重画，该格视频片段已作废（需重新生成，否则成片仍是旧画面）"
+                )
+            index[key] = entry
+            # 每格画完就落盘：并发跑 3 分半，中途崩了不该把已经画好的图全丢掉。
+            _write_index(ctx, IMAGE_INDEX_REL, index)
+        res["created"].append(out["path"])
         if out.get("is_placeholder"):
-            degraded.append(
+            res["degraded"].append(
                 f"{out['path']} 为占位分镜卡（{out.get('fallback_reason', '')[:120]}）"
             )
+        return res
+
+    try:
+        concurrency = max(1, int(getattr(settings, "image_concurrency", 3) or 3))
+    except (TypeError, ValueError):
+        concurrency = 3
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _worker(i: int, p: dict) -> dict:
+        async with sem:
+            try:
+                return await _one(i, p)
+            except Exception as exc:  # noqa: BLE001
+                # 单格异常不能拖垮整批：gather 默认把异常抛给调用方，
+                # 一格失败就等于整阶段失败 —— 并发反而比串行更脆。
+                logger.warning("第 %s 格生图异常 run=%s: %s", i, ctx.run_id, exc)
+                return {
+                    "key": str(i),
+                    "created": [],
+                    "reused": [],
+                    "degraded": [f"第 {i} 格生图异常，已跳过：{str(exc)[:200]}"],
+                }
+
+    jobs = [(i, p) for i, p in enumerate(panels, 1) if isinstance(p, dict)]
+    results = await asyncio.gather(*(_worker(i, p) for i, p in jobs))
+
+    # gather 按入参顺序返回，所以合并顺序天然等于格号顺序；
+    # 但每格内部的 degraded 是并发产生的，必须在这里统一合并，不能边跑边 append。
+    created: list[str] = []
+    reused: list[str] = []
+    degraded: list[str] = list(order_notes)
+    if shape_note:
+        degraded.append(f"panels.json {shape_note}")
+    for r in results:
+        created.extend(r["created"])
+        reused.extend(r["reused"])
+        degraded.extend(r["degraded"])
 
     _write_index(ctx, IMAGE_INDEX_REL, index)
     return {
@@ -1143,8 +1189,9 @@ async def _generate_images(
         "total_indexed": len(index),
         "placeholders": [v["path"] for v in index.values() if v.get("is_placeholder")],
         "degraded": degraded,
-        "summary": f"分镜图：新生成 {len(created)} 张、复用 {len(reused)} 张",
+        "summary": f"分镜图：新生成 {len(created)} 张、复用 {len(reused)} 张（{concurrency} 路并发）",
     }
+
 
 
 # 运镜 → 中文镜头运动指令（给图生视频模型看的动作指令，不是给静态生图看的）
@@ -1232,7 +1279,7 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
       不让一格失败拖死整条链。
     """
     from ..canvas_store import set_panel_video
-    from ..media.video import generate_clip, video_ready
+    from ..media.video import generate_clip, preflight, video_ready
 
     panels, shape_note = _plan_items(plan, "panels")
     if not panels:
@@ -1241,6 +1288,11 @@ async def _generate_panel_videos(ctx: ToolContext, plan: dict | None = None) -> 
     ok, why = video_ready()
     if not ok:
         return {"degraded": [f"视频模型不可用，全部格退回静态运镜：{why}"], "generated": 0, "reused": 0}
+
+    # 模型名/权限错了就别开跑：否则 12 个镜头各吃一次 503，最后成片全是静态图
+    ok, why = await preflight()
+    if not ok:
+        return {"degraded": [f"视频模型预检未通过，全部格退回静态运镜：{why}"], "generated": 0, "reused": 0}
 
     images: dict[str, dict] = _read_json_file(ctx, IMAGE_INDEX_REL) or {}
     workspace = ctx.storage.run_workspace(ctx.run_id)
@@ -1619,6 +1671,9 @@ async def _synthesize_lines(ctx: ToolContext, plan: dict | None = None) -> dict:
     created: list[str] = []
     reused: list[str] = []
     degraded: list[str] = []
+    # 配音降级按「原因」聚合：TTS 网关整体不可用时，20 句会产出 20 条一模一样的
+    # 备注，把真正需要看的其它问题淹掉（2026-11-05 用户反馈"降级太多"）。
+    fallback_reasons: dict[str, int] = {}
     if shape_note:
         degraded.append(f"lines.json {shape_note}")
     if legacy_count:
@@ -1671,7 +1726,11 @@ async def _synthesize_lines(ctx: ToolContext, plan: dict | None = None) -> dict:
         index[key] = out
         created.append(out["path"])
         if out.get("is_fallback"):
-            degraded.append(f"{out['path']} 由本机语音合成（{out.get('fallback_reason', '')[:120]}）")
+            reason = str(out.get("fallback_reason") or "")[:120]
+            fallback_reasons[reason] = fallback_reasons.get(reason, 0) + 1
+
+    for reason, count in fallback_reasons.items():
+        degraded.append(f"{count} 句配音由本机语音合成（{reason}）")
 
     _write_index(ctx, AUDIO_INDEX_REL, index)
     return {
@@ -1820,6 +1879,34 @@ def _has_panel_field(ln: dict) -> bool:
         return False
 
 
+def _auto_edit_plan(spec: dict, out: dict, degraded: list[str]) -> str:
+    """按真实渲染结果生成 edit_plan.md（人可读、机器可核对）。"""
+    panels = spec.get("panels") or []
+    size_mb = float(out.get("size") or 0) / 1024 / 1024
+    lines = [
+        "# 编辑方案（由 render_video 按真实渲染结果生成）",
+        "",
+        f"- 成片：`{out.get('path')}`",
+        f"- 时长：{out.get('duration_seconds')}s / {out.get('frames')} 帧 / {size_mb:.1f}MB",
+        f"- 画幅：{spec.get('width')}x{spec.get('height')} @ {spec.get('fps')}fps",
+        f"- 格数：{len(panels)}",
+        "",
+        "## 时间轴",
+        "",
+        "| 格 | 起(s) | 时长(s) | 素材 | 字幕 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for i, p in enumerate(panels, 1):
+        src = str(p.get("video") or p.get("src") or "")
+        sub = str(p.get("subtitle") or "").replace("|", "/")[:40]
+        lines.append(
+            f"| {i} | {p.get('fromSeconds')} | {p.get('durationInSeconds')} | {src} | {sub} |"
+        )
+    if degraded:
+        lines += ["", "## 降级与说明", ""] + [f"- {d}" for d in degraded]
+    return "\n".join(lines) + "\n"
+
+
 async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
     """把分镜图 + 配音 + 字幕排成时间轴，渲染竖屏 mp4。
 
@@ -1897,10 +1984,11 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         if durs:
             audio_need[pk] = LEAD + sum(durs) + GAP * (len(durs) - 1) + TAIL
 
-    # 时间轴起点：片头卡让出大部分时长，但提前 OVERLAP 入画，
-    # 让格 1 的画面在片头卡淡出的同时叠化进来（intro 卡自己带淡出）。
-    intro_dur = 2.0
-    t = max(0.0, intro_dur - OVERLAP)
+    # 时间轴起点：**不做片头卡**（2026-11-05 用户要求「视频首帧不要标题」）。
+    # 旧实现会把用户原始需求原文当标题打在黑底上（"给我生成一个白酒的广告…"），
+    # 广告片第一帧就是一句需求描述，比没有片头更糟。成片直接从第 1 格开始。
+    intro_dur = 0.0
+    t = 0.0
     starts: dict[str, float] = {}
     panel_dur: dict[str, float] = {}
     for i, p in enumerate(panels, 1):
@@ -1992,7 +2080,9 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
                 or line_by_panel.get(key) or ""
             ).strip() or None,
             "speaker": str(p.get("speaker") or "").strip() or None,
-            "label": f"格 {key}",
+            # 角标「格 x」是内部调试用的格号，观众不需要看到（2026-11-05 用户反馈
+            # 「图片左上角出现格x 很违和」）。要显示就由画布显式给 label。
+            "label": str(p.get("label") or "").strip(),
             "isPlaceholder": bool(img.get("is_placeholder")),
         })
         # 下一格提前 OVERLAP 入画：本格尾与下格头重叠叠化（crossfade 接力）。
@@ -2086,12 +2176,15 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
         "width": 1080,
         "height": 1920,
         "transitionSeconds": OVERLAP,
-        "intro": {"durationInSeconds": intro_dur, "title": title, "subtitle": "动态漫 · Longspan 合成"},
+        "intro": None,
         "panels": spec_panels,
         "audio": spec_audio,
         "bgm": bgm_spec,
-        "showWatermark": True,
-        "outro": {"durationInSeconds": 2.4, "text": "第一集 · 完", "hint": "由 Longspan 合成"},
+        # 水印只在标题够短时才打：长标题就是用户那句需求原文，打在画面上是噪音。
+        "showWatermark": bool(title) and len(title) <= 16,
+        # 片尾卡同理去掉（「第一集 · 完」对广告片是错的收尾）。品牌落版由最后一格
+        # 分镜承担（剧本里就是「陈年老窖四字 + 朱红印章」）。
+        "outro": None,
     }
 
     out = await _render_impl(ctx.run_id, ctx.storage.run_workspace(ctx.run_id), spec)
@@ -2117,6 +2210,15 @@ async def _render_video(ctx: ToolContext, plan: dict | None = None) -> dict:
     subtitle_count = sum(1 for p in spec_panels if p.get("subtitle"))
     if subtitle_count == 0:
         degraded.append("成片无任何字幕：panels.json 与 lines.json 都没有可用的台词文本")
+
+    # 交付契约兜底：compose 阶段声明要产出 edit_plan.md，但模型（实测 MiniMax-M3-W8A8）
+    # 会直接调工具、跳过写文档 —— 成片明明已经渲出来，验收却连判失败，整条任务卡在
+    # "未生成 edit_plan.md" 上重做 3 次。这里用**已经发生的事实**生成一份；
+    # 模型自己写了就不覆盖（它的版本可能更有人味）。
+    if not ctx.storage.exists(ctx.run_id, "edit_plan.md"):
+        ctx.storage.write_text(ctx.run_id, "edit_plan.md", _auto_edit_plan(spec, out, degraded))
+        degraded.append("edit_plan.md 由 render_video 按真实渲染结果自动生成（本轮模型未产出该文档）")
+
     return {
         **out,
         "degraded": degraded,
